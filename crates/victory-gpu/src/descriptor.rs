@@ -268,6 +268,79 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     SyncedHeaps(Some(mine))
 }
 
+/// Renderer port #7 (`crate::port_journal`): [`begin_sync_heaps`] for a
+/// submission that needs round `mark` (one that began after what it waits
+/// for was written, `crate::port_journal::round_after`): asked for if it has not
+/// been. 0: as [`begin_sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
+    if mark == 0 || !sync_aside() {
+        return begin_sync_heaps();
+    }
+    // (The thread is started by the first `begin_sync_heaps`.)
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        drop(rounds);
+        return begin_sync_heaps();
+    }
+    let asked = rounds.0 < mark;
+    rounds.0 = rounds.0.max(mark);
+    drop(rounds);
+    if asked {
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    SyncedHeaps(Some(mark))
+}
+
+/// Renderer port #7: the number of a round of the heaps' records that
+/// begins after this call, asked for if none is waiting to begin (at the
+/// title's submit: the round runs while the submission waits in the line).
+/// 0 if the records are not synced by a thread of their own (or it has not
+/// started yet).
+#[cfg(windows)]
+pub(crate) fn round_after_now() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = round;
+        drop(rounds);
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    round
+}
+
+/// Renderer port #7: the number of the first round that begins after this
+/// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
+#[cfg(windows)]
+pub(crate) fn round_mark() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    rounds.0 + 1
+}
+
+/// Whether `[at, at + len)` touches the title memory of a placed
+/// shader-visible heap of descriptors.
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at as u64 + len as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
+}
+
 #[cfg(windows)]
 impl Drop for SyncedHeaps {
     fn drop(&mut self) {
@@ -518,6 +591,18 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync
 #[cfg(windows)]
 static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// By outcome of `HostHeap::mirror` during the view-heap pass (made already,
+/// not a view of ours, same view as made, old view kept, left for later,
+/// view created, other): records (0..7) and their microseconds (7..14).
+/// Fed by `descriptor::host` once its mirror instrumentation is wired.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static MIRRORED: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+
+/// Inside `HostHeap::mirror`, summed over the pass's records: buffer notes
+/// and unmaking stale slots, creating the view, keeping the slot's resource.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static MIRROR_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
@@ -561,6 +646,38 @@ pub(crate) fn sync_line(frames: f64) {
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let raw = MIRRORED.each_ref().map(|a| a.swap(0, Relaxed));
+        let us = MIRROR_US.each_ref().map(|a| a.swap(0, Relaxed) as f64 / 1e3 / frames);
+        if raw[..7].iter().any(|&v| v > 0) {
+            let n = raw.map(|v| v as f64 / frames);
+            tracing::info!(
+                "the view-heap pass's records made, per frame, by what making them did (count, ms): made already {:.0} {:.2}, \
+                 not a view of ours {:.0} {:.2}, the same view as made {:.0} {:.2}, the old view kept {:.0} {:.2}, \
+                 left for later (a null view made) {:.0} {:.2}, a view created {:.0} {:.2}, other {:.0} {:.2}; inside: \
+                 buffer notes and stale slots {:.2} ms, creating views {:.2} ms, keeping the slots' resources {:.2} ms",
+                n[0],
+                n[7] / 1e3,
+                n[1],
+                n[8] / 1e3,
+                n[2],
+                n[9] / 1e3,
+                n[3],
+                n[10] / 1e3,
+                n[4],
+                n[11] / 1e3,
+                n[5],
+                n[12] / 1e3,
+                n[6],
+                n[13] / 1e3,
+                us[0],
+                us[1],
+                us[2]
+            );
+        }
+    }
 }
 
 /// Title descriptor slots in a changed byte range that have host counterparts.

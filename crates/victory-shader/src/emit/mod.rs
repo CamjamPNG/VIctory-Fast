@@ -233,6 +233,17 @@ pub fn native_rt_anyhit() -> bool {
     })
 }
 
+/// Whether eligible `RAY_FLAG_NONE` closest-hit `AnyHit` loops split into a
+/// Pass 1 (`CULL_NON_OPAQUE`) `tMax` pre-shrink followed by Pass 2 (`CULL_OPAQUE`)
+/// `AnyHit` (`VICTORY_NATIVE_RT_TWO_PASS=0` disables; on by default when
+/// `VICTORY_NATIVE_RT_ANYHIT=1`).
+pub fn native_rt_two_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NATIVE_RT_TWO_PASS").is_none_or(|v| v != "0")
+    })
+}
+
 /// Whether a shader identified by `hash_hex` is selected by
 /// `VICTORY_NATIVE_RT_FILTER`: when unset or empty, matches every shader;
 /// otherwise matches comma-separated substrings case-insensitively.
@@ -557,7 +568,7 @@ pub fn emit(
     // ([`ir::without_early_outs`]), which is what usually keeps the whole
     // body from being a block every lane runs.
     let stuck = match &original {
-        Ok((_, wave)) => *wave == Some(64),
+        Ok((_, wave, _)) => *wave == Some(64),
         Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
         Err(_) => false,
     };
@@ -566,15 +577,17 @@ pub fn emit(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
-        let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+        let report = |what: &str, r: &Result<(HostShader, Option<u32>, bool), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+                    Ok((_, wave, _)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
                     Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
                 }
             }
         };
-        let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        let done = |r: &Result<(HostShader, Option<u32>, bool), ShaderError>| {
+            matches!(r, Ok((_, wave, _)) if *wave != Some(64))
+        };
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -640,7 +653,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
-                    return again.map(|(shader, _)| shader);
+                    return again.map(|(shader, _, _)| shader);
                 }
             }
         }
@@ -682,7 +695,7 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
-                        return again.map(|(shader, _)| shader);
+                        return again.map(|(shader, _, _)| shader);
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -699,7 +712,7 @@ pub fn emit(
                         let again = widen(c, native, base, why, driver_loop);
                         report("wave-wide branches", &again);
                         if done(&again) {
-                            return again.map(|(shader, _)| shader);
+                            return again.map(|(shader, _, _)| shader);
                         }
                     }
                 }
@@ -717,7 +730,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
-                        return local.map(|(shader, _)| shader);
+                        return local.map(|(shader, _, _)| shader);
                     }
                 }
             }
@@ -725,7 +738,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local.map(|(shader, _, _)| shader);
                 }
             }
         }
@@ -737,14 +750,58 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                            return local.map(|(shader, _, _)| shader);
                         }
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
-                    return local.map(|(shader, _)| shader);
+                    return local.map(|(shader, _, _)| shader);
+                }
+            }
+        }
+    } else if matches!(&original, Ok((_, Some(64), true)))
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_rdna() != 0
+        && lower::host_max_wave() != 32
+    {
+        // RDNA 4 Wave64 shader with a lifted `AnyHit` loop: attempt ONLY the exact
+        // barrier-free `wave_local` idiom Wave32 lowering (never approximate, never
+        // `widen` barriers). On failure, fall through and keep Wave64 cleanly.
+        let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
+        let done = |r: &Result<(HostShader, Option<u32>, bool), ShaderError>| {
+            matches!(r, Ok((_, wave, _)) if *wave != Some(64))
+        };
+        if local_on && !exact_only {
+            if lower::wave_local(p, st).is_ok() {
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                if done(&local) {
+                    return local.map(|(shader, _, _)| shader);
+                }
+            }
+            for alt in [ir::without_early_outs(p), ir::without_skips(p, false)]
+                .into_iter()
+                .flatten()
+            {
+                let Ok(alt_st) = structure::structure(&alt) else {
+                    continue;
+                };
+                if lower::wave_local(&alt, &alt_st).is_err() {
+                    continue;
+                }
+                let Ok(alt_io) = io::raise(&alt, native) else {
+                    continue;
+                };
+                let Ok(alt_res) = resource::track(&alt, &native.layout, native.stage, Some(&alt_st)) else {
+                    continue;
+                };
+                let local = lower::with_local_waves(|| {
+                    emit_program(c, native, &alt, &alt_st, &alt_io, &alt_res)
+                });
+                if done(&local) {
+                    return local.map(|(shader, _, _)| shader);
                 }
             }
         }
@@ -766,7 +823,7 @@ pub fn emit(
         }
         other => other,
     };
-    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+    let supported = |(shader, wave, _): (HostShader, Option<u32>, bool)| {
         if wave == Some(64) && lower::host_max_wave() == 32 {
             Err(ShaderError::Unsupported {
                 offset: 0,
@@ -806,7 +863,7 @@ fn widen(
     p: &ir::Program,
     why: bool,
     active_loop_only: bool,
-) -> Result<(HostShader, Option<u32>), ShaderError> {
+) -> Result<(HostShader, Option<u32>, bool), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
@@ -835,7 +892,7 @@ fn widen(
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
-            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+            || matches!(&r, Ok((_, Some(64), _))) && !needs.is_empty();
         if !stuck {
             if why {
                 let order = ir::reverse_postorder(&p.blocks);
@@ -896,7 +953,8 @@ fn widen(
     }
 }
 
-/// The translated program, and the wave size it requires of the host.
+/// The translated program, the wave size it requires of the host, and whether it
+/// contains a lifted `RayLoopKind::AnyHit` loop.
 fn emit_program(
     c: &Container,
     native: &NativeProgram,
@@ -904,7 +962,7 @@ fn emit_program(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
-) -> Result<(HostShader, Option<u32>), ShaderError> {
+) -> Result<(HostShader, Option<u32>, bool), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -982,6 +1040,7 @@ fn emit_program(
         })
     })?;
     let wave_size = l.wave_size;
+    let has_anyhit_loop = l.has_anyhit_loop;
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -1004,7 +1063,7 @@ fn emit_program(
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
     };
-    Ok((shader, wave_size))
+    Ok((shader, wave_size, has_anyhit_loop))
 }
 
 /// The title's vertex output interpolation lives in PSV0. A float packed

@@ -360,10 +360,22 @@ fn slow_limit() -> usize {
     })
 }
 
+fn writes_depth_only(state: &GraphicsState) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_WRITE_MASK_ALL;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+    state.targets.NumRenderTargets == 0
+        && state.depth_format != DXGI_FORMAT_UNKNOWN
+        && state.depth.DepthEnable.as_bool()
+        && state.depth.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Prewarmed depth-only passes (shadow maps and depth prepasses), prioritized
+    /// ahead of other prewarmed pipelines when no draw is waiting.
+    early_depth: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Those of the early ones known to take long, and how many of them are
     /// being made ([`slow_limit`]).
@@ -376,6 +388,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            early_depth: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
             slow_now: 0,
@@ -401,6 +414,8 @@ impl Queue {
             self.requested.push_back(p.clone());
         } else if slow {
             self.slow.push_back(p.clone());
+        } else if p.graphics.as_ref().is_some_and(|state| writes_depth_only(state)) {
+            self.early_depth.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
         }
@@ -414,7 +429,11 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self
+                .requested
+                .pop_front()
+                .or_else(|| unclaimed(&mut self.early_depth))
+                .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -659,5 +678,29 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn early_depth_precedes_other_prewarming_and_requests_precede_both() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let depth_pipeline = || {
+            let mut depth = Box::new(GraphicsState::default());
+            let format = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+            // SAFETY: a complete depth-format subobject of the title pipeline stream.
+            unsafe { depth.read(16, format.as_ptr().cast()) };
+            Arc::new(Pending::new(Vec::new(), Some(depth)))
+        };
+        let normal = Arc::new(Pending::new(Vec::new(), None));
+        let promoted = depth_pipeline();
+        let shadow = depth_pipeline();
+        let mut queue = Queue::new();
+        for p in [&normal, &shadow, &promoted] {
+            assert_eq!(queue.push(p, EARLY), Some(true));
+        }
+        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
+        for expected in [&promoted, &shadow, &normal] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), expected));
+        }
+        assert!(queue.pop(false, 1).is_none());
     }
 }

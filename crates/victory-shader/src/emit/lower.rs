@@ -59,6 +59,8 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// Whether native RT lifting found at least one `RayLoopKind::AnyHit` loop.
+    pub has_anyhit_loop: bool,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -310,6 +312,8 @@ struct Lower<'a> {
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
     rpo: Vec<usize>,
+    /// Immediate dominator per IR block (`usize::MAX` if unreachable).
+    idom: Vec<usize>,
     /// DXIL block each IR block ends in (guarded stores split blocks).
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
@@ -393,8 +397,22 @@ struct Lower<'a> {
     tlas_root_loads: HashSet<Site>,
     /// Replaced BVH metadata `global_load_*` / `s_load_*` sites (`CANDIDATE_*` / `COMMITTED_*`).
     ray_meta_loads: HashMap<Site, super::rayquery_lift::RayMetaLoad>,
-    /// Pre-allocated `RayQuery` handles indexed by lifted ray-loop index.
+    /// Lifted `RayLoop`s discovered in `Lower::new` and consumed in `Lower::run`.
+    ray_loops: Vec<super::rayquery_lift::RayLoop>,
+    /// IR entry blocks of lifted `RayLoop`s (replaced by `emit_ray_loop`).
+    ray_entries: HashSet<usize>,
+    /// IR blocks skipped during lowering (deleted BVH scaffolding).
+    ray_skipped: HashSet<usize>,
+    /// Whether any lifted `RayLoop` is a `RayLoopKind::AnyHit`.
+    has_anyhit_loop: bool,
+    /// Pre-allocated `RayQuery` handles indexed by lifted `rq_group`.
     ray_queries: Vec<V>,
+    /// Optional Pass 1 opaque-only (`CULL_NON_OPAQUE`) `RayQuery` handle per `rq_group`.
+    ray_queries_opaque: Vec<Option<V>>,
+    /// Lazy candidate triangle queries (`RayT`, `Bary`, `FrontFace`) materialized on demand.
+    cand_inputs: HashMap<Value, (V, super::rayquery_lift::CandidateInput)>,
+    /// Per-DXIL-block cache of materialized lazy candidate queries.
+    cand_cache: HashMap<(usize, V, super::rayquery_lift::CandidateInput), V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1146,6 +1164,8 @@ pub fn set_host_rdna(on: bool) {
 thread_local! {
     /// A test's choice for [`host_rdna`], for its thread only.
     pub(super) static TEST_RDNA: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Test hook to simulate a lifted `AnyHit` loop for RDNA Wave32 policy unit tests.
+    static TEST_FORCE_ANYHIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The bits of [`super::rdna`] that count on this host.
@@ -1405,7 +1425,38 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let ray_loops = if super::native_rt_active() {
+            super::rayquery_lift::find_ray_loops(p, x.st, x.res, &scalar)
+        } else {
+            Vec::new()
+        };
+        let ray_entries: HashSet<usize> = ray_loops.iter().map(|rl| rl.entry_block).collect();
+        let ray_skipped: HashSet<usize> = ray_loops
+            .iter()
+            .flat_map(|rl| rl.skipped_blocks.iter().copied())
+            .collect();
+        let has_anyhit_loop = ray_loops
+            .iter()
+            .any(|rl| matches!(rl.kind, super::rayquery_lift::RayLoopKind::AnyHit(_)))
+            || {
+                #[cfg(test)]
+                {
+                    TEST_FORCE_ANYHIT.get()
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            };
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+        let live_insts = || {
+            p.blocks
+                .iter()
+                .enumerate()
+                .filter(|(b, _)| !ray_entries.contains(b) && !ray_skipped.contains(b))
+                .flat_map(|(_, blk)| &blk.insts)
+        };
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
@@ -1426,7 +1477,7 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            console_lanes = live_insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -1441,6 +1492,11 @@ impl<'a> Lower<'a> {
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            // On AMD RDNA, a Wave64 shader with a lifted `AnyHit` loop prefers Wave32 via the
+            // exact barrier-free paths only (`!crosses` or `wave_local` idiom under
+            // `with_local_waves`); if exact Wave32 does not apply, keep Wave64 cleanly.
+            let rdna_anyhit_wave32 =
+                host_rdna() != 0 && x.native.wave64 && has_anyhit_loop && host_max_wave() != 32;
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
@@ -1449,8 +1505,11 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
+            if wave == 64
+                && (host_max_wave() == 32 || rdna_anyhit_wave32)
+                && (console_lanes || one_wave && s.lds_dwords > 0)
+            {
+                let crosses = live_insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
@@ -1461,6 +1520,13 @@ impl<'a> Lower<'a> {
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
+                } else if rdna_anyhit_wave32 {
+                    // Never emit exchange or split_lds barriers on RDNA: engage Wave32 only
+                    // when `emit` verified `wave_local` and invoked `with_local_waves`.
+                    if LOCAL_WAVES.get() && (s.lds_dwords == 0 || group <= 32) {
+                        wave = 32;
+                        exchange = Some((s.lds_dwords, group <= 32, vec![false; p.blocks.len()]));
+                    }
                 } else {
                     // (Groups of several console waves too: each console wave is two host
                     // waves, which exchange through their own pair of dwords.)
@@ -1507,7 +1573,7 @@ impl<'a> Lower<'a> {
                 // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
                 if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
                     let mut why: Vec<&str> = Vec::new();
-                    for i in insts() {
+                    for i in live_insts() {
                         let n = i.name();
                         let r = if n.starts_with("v_mbcnt") {
                             "v_mbcnt"
@@ -1543,13 +1609,15 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
-            if wave == 32 && x.native.wave64 {
+            if wave == 32 && x.native.wave64 && (console_lanes || one_wave && s.lds_dwords > 0) {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            } else if rdna_anyhit_wave32 {
+                s.wave_size = Some(32);
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -1666,7 +1734,7 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: {
                 let mut m: HashMap<Site, &Interp> = x.io.interps.iter().map(|(s, i)| (*s, i)).collect();
@@ -1692,6 +1760,7 @@ impl<'a> Lower<'a> {
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
+            idom: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
@@ -1750,7 +1819,14 @@ impl<'a> Lower<'a> {
             abort: None,
             tlas_root_loads: HashSet::new(),
             ray_meta_loads: HashMap::new(),
+            ray_loops,
+            ray_entries,
+            ray_skipped,
+            has_anyhit_loop,
             ray_queries: Vec::new(),
+            ray_queries_opaque: Vec::new(),
+            cand_inputs: HashMap::new(),
+            cand_cache: HashMap::new(),
         }
     }
 
@@ -2364,19 +2440,11 @@ impl<'a> Lower<'a> {
             self.s.entry = body;
         }
         self.find_coherent();
-        let ray_loops = if super::native_rt_active() {
-            super::rayquery_lift::find_ray_loops(p, self.x.st, self.x.res, &self.scalar)
-        } else {
-            Vec::new()
-        };
+        let ray_loops = std::mem::take(&mut self.ray_loops);
         let ray_by_entry: HashMap<usize, usize> = ray_loops
             .iter()
             .enumerate()
             .map(|(idx, rl)| (rl.entry_block, idx))
-            .collect();
-        let ray_skipped: HashSet<usize> = ray_loops
-            .iter()
-            .flat_map(|rl| rl.skipped_blocks.iter().copied())
             .collect();
         self.tlas_root_loads = ray_loops
             .iter()
@@ -2417,8 +2485,9 @@ impl<'a> Lower<'a> {
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
+        self.idom = crate::ir::idoms(&p.blocks, &order, &self.rpo);
         for (n, &b) in order.iter().enumerate() {
-            if ray_skipped.contains(&b) {
+            if self.ray_skipped.contains(&b) {
                 continue;
             }
             self.block[b] = Some(if n == 0 {
@@ -2429,7 +2498,7 @@ impl<'a> Lower<'a> {
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
-            if ray_skipped.contains(&b) || ray_by_entry.contains_key(&b) {
+            if self.ray_skipped.contains(&b) || ray_by_entry.contains_key(&b) {
                 continue;
             }
             let header = p.blocks[b]
@@ -2451,7 +2520,9 @@ impl<'a> Lower<'a> {
         }
         // Pre-allocate one `RayQuery` handle per `rq_group` in the function entry block so every
         // handle strictly dominates both in-loop any-hit blocks and shared post-loop metadata queries.
+        // Eligible closest-hit `AnyHit` groups also allocate a Pass 1 `CULL_NON_OPAQUE` handle.
         self.ray_queries.clear();
+        self.ray_queries_opaque.clear();
         let entry_dxil_blk = self.block[order[0]].expect("entry block");
         let num_groups = ray_loops
             .iter()
@@ -2459,6 +2530,7 @@ impl<'a> Lower<'a> {
             .max()
             .unwrap_or(0);
         let mut group_flags: Vec<Option<u32>> = vec![None; num_groups];
+        let mut group_two_pass: Vec<bool> = vec![super::native_rt_two_pass(); num_groups];
         for rl in &ray_loops {
             let f = match rl.ray_flags {
                 super::rayquery_lift::RayInput::Const(f) => f,
@@ -2468,19 +2540,33 @@ impl<'a> Lower<'a> {
                 Some(prev) => prev & f,
                 None => f,
             });
+            group_two_pass[rl.rq_group] &= super::rayquery_lift::is_two_pass_eligible(rl);
         }
-        let group_flags: Vec<u32> = group_flags
-            .into_iter()
-            .map(|fl| fl.unwrap_or(0))
-            .collect();
-        for &fl in &group_flags {
-            self.ray_queries
-                .push(self.s.allocate_ray_query(entry_dxil_blk, fl));
+        let mut group_q2_flags: Vec<u32> = Vec::with_capacity(num_groups);
+        let mut group_q1_flags: Vec<u32> = Vec::with_capacity(num_groups);
+        for g in 0..num_groups {
+            let base_fl = group_flags[g].unwrap_or(0);
+            if group_flags[g].is_some() && group_two_pass[g] {
+                let q1_fl = base_fl | super::rayquery_lift::ray_flag::CULL_NON_OPAQUE;
+                let q2_fl = base_fl | super::rayquery_lift::ray_flag::CULL_OPAQUE;
+                self.ray_queries
+                    .push(self.s.allocate_ray_query(entry_dxil_blk, q2_fl));
+                self.ray_queries_opaque
+                    .push(Some(self.s.allocate_ray_query(entry_dxil_blk, q1_fl)));
+                group_q2_flags.push(q2_fl);
+                group_q1_flags.push(q1_fl);
+            } else {
+                self.ray_queries
+                    .push(self.s.allocate_ray_query(entry_dxil_blk, base_fl));
+                self.ray_queries_opaque.push(None);
+                group_q2_flags.push(base_fl);
+                group_q1_flags.push(0);
+            }
         }
         let mut pending_anyhits: HashMap<usize, super::rayquery_lift::PendingAnyHit> =
             HashMap::new();
         for &b in &order {
-            if ray_skipped.contains(&b) {
+            if self.ray_skipped.contains(&b) {
                 continue;
             }
             self.cur = self.block[b].expect("reachable");
@@ -2583,6 +2669,7 @@ impl<'a> Lower<'a> {
                 }
                 let inputs = super::rayquery_lift::ResolvedRayInputs {
                     rq: self.ray_queries[rl.rq_group],
+                    rq_opaque: self.ray_queries_opaque[rl.rq_group],
                     tlas,
                     active_ray,
                     origin,
@@ -2591,7 +2678,8 @@ impl<'a> Lower<'a> {
                     t_max,
                     instance_mask,
                     ray_flags,
-                    group_const_flags: group_flags[rl.rq_group],
+                    group_const_flags: group_q2_flags[rl.rq_group],
+                    group_opaque_const_flags: group_q1_flags[rl.rq_group],
                     init_min_front_t,
                     anyhit_inits,
                     anyhit_entry_dxil,
@@ -2612,6 +2700,17 @@ impl<'a> Lower<'a> {
                 if let super::rayquery_lift::RayLoopKind::AnyHit(ah) = &rl.kind
                     && let Some(pending) = emitted.pending_anyhit
                 {
+                    let rq = self.ray_queries[rl.rq_group];
+                    for &(val_id, ci) in &ah.inputs {
+                        if matches!(
+                            ci,
+                            super::rayquery_lift::CandidateInput::RayT
+                                | super::rayquery_lift::CandidateInput::Bary(_)
+                                | super::rayquery_lift::CandidateInput::FrontFace
+                        ) {
+                            self.cand_inputs.insert(val_id, (rq, ci));
+                        }
+                    }
                     for &(atom_v, const_b) in &ah.const_lane_atoms {
                         let bv = self.s.m.bool(const_b);
                         self.lane_bits.insert(atom_v, bv);
@@ -2699,19 +2798,24 @@ impl<'a> Lower<'a> {
                     .m
                     .terminate(tail_blk, Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk));
                 for k in 0..ah.state_vars.len() {
-                    self.s.m.set_phi(
-                        pending.latch_phis[k],
-                        vec![
-                            (pending.state_phis[k], pending.cand_check_blk),
-                            (next_vals[k], tail_blk),
-                            (next_vals[k], pending.do_commit_blk),
-                        ],
-                    );
+                    let back_val = if let Some(cb) = pending.cand_check_blk {
+                        self.s.m.set_phi(
+                            pending.latch_phis[k],
+                            vec![
+                                (pending.state_phis[k], cb),
+                                (next_vals[k], tail_blk),
+                                (next_vals[k], pending.do_commit_blk),
+                            ],
+                        );
+                        pending.latch_phis[k]
+                    } else {
+                        next_vals[k]
+                    };
                     self.s.m.set_phi(
                         pending.state_phis[k],
                         vec![
                             (pending.init_vals[k], pending.start_blk),
-                            (pending.latch_phis[k], pending.latch_blk),
+                            (back_val, pending.latch_blk),
                         ],
                     );
                 }
@@ -2727,8 +2831,10 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let has_anyhit_loop = self.has_anyhit_loop;
         Ok(Lowered {
             wave_size,
+            has_anyhit_loop,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2992,6 +3098,10 @@ impl<'a> Lower<'a> {
             Some(&val) => return Ok(val),
             None => {}
         }
+        if let Some(&(rq, ci)) = self.cand_inputs.get(&v) {
+            let x = self.materialize_cand_input(self.cur, rq, ci);
+            return Ok(Val::I32(x));
+        }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
             self.vals.insert(v, val);
@@ -3002,6 +3112,20 @@ impl<'a> Lower<'a> {
             return Ok(self.vals[&v]);
         }
         Err("a value defined after its use")
+    }
+
+    fn materialize_cand_input(
+        &mut self,
+        block: usize,
+        rq: V,
+        ci: super::rayquery_lift::CandidateInput,
+    ) -> V {
+        if let Some(&x) = self.cand_cache.get(&(block, rq, ci)) {
+            return x;
+        }
+        let x = super::rayquery_lift::emit_cand_input(&mut self.s, block, rq, ci);
+        self.cand_cache.insert((block, rq, ci), x);
+        x
     }
 
     /// Loads `v` if it is a barycentric input VGPR not loaded yet (see
@@ -5589,14 +5713,90 @@ impl<'a> Lower<'a> {
         if let Some(&meta) = self.ray_meta_loads.get(&(b, i)) {
             let guard = self.guard(b, i).map_err(|w| unsupported(offset, w))?;
             let rq = self.ray_queries[meta.loop_idx];
-            let vals = super::rayquery_lift::emit_ray_meta_load(
-                &mut self.s,
-                self.cur,
-                rq,
-                meta.candidate,
-                meta.kind,
-                inst.writes.len(),
-            );
+            let vals = if !meta.candidate
+                && meta.kind != super::rayquery_lift::RayMetaKind::BlasBaseZero
+                && let Some(q1) = self.ray_queries_opaque[meta.loop_idx]
+            {
+                let i32t = self.s.t.i32;
+                let n = inst.writes.len();
+                let orig = self.cur;
+                let b_q2 = self.s.m.new_block();
+                let b_q1_check = self.s.m.new_block();
+                let b_q1 = self.s.m.new_block();
+                let b_join = self.s.m.new_block();
+                let mut zero_edge: Option<usize> = None;
+                let check_blk = if let Some(g) = guard {
+                    let b_check = self.s.m.new_block();
+                    self.s.m.terminate(orig, Term::CondBr(g, b_check, b_join));
+                    zero_edge = Some(orig);
+                    b_check
+                } else {
+                    orig
+                };
+                let one = self.s.m.i32(1);
+                let s2 = self.s.ray_query_state_i32(
+                    check_blk,
+                    super::shader::rq_op::COMMITTED_STATUS,
+                    rq,
+                );
+                let use_q2 = self.s.m.cmp(check_blk, pred::EQ, s2, one);
+                self.s
+                    .m
+                    .terminate(check_blk, Term::CondBr(use_q2, b_q2, b_q1_check));
+
+                let v2 = super::rayquery_lift::emit_ray_meta_load(
+                    &mut self.s,
+                    b_q2,
+                    rq,
+                    false,
+                    meta.kind,
+                    n,
+                );
+                self.s.m.terminate(b_q2, Term::Br(b_join));
+
+                let s1 = self.s.ray_query_state_i32(
+                    b_q1_check,
+                    super::shader::rq_op::COMMITTED_STATUS,
+                    q1,
+                );
+                let use_q1 = self.s.m.cmp(b_q1_check, pred::EQ, s1, one);
+                self.s
+                    .m
+                    .terminate(b_q1_check, Term::CondBr(use_q1, b_q1, b_join));
+
+                let v1 = super::rayquery_lift::emit_ray_meta_load(
+                    &mut self.s,
+                    b_q1,
+                    q1,
+                    false,
+                    meta.kind,
+                    n,
+                );
+                self.s.m.terminate(b_q1, Term::Br(b_join));
+
+                let zero = self.s.m.i32(0);
+                let mut merged = Vec::with_capacity(n);
+                for k in 0..n {
+                    let phi = self.s.m.phi(b_join, i32t);
+                    let mut inc = vec![(v2[k], b_q2), (v1[k], b_q1), (zero, b_q1_check)];
+                    if let Some(ze) = zero_edge {
+                        inc.push((zero, ze));
+                    }
+                    self.s.m.set_phi(phi, inc);
+                    merged.push(phi);
+                }
+                self.cur = b_join;
+                merged
+            } else {
+                super::rayquery_lift::emit_ray_meta_load(
+                    &mut self.s,
+                    self.cur,
+                    rq,
+                    meta.candidate,
+                    meta.kind,
+                    inst.writes.len(),
+                )
+            };
             for (&(reg, _), x) in inst.writes.iter().zip(vals) {
                 self.write(inst, reg, x, guard);
             }
@@ -7536,6 +7736,76 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
+    fn dominates(&self, a: usize, mut b: usize) -> bool {
+        if self.idom.get(a).copied().unwrap_or(usize::MAX) == usize::MAX
+            || self.idom.get(b).copied().unwrap_or(usize::MAX) == usize::MAX
+        {
+            return false;
+        }
+        while b != a {
+            let p = self.idom[b];
+            if p == b || p == usize::MAX {
+                return false;
+            }
+            b = p;
+        }
+        true
+    }
+
+    fn can_hoist_heap_index(&self, load: Site) -> bool {
+        if !self.scalar.contains_key(&load) {
+            return false;
+        }
+        let Some(li) = self
+            .x
+            .p
+            .blocks
+            .get(load.0)
+            .and_then(|b| b.insts.get(load.1))
+        else {
+            return false;
+        };
+        let Fields::Smem {
+            base: Operand::Scalar { code, .. },
+            soffset,
+            ..
+        } = &li.fields
+        else {
+            return false;
+        };
+        let val_ready = |v: Value| -> bool {
+            if self.cand_inputs.contains_key(&v) {
+                return false;
+            }
+            if self.params.contains_key(&v) {
+                return true;
+            }
+            match self.vals.get(&v) {
+                Some(Val::I32(V::Const(_)) | Val::Bit(V::Const(_))) => true,
+                Some(Val::I32(_) | Val::Bit(_)) => self.def_block.get(&v).is_none_or(|&db| {
+                    !self.ray_entries.contains(&db)
+                        && !self.ray_skipped.contains(&db)
+                        && self.dominates(db, load.0)
+                }),
+                _ => false,
+            }
+        };
+        let Some(base_v) = li.read(Reg::S(*code)) else {
+            return false;
+        };
+        if !val_ready(base_v) {
+            return false;
+        }
+        match *soffset {
+            Operand::Scalar { code: NULL, .. } | Operand::Literal(_) => true,
+            Operand::Const(253) => li.read(Reg::Scc).is_some_and(val_ready),
+            Operand::Const(_) => true,
+            Operand::Scalar { code, .. } => li.read(Reg::S(code)).is_some_and(val_ready),
+            Operand::Vector { reg, .. } => li.read(Reg::V(reg)).is_some_and(val_ready),
+            _ => false,
+        }
+    }
+
     /// A handle for the descriptor `src` read at `site`.
     fn handle(
         &mut self,
@@ -7546,18 +7816,45 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props);
-                if let Some(&h) = self.handles.get(&key) {
-                    return Ok(h);
-                }
-                let index = self.heap_index(*load, *first, sampler)?;
-                let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
-                let h = self
-                    .s
-                    .heap_handle_at(self.cur, index, sampler, per_lane, props, bounded);
+                // Hoist wave-uniform descriptor handles out of inner loops (such as
+                // `RayQuery::Proceed`) into `load.0`'s DXIL tail block before its
+                // terminator whenever `load.0` strictly dominates `self.cur_ir`.
+                let target_blk = if !per_lane
+                    && load.0 != self.cur_ir
+                    && !self.ray_entries.contains(&load.0)
+                    && !self.ray_skipped.contains(&load.0)
+                    && self.dominates(load.0, self.cur_ir)
+                    && let Some(dst_blk) = self.tail[load.0]
+                    && self.can_hoist_heap_index(*load)
+                {
+                    dst_blk
+                } else {
+                    self.cur
+                };
+                let key = (target_blk, *load, *first, sampler, props);
+                if let Some(&h) = self.handles.get(&key) {
+                    return Ok(h);
+                }
+                let saved_cur = std::mem::replace(&mut self.cur, target_blk);
+                let next_ir = if target_blk == saved_cur {
+                    self.cur_ir
+                } else {
+                    load.0
+                };
+                let saved_ir = std::mem::replace(&mut self.cur_ir, next_ir);
+                let res = (|| -> Result<V, Why> {
+                    let index = self.heap_index(*load, *first, sampler)?;
+                    let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                    Ok(self
+                        .s
+                        .heap_handle_at(target_blk, index, sampler, per_lane, props, bounded))
+                })();
+                self.cur = saved_cur;
+                self.cur_ir = saved_ir;
+                let h = res?;
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -13027,15 +13324,20 @@ impl<'a> Lower<'a> {
             let numbers = !bit
                 && !st.masks.contains_key(&phi.value)
                 && !st.highs.contains_key(&phi.value)
-                && phi
-                    .args
-                    .iter()
-                    .any(|a| matches!(self.vals.get(a), Some(Val::I32(_))));
+                && phi.args.iter().any(|a| {
+                    matches!(self.vals.get(a), Some(Val::I32(_)))
+                        || self.cand_inputs.contains_key(a)
+                });
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if !bit && let Some(&(rq, ci)) = self.cand_inputs.get(&arg) {
+                    let x = self.materialize_cand_input(qb, rq, ci);
+                    incoming.push((x, qb));
+                    continue;
+                }
                 if self.read_phis.contains(&phi.value) && !self.vals.contains_key(&arg) {
                     let _ = self.lazy_barycentric(arg);
                     // A root parameter nothing read before the join (user
@@ -13792,5 +14094,84 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn rdna_exact_wave32_lowering_for_anyhit_shaders() {
+        use super::{TEST_FORCE_ANYHIT, TEST_HOST_WAVE, TEST_RDNA, with_local_waves};
+
+        let lower_w64 = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 32,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [64, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, true, 32).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .expect("lowering succeeds")
+        };
+
+        // Plain wave64 shader without cross-lane ops: RDNA AnyHit selects Wave32.
+        let plain = [S_ENDPGM];
+        // Cross-lane op confined to 32-lane halves (`ds_swizzle_b32 v0, v0 offset:swizzle(QUAD_PERM, 1,0,3,2)`):
+        // `!crosses` -> exact Wave32 on RDNA with AnyHit.
+        let swizzle = [0xD8D4_80E1, 0x0000_0000, S_ENDPGM];
+        // Cross-half op (`v_mbcnt_lo_u32_b32 v0, -1, 0`):
+        // stays Wave64 cleanly without `with_local_waves`, lowers to Wave32 under `with_local_waves`.
+        let mbcnt = [0xD765_0000, 0x0001_00C1, S_ENDPGM];
+
+        let prev_rdna = TEST_RDNA.replace(Some(super::super::rdna::ALL));
+        let prev_wave = TEST_HOST_WAVE.replace(Some(64));
+        let prev_ah = TEST_FORCE_ANYHIT.replace(true);
+
+        let l_plain = lower_w64(&plain);
+        assert_eq!(l_plain.wave_size, Some(32), "plain RDNA AnyHit should request Wave32");
+
+        let l_swizzle = lower_w64(&swizzle);
+        assert_eq!(l_swizzle.wave_size, Some(32), "!crosses RDNA AnyHit should lower to exact Wave32");
+
+        let l_mbcnt_w64 = lower_w64(&mbcnt);
+        assert_eq!(
+            l_mbcnt_w64.wave_size,
+            Some(64),
+            "crosses RDNA AnyHit without wave_local must keep Wave64 cleanly (no barriers)"
+        );
+
+        let l_mbcnt_local = with_local_waves(|| lower_w64(&mbcnt));
+        assert_eq!(
+            l_mbcnt_local.wave_size,
+            Some(32),
+            "crosses RDNA AnyHit under with_local_waves should lower to exact Wave32"
+        );
+
+        // Without AnyHit, swizzle stays Wave64 on RDNA (host_max_wave == 64).
+        TEST_FORCE_ANYHIT.set(false);
+        let l_no_ah = lower_w64(&swizzle);
+        assert_eq!(l_no_ah.wave_size, Some(64));
+
+        TEST_FORCE_ANYHIT.set(prev_ah);
+        TEST_HOST_WAVE.set(prev_wave);
+        TEST_RDNA.set(prev_rdna);
     }
 }

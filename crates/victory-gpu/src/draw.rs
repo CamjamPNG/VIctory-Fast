@@ -456,9 +456,11 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
-    /// Tables made afresh in this list: (table, slot count, contents) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Tables made afresh in this list, by a hash of the table and what it
+    /// holds ([`table_hash`]).
+    fresh_tables: std::collections::HashMap<u64, FreshTable, std::hash::BuildHasherDefault<Plain>>,
+    /// The record words of [`FreshTable`] tables, one after the other.
+    fresh_records: Vec<[u32; 3]>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -504,6 +506,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.fresh_records.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -1336,7 +1339,7 @@ impl State {
     ) -> u32 {
         use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
-            return memory.map_or(0, |m| m.base);
+            return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
@@ -1637,16 +1640,23 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        // With `table_stages`: what the stages of this draw read of each
+        // table, and the tables its earlier stages made afresh (address,
+        // slots).
+        let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
+        let mut staged: Vec<(u64, u32)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute);
+            let made = self.tables(list, &t.tables, compute, &spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why(format!("no free dynamic slots for a table of {}", p.name));
                 return false;
             }
             if stage.shader.ambient.is_some() {
@@ -1927,6 +1937,8 @@ impl State {
                     crate::host::settle_for_fence();
                     host.dynamic(1)
                 }) else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -2001,6 +2013,8 @@ impl State {
                     crate::host::settle_for_fence();
                     host.dynamic(1)
                 }) else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_why("no free dynamic slot for the one-view table of a root view".to_owned());
                     return false;
                 };
                 self.dynamic.push((key.0, index, 1));
@@ -3630,6 +3644,8 @@ impl State {
         list: &HostList,
         plan: &TablePlan,
         compute: bool,
+        spans: &[(u8, u32, u32)],
+        staged: &mut Vec<(u64, u32)>,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
@@ -3689,6 +3705,20 @@ impl State {
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
+            // With `table_stages`: as many slots as the stage of this draw
+            // that reads furthest into the table needs among those that
+            // make it afresh too: the ones reading a constant view in it,
+            // or every stage where the table reaches past the host heap's
+            // slots (`spans` is empty with the switch off).
+            let n = match spans.iter().find(|s| s.0 == slot) {
+                Some(&(_, with_constants, all)) => {
+                    let past = heap
+                        .index(table)
+                        .is_some_and(|at| u64::from(at) + u64::from(all) > u64::from(host.count()));
+                    n.max(if past { all } else { with_constants })
+                }
+                None => n,
+            };
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3697,23 +3727,35 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                let mut h = RecordHash::default();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
-                }
-                (table, n, h.0)
-            };
+            let key = table_hash(table, n);
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
-            if let Some(known) = self.fresh_tables.get_mut(&key) {
+            let same = {
+                let fresh_records = &self.fresh_records;
+                self.fresh_tables.get_mut(&key).filter(|f| {
+                    f.table == table
+                        && f.n == n
+                        && fresh_records[f.at..f.at + n as usize]
+                            .iter()
+                            .enumerate()
+                            .all(|(k, r)| *r == record(table, k as u32))
+                })
+            };
+            if let Some(known) = same {
                 let first = known.first;
+                // Found in the table an earlier stage of this draw made
+                // ([`table_stages`]): the title's own slots of the texture
+                // views this stage reads are stamped and made as the
+                // making of a table of its own did it (below).
+                let staged_title = staged
+                    .contains(&(table, n))
+                    .then(|| heap.index(table).filter(|at| at + n <= host.count()))
+                    .flatten();
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
                 if once
+                    && staged_title.is_none()
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
                 {
@@ -3729,6 +3771,13 @@ impl State {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        if let Some(title) = staged_title
+                            && crate::descriptor::host::is_texture_view(&view)
+                        {
+                            let k = u.table_offset_dwords / 8;
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror_after(list, title + k, handle);
+                        }
                     }
                 }
                 for k in selected {
@@ -3740,11 +3789,17 @@ impl State {
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
+                        if let Some(title) = staged_title
+                            && crate::descriptor::host::is_texture_view(&view)
+                        {
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror_after(list, title + k, handle);
+                        }
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
-                if once && let Some(known) = self.fresh_tables.get_mut(&key) {
+                if once {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
                     let epoch = list.epoch();
@@ -3768,7 +3823,15 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            let at = self.fresh_records.len();
+            self.fresh_records.extend((0..n).map(|k| record(table, k)));
+            self.fresh_tables.insert(
+                key,
+                FreshTable { table, n, at, first, epoch: 0, ready: Vec::new() },
+            );
+            if !spans.is_empty() {
+                staged.push((table, n));
+            }
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -4549,8 +4612,13 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     }
 }
 
-/// A table made afresh in dynamic slots, in a list ([`State::tables`]).
+/// A table made afresh in dynamic slots, in a list ([`State::tables`]):
+/// what it was made from (the `n` records at `at` in [`State::fresh_records`]),
+/// its first dynamic slot, and the readers brought up to date.
 struct FreshTable {
+    table: u64,
+    n: u32,
+    at: usize,
     first: u32,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
@@ -4560,6 +4628,42 @@ struct FreshTable {
     ready: Vec<((usize, usize, bool, usize), bool)>,
 }
 
+/// A hash that is mixed already, used as it is.
+#[derive(Default)]
+struct Plain(u64);
+
+impl std::hash::Hasher for Plain {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0 << 8 | u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+/// A quick hash of `table` and its `n` records. It only finds the table
+/// made before: the records are compared too, so a collision costs a copy,
+/// not wrong descriptors.
+fn table_hash(table: u64, n: u32) -> u64 {
+    let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
+    let h = (0..n).fold(table, |h, k| {
+        let [a, b, c] = record(table, k);
+        mix(mix(h, u64::from(a) | u64::from(b) << 32), u64::from(c))
+    });
+    h ^ h >> 32
+}
+
+/// The words of entry `k` of `table`.
+fn record(table: u64, k: u32) -> [u32; 3] {
+    // SAFETY: a descriptor slot in title memory.
+    unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
+}
+
 /// Whether a table a list reads again, with nothing changed in the list
 /// since, is left as it is (`VICTORY_READY_ONCE=0`: every entry is gone
 /// through again at every draw).
@@ -4567,21 +4671,53 @@ fn ready_once() -> bool {
     crate::toggled!("VICTORY_READY_ONCE")
 }
 
-/// A hash of records' words: 64 bits, two multiplications a record. (The
-/// standard library's took 3 % of the recording threads' time.)
-#[derive(Default)]
-struct RecordHash(u64);
-
-impl RecordHash {
-    fn add(&mut self, [a, b, c]: [u32; 3]) {
-        let fold = |x: u64, y: u64| {
-            let p = u128::from(x) * u128::from(y);
-            p as u64 ^ (p >> 64) as u64
-        };
-        let words = u64::from(a) << 32 | u64::from(b);
-        let first = fold(self.0 ^ words ^ 0x2d35_8dcc_aa6c_78a5, 0x8bb8_4b93_962e_acc9 ^ u64::from(c));
-        self.0 = fold(first ^ 0x4b33_a62e_d433_d4a3, 0x4d5a_2da5_1de1_aa47 ^ self.0.rotate_left(23)) ^ first;
+/// Whether the stages of one draw share a table they both need made afresh
+/// (`VICTORY_TABLE_STAGES=1|alt|alt40`; off by default).
+fn table_stages() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_TABLE_STAGES").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        Ok("alt40") => 3,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        mode => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let period = if mode == 3 { 40 } else { 20 };
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / period) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the stages of a draw share the tables they need made afresh from now (VICTORY_TABLE_STAGES={}): {}",
+                    if mode == 3 { "alt40" } else { "alt" },
+                    if on { "ON" } else { "off, each stage makes its own as usual" }
+                );
+            }
+            on
+        }
     }
+}
+
+/// Per root table the stages of `p` read: `(root parameter, max slots among
+/// stages with a CBV in that table, max slots among all stages)`.
+fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
+    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
+    for stage in &p.stages {
+        for group in &stage.translated().tables.groups {
+            let n = group.max_dword / 8 + 1;
+            let with = if group.has_cbv { n } else { 0 };
+            match spans.iter_mut().find(|s| s.0 == group.slot) {
+                Some(s) => {
+                    s.1 = s.1.max(with);
+                    s.2 = s.2.max(n);
+                }
+                None => spans.push((group.slot, with, n)),
+            }
+        }
+    }
+    spans
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
@@ -4897,7 +5033,7 @@ mod tests {
 
 #[cfg(test)]
 mod record_hash_tests {
-    use super::{Few, RecordHash};
+    use super::{Few, FreshTable, State, record, table_hash};
 
     #[test]
     fn a_few_things_are_kept_in_order_however_many() {
@@ -4911,26 +5047,35 @@ mod record_hash_tests {
     }
 
     #[test]
-    fn records_that_differ_hash_apart() {
-        let of = |records: &[[u32; 3]]| {
-            let mut h = RecordHash::default();
-            records.iter().for_each(|r| h.add(*r));
-            h.0
+    fn fresh_table_lookup_verifies_record_words_on_hash_collision() {
+        let mut slots = [[0u32; 8]; 2];
+        slots[0][..3].copy_from_slice(&[1, 2, 3]);
+        slots[1][..3].copy_from_slice(&[4, 5, 6]);
+        let ptr = slots.as_mut_ptr();
+        let table = ptr as u64;
+        let key = table_hash(table, 2);
+        let mut state = State::default();
+        let at = state.fresh_records.len();
+        state.fresh_records.extend((0..2).map(|k| record(table, k)));
+        state.fresh_tables.insert(
+            key,
+            FreshTable { table, n: 2, at, first: 42, epoch: 0, ready: Vec::new() },
+        );
+        let matches = |state: &State, key: u64, table: u64, n: u32| {
+            state.fresh_tables.get(&key).is_some_and(|f| {
+                f.table == table
+                    && f.n == n
+                    && state.fresh_records[f.at..f.at + n as usize]
+                        .iter()
+                        .enumerate()
+                        .all(|(k, r)| *r == record(table, k as u32))
+            })
         };
-        let mut seen = std::collections::HashSet::new();
-        // One record, one word or two of it different; runs of zeros; order.
-        for a in 0..64u32 {
-            for b in 0..64u32 {
-                for c in [0, 1, 0x8000_0000, u32::MAX] {
-                    assert!(seen.insert(of(&[[a, b, c]])));
-                    assert!(seen.insert(of(&[[1, 2, 3], [a, b, c]])));
-                    assert!(seen.insert(of(&[[a, b, c], [1, 2, 3], [0, 0, 0]])));
-                }
-            }
-        }
-        assert!(seen.insert(of(&[])));
-        // (One record of zeros is among the above.)
-        let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
-        assert!(zeros.iter().all(|h| seen.insert(*h)));
+        assert!(matches(&state, key, table, 2));
+        // Mutating a record word while looking up under the same hash key must miss.
+        // SAFETY: `ptr` points to the live two-slot array on the stack.
+        unsafe { (*ptr.add(1))[2] = 99 };
+        assert!(!matches(&state, key, table, 2));
+        assert_ne!(table_hash(table, 2), key);
     }
 }

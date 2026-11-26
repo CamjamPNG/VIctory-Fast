@@ -76,8 +76,6 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer).
-const COPIES: u32 = (1 << 12) - 1;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 /// An arena's bytes.
@@ -149,8 +147,9 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Places of title buffers' copies among `copies`.
-    numbers: HashMap<usize, usize>,
+    /// Shadow IDs are unique for the lifetime of a backing, including after
+    /// the guest reuses its address.
+    numbers: HashMap<u64, usize>,
     /// Arenas: place in `copies`, address.
     arenas: Vec<(usize, usize)>,
     /// By title page.
@@ -171,9 +170,6 @@ struct Memory {
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
     faulted: usize,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -217,6 +213,9 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Last numbered copy this draw prepared. Other recording threads can
+    /// subsequently add mappings to the same directory.
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -250,7 +249,6 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
-            heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
             stats: Stats::default(),
@@ -296,15 +294,17 @@ impl Memory {
         ours
     }
 
-    /// Gives a copy a number, if one is left.
+    /// Assigns a stable one-based copy number, keeping earlier numbers valid
+    /// for previously recorded command lists.
     fn number(&mut self, shadow: Arc<Shadow>) -> Option<usize> {
-        let key = Arc::as_ptr(&shadow) as usize;
+        let key = shadow.id();
         if let Some(&n) = self.numbers.get(&key) {
             return Some(n);
         }
-        if self.copies.len() >= COPIES as usize {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
+        // Directory stores a one-based index in the low 31 bits (bit 31 is
+        // MEMORY_READ_ONLY, 0 is the null view).
+        let next = u32::try_from(self.copies.len()).ok()?.checked_add(1)?;
+        if next & MEMORY_READ_ONLY != 0 {
             return None;
         }
         // SAFETY: a live buffer.
@@ -332,7 +332,7 @@ impl Memory {
             let Some(shadow) = crate::shadow::find(start, PAGE) else {
                 return false;
             };
-            let fresh = !self.numbers.contains_key(&(Arc::as_ptr(&shadow) as usize));
+            let fresh = !self.numbers.contains_key(&shadow.id());
             let Some(n) = self.number(shadow.clone()) else {
                 return false;
             };
@@ -741,12 +741,12 @@ impl Memory {
         }
     }
 
-    /// Every copy is brought up to date when `list` is submitted, after what
-    /// it deferred so far (once until a copy of the title's intervenes).
-    fn bring_up(&self, list: &HostList) {
+    /// Every addressable copy is brought up to date when `list` is submitted,
+    /// after what it deferred so far (once until a copy of the title's intervenes).
+    fn bring_up(&self, list: &HostList, count: usize) {
         let (start, len) = self.directory.1.span();
         self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies {
+        for shadow in &self.copies[..count.min(self.copies.len())] {
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
         }
@@ -984,7 +984,7 @@ pub(crate) fn ready(
                     m.land(at);
                 }
             });
-            m.bring_up(list);
+            m.bring_up(list, m.copies.len());
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
@@ -1025,24 +1025,7 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            // Every slot of the run: a number shows no view of another kind.
-            for n in 0..=COPIES {
-                heap.null_raw_uav_at(base + n);
-            }
-            (base, 0)
-        }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
-    }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    let (base, count) = heap.raw_page_views(&m.copies)?;
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which
@@ -1050,8 +1033,8 @@ pub(crate) fn ready(
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
     let first_read = list.first_use(READ);
-    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
-        m.bring_up(list);
+    if list.first_use(usize::MAX - (6 << 33) - count as usize) {
+        m.bring_up(list, count as usize);
     }
     if first_read {
         list.keep(&m.faults.0);
@@ -1067,6 +1050,7 @@ pub(crate) fn ready(
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
+        count,
     })
 }
 
@@ -1272,6 +1256,9 @@ mod dump {
         }
     }
 }
+
+#[cfg(test)]
+mod producer_tests;
 
 #[cfg(test)]
 mod tests {

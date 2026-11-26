@@ -123,7 +123,7 @@ pub(crate) struct RayMetaLoad {
 }
 
 /// Candidate value injected at the entry of a preserved in-loop any-hit sub-CFG.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CandidateInput {
     RayT,
     Bary(u8),
@@ -280,6 +280,9 @@ pub(crate) struct RayLoop {
 pub(crate) struct ResolvedRayInputs {
     /// Pre-allocated `RayQuery` handle (allocated in function entry block for dominance).
     pub rq: V,
+    /// Optional Pass 1 opaque-only (`CULL_NON_OPAQUE`) `RayQuery` handle for two-pass
+    /// `tMax` pre-shrink on eligible closest-hit `AnyHit` loops.
+    pub rq_opaque: Option<V>,
     /// Bound `RaytracingAccelerationStructure` SRV handle (`Lower::handle(..., (16, 0))`).
     pub tlas: V,
     /// Per-lane ray-active `i1` predicate when `active_ray_mask` is non-trivial.
@@ -296,8 +299,10 @@ pub(crate) struct ResolvedRayInputs {
     pub instance_mask: Option<V>,
     /// Dynamic `ray_flags` `i32` (`None` when `rl.ray_flags` is `Const`).
     pub ray_flags: Option<V>,
-    /// Constant `constRayFlags` baked into `AllocateRayQuery` for this loop's `rq_group`.
+    /// Constant `constRayFlags` baked into `AllocateRayQuery` for `rq`.
     pub group_const_flags: u32,
+    /// Constant `constRayFlags` baked into `AllocateRayQuery` for `rq_opaque` (when two-pass).
+    pub group_opaque_const_flags: u32,
     /// Initial `minFrontFaceT` `i32` (`f32` bits) for [`RayLoopKind::FrontBackTrack`].
     pub init_min_front_t: Option<V>,
     /// Initial loop-carried user state values for [`RayLoopKind::AnyHit`].
@@ -311,13 +316,37 @@ pub(crate) struct ResolvedRayInputs {
 /// Pending `Proceed()` loop blocks/PHIs completed when `Lower` reaches [`AnyHitInfo::tail_block`].
 pub(crate) struct PendingAnyHit {
     pub start_blk: usize,
-    pub cand_check_blk: usize,
+    /// `None` when `SKIP_PROCEDURAL_PRIMITIVES` is constant and `cand_check_blk` was elided.
+    pub cand_check_blk: Option<usize>,
     pub anyhit_bridge_blk: usize,
     pub do_commit_blk: usize,
     pub latch_blk: usize,
     pub state_phis: Vec<V>,
     pub latch_phis: Vec<V>,
     pub init_vals: Vec<V>,
+}
+
+/// Returns `true` when `rl` is eligible for two-pass `tMax` pre-shrink:
+/// a closest-hit `AnyHit` loop with no loop-carried state variables and constant
+/// `ray_flags` that do not force or cull opaque/non-opaque geometry.
+pub(crate) fn is_two_pass_eligible(rl: &RayLoop) -> bool {
+    let RayLoopKind::AnyHit(ah) = &rl.kind else {
+        return false;
+    };
+    if ah.accept_first_hit || !ah.state_vars.is_empty() {
+        return false;
+    }
+    matches!(
+        rl.ray_flags,
+        RayInput::Const(f)
+            if (f
+                & (ray_flag::FORCE_OPAQUE
+                    | ray_flag::FORCE_NON_OPAQUE
+                    | ray_flag::CULL_OPAQUE
+                    | ray_flag::CULL_NON_OPAQUE
+                    | ray_flag::ACCEPT_FIRST_HIT_AND_END_SEARCH))
+                == 0
+    )
 }
 
 /// Output of [`emit_ray_loop`].
@@ -720,6 +749,7 @@ impl<'a> Analyzer<'a> {
         struct GroupInfo {
             id: usize,
             const_flags: Option<u32>,
+            two_pass: bool,
             defs: HashSet<usize>,
             live: HashSet<usize>,
         }
@@ -727,11 +757,13 @@ impl<'a> Analyzer<'a> {
         for &gid in &group_ids {
             let mut const_flags: Option<u32> = None;
             let mut mixed_flags = false;
+            let mut two_pass = true;
             let mut defs: HashSet<usize> = HashSet::new();
             let mut live: HashSet<usize> = HashSet::new();
             let mut work: Vec<usize> = Vec::new();
             for &idx in &group_loops[&gid] {
                 let rl = &lifted[idx];
+                two_pass &= is_two_pass_eligible(rl);
                 match rl.ray_flags {
                     RayInput::Const(f) => match const_flags {
                         Some(prev) if prev != f => mixed_flags = true,
@@ -752,10 +784,22 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
+            // Forward-reachable blocks from `defs`: keeps backward liveness restricted to
+            // paths that can execute after this group's trace, preventing spurious
+            // interference via pre-loop bypass edges.
+            let mut fwd_reach: HashSet<usize> = defs.clone();
+            let mut fwd_work: Vec<usize> = defs.iter().copied().collect();
+            while let Some(b) = fwd_work.pop() {
+                for succ in self.p.blocks[b].exit.successors() {
+                    if fwd_reach.insert(succ) {
+                        fwd_work.push(succ);
+                    }
+                }
+            }
             // Backward dataflow from post-loop committed metadata loads back to `defs`.
             while let Some(b) = work.pop() {
                 for &pred in &self.p.blocks[b].preds {
-                    if defs.contains(&pred) {
+                    if defs.contains(&pred) || !fwd_reach.contains(&pred) {
                         continue;
                     }
                     if live.insert(pred) {
@@ -766,19 +810,21 @@ impl<'a> Analyzer<'a> {
             infos.push(GroupInfo {
                 id: gid,
                 const_flags: if mixed_flags { None } else { const_flags },
+                two_pass,
                 defs,
                 live,
             });
         }
 
-        // Greedy interference-free merging of groups sharing the exact same constant `ray_flags`.
+        // Greedy interference-free merging of groups sharing the exact same constant `ray_flags`
+        // and two-pass eligibility.
         let mut merged: Vec<GroupInfo> = Vec::new();
         let mut remap: HashMap<usize, usize> = HashMap::new();
         for g in infos {
             let mut target_idx: Option<usize> = None;
             if let Some(cf) = g.const_flags {
                 for (mi, m) in merged.iter().enumerate() {
-                    if m.const_flags != Some(cf) {
+                    if m.const_flags != Some(cf) || m.two_pass != g.two_pass {
                         continue;
                     }
                     let clash = g.defs.iter().any(|b| m.live.contains(b))
@@ -855,11 +901,16 @@ impl<'a> Analyzer<'a> {
         let ray_flags = self.extract_ray_flags(nodes, &tri_hit)?;
         let instance_mask = self.extract_instance_mask(template, nodes, entry_block)?;
 
-        // Closest-hit `AnyHit` loops (`accept_first_hit == false`) execute memory-heavy
-        // material/alpha-test callbacks inside `while (Proceed())`, which is slower on RDNA 4
-        // DXR than the GDK-compiled inline BVH loop; keep them on software BVH by default unless
-        // `VICTORY_NATIVE_RT_ANYHIT=1` is set.
+        // Closest-hit `AnyHit` loops with `FORCE_NON_OPAQUE` (or dynamic flags) exit hardware
+        // traversal on every opaque triangle (`020`/`018`/`024` L0..2), which trails the inline
+        // BVH loop on RDNA 4; non-`FORCE_NON_OPAQUE` closest-hit `AnyHit` loops (`003`, `015`,
+        // `062`, `024` L3) beat SW-RT by 2.8x-5.5x on native DXR and are lifted by default.
+        let is_force_non_opaque = !matches!(
+            ray_flags,
+            RayInput::Const(f) if (f & ray_flag::FORCE_NON_OPAQUE) == 0
+        );
         if matches!(&tri_hit.mode, HitMode::AnyHit(ah) if !ah.accept_first_hit)
+            && is_force_non_opaque
             && !super::native_rt_anyhit()
         {
             return None;
@@ -6941,6 +6992,100 @@ pub(crate) fn emit_ray_loop(
     }
 }
 
+/// Materializes a lazy candidate triangle query (`RayT`, `Bary`, `FrontFace`) in `block`.
+pub(crate) fn emit_cand_input(s: &mut Shader, block: usize, rq: V, ci: CandidateInput) -> V {
+    let i32t = s.t.i32;
+    match ci {
+        CandidateInput::RayT => {
+            let tf = s.ray_query_state_f32(block, rq_op::CANDIDATE_TRIANGLE_RAY_T, rq);
+            s.m.cast(block, Cast::Bitcast, tf, i32t)
+        }
+        CandidateInput::Bary(comp) => {
+            let bf = s.ray_query_state_vec_f32(
+                block,
+                rq_op::CANDIDATE_TRIANGLE_BARYCENTRICS,
+                rq,
+                comp,
+            );
+            s.m.cast(block, Cast::Bitcast, bf, i32t)
+        }
+        CandidateInput::FrontFace => {
+            let ff = s.ray_query_state_i1(block, rq_op::CANDIDATE_TRIANGLE_FRONT_FACE, rq);
+            let front = s.m.i32(0xFE);
+            let back = s.m.i32(0xFF);
+            s.m.select(block, ff, front, back)
+        }
+        _ => unreachable!("only lazy candidate queries use emit_cand_input"),
+    }
+}
+
+fn emit_committed_hit_output(
+    s: &mut Shader,
+    block: usize,
+    rq: V,
+    output: RayOutput,
+    i32t: super::bitcode::Ty,
+) -> V {
+    match output {
+        RayOutput::CommittedStatusTriNode => s.m.i32(1),
+        RayOutput::CommittedRayT => {
+            let t_f = s.ray_query_state_f32(block, rq_op::COMMITTED_RAY_T, rq);
+            s.m.cast(block, Cast::Bitcast, t_f, i32t)
+        }
+        RayOutput::CommittedBary(comp) => {
+            let b_f = s.ray_query_state_vec_f32(
+                block,
+                rq_op::COMMITTED_TRIANGLE_BARYCENTRICS,
+                rq,
+                comp,
+            );
+            s.m.cast(block, Cast::Bitcast, b_f, i32t)
+        }
+        RayOutput::CommittedFrontFace => {
+            let ff = s.ray_query_state_i1(block, rq_op::COMMITTED_TRIANGLE_FRONT_FACE, rq);
+            let front = s.m.i32(0xFE);
+            let back = s.m.i32(0xFF);
+            s.m.select(block, ff, front, back)
+        }
+        RayOutput::CommittedInstanceIndex => {
+            s.ray_query_state_i32(block, rq_op::COMMITTED_INSTANCE_INDEX, rq)
+        }
+        RayOutput::CommittedInstanceId => {
+            s.ray_query_state_i32(block, rq_op::COMMITTED_INSTANCE_ID, rq)
+        }
+        RayOutput::CommittedInstanceContribution => {
+            s.ray_query_state_i32(block, rq_op::COMMITTED_INSTANCE_CONTRIBUTION, rq)
+        }
+        RayOutput::CommittedGeometryIndex => {
+            s.ray_query_state_i32(block, rq_op::COMMITTED_GEOMETRY_INDEX, rq)
+        }
+        RayOutput::CommittedPrimitiveIndex => {
+            s.ray_query_state_i32(block, rq_op::COMMITTED_PRIMITIVE_INDEX, rq)
+        }
+        RayOutput::CommittedObjectToWorld(row, col) => {
+            let m = s.ray_query_state_mat_f32(
+                block,
+                rq_op::COMMITTED_OBJECT_TO_WORLD_3X4,
+                rq,
+                row,
+                col,
+            );
+            s.m.cast(block, Cast::Bitcast, m, i32t)
+        }
+        RayOutput::CommittedWorldToObject(row, col) => {
+            let m = s.ray_query_state_mat_f32(
+                block,
+                rq_op::COMMITTED_WORLD_TO_OBJECT_3X4,
+                rq,
+                row,
+                col,
+            );
+            s.m.cast(block, Cast::Bitcast, m, i32t)
+        }
+        _ => unreachable!("non-committed output in emit_committed_hit_output"),
+    }
+}
+
 fn emit_trace_body(
     s: &mut Shader,
     start_blk: usize,
@@ -6949,12 +7094,6 @@ fn emit_trace_body(
     i32t: super::bitcode::Ty,
     f32t: super::bitcode::Ty,
 ) -> (usize, Vec<(Value, V)>, Vec<(Value, V)>, Option<PendingAnyHit>) {
-    let dyn_flags = match rl.ray_flags {
-        RayInput::Const(f) => s.m.i32(f & !inputs.group_const_flags),
-        RayInput::Val(_) => inputs.ray_flags.unwrap_or_else(|| s.m.i32(0)),
-        RayInput::ShiftedMask(_) => s.m.i32(0),
-    };
-
     let mask = match rl.instance_mask {
         RayInput::Const(m) => s.m.i32(m & 0xFF),
         RayInput::Val(_) => {
@@ -6986,21 +7125,82 @@ fn emit_trace_body(
     let t_max = s.m.cast(start_blk, Cast::Bitcast, inputs.t_max, f32t);
 
     let rq = inputs.rq;
-    s.ray_query_trace_inline(
-        start_blk,
-        rq,
-        inputs.tlas,
-        dyn_flags,
-        mask,
-        origin,
-        t_min,
-        dir,
-        t_max,
-    );
+    let skip_proc = (inputs.group_const_flags & ray_flag::SKIP_PROCEDURAL_PRIMITIVES) != 0
+        || matches!(rl.ray_flags, RayInput::Const(f) if (f & ray_flag::SKIP_PROCEDURAL_PRIMITIVES) != 0);
+
+    // Two-pass tMax pre-shrink: Pass 1 (CULL_NON_OPAQUE, never FORCE_OPAQUE) finds the closest
+    // opaque hit to tighten tMax before Pass 2 (CULL_OPAQUE) runs AnyHit.
+    let (trace_start_blk, two_pass_q1) = if let (RayLoopKind::AnyHit(_), Some(q1)) =
+        (&rl.kind, inputs.rq_opaque)
+    {
+        let orig_f = match rl.ray_flags {
+            RayInput::Const(f) => f,
+            _ => unreachable!("two-pass requires constant ray flags"),
+        };
+        let dyn_flags_p1 = s.m.i32(
+            (orig_f | ray_flag::CULL_NON_OPAQUE) & !inputs.group_opaque_const_flags,
+        );
+        s.ray_query_trace_inline(
+            start_blk,
+            q1,
+            inputs.tlas,
+            dyn_flags_p1,
+            mask,
+            origin,
+            t_min,
+            dir,
+            t_max,
+        );
+        let p1_proceed_blk = s.m.new_block();
+        let p2_start_blk = s.m.new_block();
+        s.m.terminate(start_blk, Term::Br(p1_proceed_blk));
+
+        let p1_more = s.ray_query_proceed(p1_proceed_blk, q1);
+        s.m.terminate(p1_proceed_blk, Term::CondBr(p1_more, p1_proceed_blk, p2_start_blk));
+
+        let p1_status = s.ray_query_state_i32(p2_start_blk, rq_op::COMMITTED_STATUS, q1);
+        let one = s.m.i32(1);
+        let q1_hit = s.m.cmp(p2_start_blk, pred::EQ, p1_status, one);
+        let p1_t = s.ray_query_state_f32(p2_start_blk, rq_op::COMMITTED_RAY_T, q1);
+        let t_clamp = s.m.select(p2_start_blk, q1_hit, p1_t, t_max);
+
+        let dyn_flags_p2 =
+            s.m.i32((orig_f | ray_flag::CULL_OPAQUE) & !inputs.group_const_flags);
+        s.ray_query_trace_inline(
+            p2_start_blk,
+            rq,
+            inputs.tlas,
+            dyn_flags_p2,
+            mask,
+            origin,
+            t_min,
+            dir,
+            t_clamp,
+        );
+        (p2_start_blk, Some((q1, q1_hit, p1_t)))
+    } else {
+        let dyn_flags = match rl.ray_flags {
+            RayInput::Const(f) => s.m.i32(f & !inputs.group_const_flags),
+            RayInput::Val(_) => inputs.ray_flags.unwrap_or_else(|| s.m.i32(0)),
+            RayInput::ShiftedMask(_) => s.m.i32(0),
+        };
+        s.ray_query_trace_inline(
+            start_blk,
+            rq,
+            inputs.tlas,
+            dyn_flags,
+            mask,
+            origin,
+            t_min,
+            dir,
+            t_max,
+        );
+        (start_blk, None)
+    };
 
     let proceed_blk = s.m.new_block();
     let after_blk = s.m.new_block();
-    s.m.terminate(start_blk, Term::Br(proceed_blk));
+    s.m.terminate(trace_start_blk, Term::Br(proceed_blk));
 
     let mut front_back_min_f: Option<V> = None;
     let mut state_phis: Vec<V> = Vec::new();
@@ -7014,21 +7214,26 @@ fn emit_trace_body(
         }
         RayLoopKind::FrontBackTrack { .. } => {
             let init_i = inputs.init_min_front_t.unwrap_or(inputs.t_max);
-            let init_f = s.m.cast(start_blk, Cast::Bitcast, init_i, f32t);
+            let init_f = s.m.cast(trace_start_blk, Cast::Bitcast, init_i, f32t);
             let min_phi = s.m.phi(proceed_blk, f32t);
-            let cand_blk = s.m.new_block();
             let tri_blk = s.m.new_block();
             let front_blk = s.m.new_block();
             let back_blk = s.m.new_block();
             let latch_blk = s.m.new_block();
 
             let more = s.ray_query_proceed(proceed_blk, rq);
-            s.m.terminate(proceed_blk, Term::CondBr(more, cand_blk, after_blk));
-
-            let ctype = s.ray_query_state_i32(cand_blk, rq_op::CANDIDATE_TYPE, rq);
-            let zero = s.m.i32(0);
-            let is_tri = s.m.cmp(cand_blk, pred::EQ, ctype, zero);
-            s.m.terminate(cand_blk, Term::CondBr(is_tri, tri_blk, latch_blk));
+            let cand_blk = if skip_proc {
+                s.m.terminate(proceed_blk, Term::CondBr(more, tri_blk, after_blk));
+                None
+            } else {
+                let cb = s.m.new_block();
+                s.m.terminate(proceed_blk, Term::CondBr(more, cb, after_blk));
+                let ctype = s.ray_query_state_i32(cb, rq_op::CANDIDATE_TYPE, rq);
+                let zero = s.m.i32(0);
+                let is_tri = s.m.cmp(cb, pred::EQ, ctype, zero);
+                s.m.terminate(cb, Term::CondBr(is_tri, tri_blk, latch_blk));
+                Some(cb)
+            };
 
             let is_ff = s.ray_query_state_i1(tri_blk, rq_op::CANDIDATE_TRIANGLE_FRONT_FACE, rq);
             s.m.terminate(tri_blk, Term::CondBr(is_ff, front_blk, back_blk));
@@ -7042,16 +7247,16 @@ fn emit_trace_body(
             s.m.terminate(back_blk, Term::Br(latch_blk));
 
             let min_latch = s.m.phi(latch_blk, f32t);
-            s.m.set_phi(
-                min_latch,
-                vec![(min_phi, cand_blk), (new_min, front_blk), (min_phi, back_blk)],
-            );
+            let mut latch_in = vec![(new_min, front_blk), (min_phi, back_blk)];
+            if let Some(cb) = cand_blk {
+                latch_in.push((min_phi, cb));
+            }
+            s.m.set_phi(min_latch, latch_in);
             s.m.terminate(latch_blk, Term::Br(proceed_blk));
-            s.m.set_phi(min_phi, vec![(init_f, start_blk), (min_latch, latch_blk)]);
+            s.m.set_phi(min_phi, vec![(init_f, trace_start_blk), (min_latch, latch_blk)]);
             front_back_min_f = Some(min_phi);
         }
         RayLoopKind::AnyHit(ah) => {
-            let cand_check_blk = s.m.new_block();
             let anyhit_bridge_blk = s.m.new_block();
             let do_commit_blk = s.m.new_block();
             let latch_blk = s.m.new_block();
@@ -7060,48 +7265,27 @@ fn emit_trace_body(
                 state_phis.push(s.m.phi(proceed_blk, i32t));
             }
             let more = s.ray_query_proceed(proceed_blk, rq);
-            s.m.terminate(proceed_blk, Term::CondBr(more, cand_check_blk, after_blk));
+            let cand_check_blk = if skip_proc {
+                s.m.terminate(proceed_blk, Term::CondBr(more, anyhit_bridge_blk, after_blk));
+                None
+            } else {
+                let cb = s.m.new_block();
+                s.m.terminate(proceed_blk, Term::CondBr(more, cb, after_blk));
+                let ctype = s.ray_query_state_i32(cb, rq_op::CANDIDATE_TYPE, rq);
+                let zero = s.m.i32(0);
+                let is_tri = s.m.cmp(cb, pred::EQ, ctype, zero);
+                s.m.terminate(cb, Term::CondBr(is_tri, anyhit_bridge_blk, latch_blk));
+                Some(cb)
+            };
 
-            let ctype = s.ray_query_state_i32(cand_check_blk, rq_op::CANDIDATE_TYPE, rq);
-            let zero = s.m.i32(0);
-            let is_tri = s.m.cmp(cand_check_blk, pred::EQ, ctype, zero);
-            s.m.terminate(cand_check_blk, Term::CondBr(is_tri, anyhit_bridge_blk, latch_blk));
-
-            // Materialize candidate inputs in `anyhit_bridge_blk` (dominates all of `ah.body_blocks`).
-            let mut cached_ray_t: Option<V> = None;
-            let mut cached_bary: [Option<V>; 2] = [None, None];
-            let mut cached_ff: Option<V> = None;
+            // Only bind zero-cost candidate inputs here; `RayT`, `Bary`, and `FrontFace` are
+            // materialized lazily on demand inside `Lower` so skipped/fast-rejected candidates
+            // avoid unnecessary `rayQuery_State*` intrinsics.
             for &(val_id, ci) in &ah.inputs {
                 let v = match ci {
-                    CandidateInput::RayT => *cached_ray_t.get_or_insert_with(|| {
-                        let tf = s.ray_query_state_f32(
-                            anyhit_bridge_blk,
-                            rq_op::CANDIDATE_TRIANGLE_RAY_T,
-                            rq,
-                        );
-                        s.m.cast(anyhit_bridge_blk, Cast::Bitcast, tf, i32t)
-                    }),
-                    CandidateInput::Bary(comp) => {
-                        *cached_bary[comp as usize].get_or_insert_with(|| {
-                            let bf = s.ray_query_state_vec_f32(
-                                anyhit_bridge_blk,
-                                rq_op::CANDIDATE_TRIANGLE_BARYCENTRICS,
-                                rq,
-                                comp,
-                            );
-                            s.m.cast(anyhit_bridge_blk, Cast::Bitcast, bf, i32t)
-                        })
+                    CandidateInput::RayT | CandidateInput::Bary(_) | CandidateInput::FrontFace => {
+                        continue;
                     }
-                    CandidateInput::FrontFace => *cached_ff.get_or_insert_with(|| {
-                        let ff = s.ray_query_state_i1(
-                            anyhit_bridge_blk,
-                            rq_op::CANDIDATE_TRIANGLE_FRONT_FACE,
-                            rq,
-                        );
-                        let front = s.m.i32(0xFE);
-                        let back = s.m.i32(0xFF);
-                        s.m.select(anyhit_bridge_blk, ff, front, back)
-                    }),
                     CandidateInput::One => s.m.i32(1),
                     CandidateInput::Zero => s.m.i32(0),
                     CandidateInput::CopyOf(pre) => inputs
@@ -7122,14 +7306,19 @@ fn emit_trace_body(
             }
             s.m.terminate(do_commit_blk, Term::Br(latch_blk));
 
-            let mut latch_phis = Vec::with_capacity(ah.state_vars.len());
-            for _ in &ah.state_vars {
-                latch_phis.push(s.m.phi(latch_blk, i32t));
+            // When `cand_check_blk` is elided, `tail_blk` dominates `latch_blk` and `do_commit_blk`
+            // does not alter `state_vars`, so `next_vals[k]` feeds `state_phis[k]` directly.
+            let mut latch_phis = Vec::new();
+            if cand_check_blk.is_some() {
+                latch_phis.reserve(ah.state_vars.len());
+                for _ in &ah.state_vars {
+                    latch_phis.push(s.m.phi(latch_blk, i32t));
+                }
             }
             s.m.terminate(latch_blk, Term::Br(proceed_blk));
 
             pending_anyhit = Some(PendingAnyHit {
-                start_blk,
+                start_blk: trace_start_blk,
                 cand_check_blk,
                 anyhit_bridge_blk,
                 do_commit_blk,
@@ -7139,6 +7328,95 @@ fn emit_trace_body(
                 init_vals: inputs.anyhit_inits.clone(),
             });
         }
+    }
+
+    if let Some((q1, q1_hit, p1_t)) = two_pass_q1 {
+        let q2_status = s.ray_query_state_i32(after_blk, rq_op::COMMITTED_STATUS, rq);
+        let one = s.m.i32(1);
+        let q2_hit = s.m.cmp(after_blk, pred::EQ, q2_status, one);
+        let needs_hit_fields = rl.outputs.iter().any(|b| {
+            !matches!(
+                b.output,
+                RayOutput::CommittedStatusTriNode | RayOutput::Zero | RayOutput::CopyOf(_)
+            )
+        });
+        if !needs_hit_fields {
+            let any_hit = s.m.bin(after_blk, Bin::Or, q2_hit, q1_hit);
+            let zero = s.m.i32(0);
+            let mut outs = Vec::with_capacity(rl.outputs.len());
+            for binding in &rl.outputs {
+                let v = match binding.output {
+                    RayOutput::CommittedStatusTriNode => s.m.select(after_blk, any_hit, one, zero),
+                    RayOutput::Zero => zero,
+                    RayOutput::CopyOf(pre) => inputs
+                        .fallbacks
+                        .get(&pre)
+                        .copied()
+                        .unwrap_or(zero),
+                    _ => unreachable!(),
+                };
+                outs.push((binding.value, v));
+            }
+            return (after_blk, outs, cand_outs, pending_anyhit);
+        }
+
+        let from_q2_blk = s.m.new_block();
+        let check_q1_blk = s.m.new_block();
+        let from_q1_blk = s.m.new_block();
+        let miss_blk = s.m.new_block();
+        let done_blk = s.m.new_block();
+
+        s.m.terminate(after_blk, Term::CondBr(q2_hit, from_q2_blk, check_q1_blk));
+        s.m.terminate(check_q1_blk, Term::CondBr(q1_hit, from_q1_blk, miss_blk));
+
+        let mut outs = Vec::with_capacity(rl.outputs.len());
+        for binding in &rl.outputs {
+            let v = match binding.output {
+                RayOutput::Zero => s.m.i32(0),
+                RayOutput::CopyOf(pre) => inputs
+                    .fallbacks
+                    .get(&pre)
+                    .copied()
+                    .unwrap_or_else(|| s.m.i32(0)),
+                RayOutput::AnyHitState(k) => state_phis[k],
+                RayOutput::FrontBackMinFrontT => {
+                    let mf = front_back_min_f.expect("front_back min phi");
+                    s.m.cast(done_blk, Cast::Bitcast, mf, i32t)
+                }
+                committed => {
+                    let v2 = emit_committed_hit_output(s, from_q2_blk, rq, committed, i32t);
+                    // Reuse `p1_t` instead of querying `COMMITTED_RAY_T(q1)` a second time:
+                    // AMD RDNA 4 (`amdxc64.dll`) adds `tMin` twice on a repeated read across `q2`.
+                    let v1 = if matches!(committed, RayOutput::CommittedRayT) {
+                        s.m.cast(from_q1_blk, Cast::Bitcast, p1_t, i32t)
+                    } else {
+                        emit_committed_hit_output(s, from_q1_blk, q1, committed, i32t)
+                    };
+                    let v_miss = match committed {
+                        RayOutput::CommittedRayT => binding
+                            .fallback
+                            .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                            .unwrap_or(inputs.t_max),
+                        RayOutput::CommittedBary(_) | RayOutput::CommittedFrontFace => binding
+                            .fallback
+                            .and_then(|fb| inputs.fallbacks.get(&fb).copied())
+                            .unwrap_or_else(|| s.m.i32(0)),
+                        _ => s.m.i32(0),
+                    };
+                    let phi = s.m.phi(done_blk, i32t);
+                    s.m.set_phi(
+                        phi,
+                        vec![(v2, from_q2_blk), (v1, from_q1_blk), (v_miss, miss_blk)],
+                    );
+                    phi
+                }
+            };
+            outs.push((binding.value, v));
+        }
+        s.m.terminate(from_q2_blk, Term::Br(done_blk));
+        s.m.terminate(from_q1_blk, Term::Br(done_blk));
+        s.m.terminate(miss_blk, Term::Br(done_blk));
+        return (done_blk, outs, cand_outs, pending_anyhit);
     }
 
     // Read `CommittedStatus` once if any output needs hit/miss selection.
@@ -7625,6 +7903,7 @@ mod tests {
 
         let inputs = ResolvedRayInputs {
             rq,
+            rq_opaque: None,
             tlas,
             active_ray: Some(s.m.bool(true)),
             origin: [zero, zero, zero],
@@ -7637,6 +7916,7 @@ mod tests {
                 | ray_flag::ACCEPT_FIRST_HIT_AND_END_SEARCH
                 | ray_flag::CULL_BACK_FACING_TRIANGLES
                 | ray_flag::SKIP_PROCEDURAL_PRIMITIVES,
+            group_opaque_const_flags: 0,
             init_min_front_t: None,
             anyhit_inits: vec![],
             anyhit_entry_dxil: None,
@@ -7712,6 +7992,7 @@ mod tests {
 
         let inputs = ResolvedRayInputs {
             rq,
+            rq_opaque: None,
             tlas,
             active_ray: Some(s.m.bool(true)),
             origin: [zero, zero, zero],
@@ -7721,6 +8002,7 @@ mod tests {
             instance_mask: None,
             ray_flags: None,
             group_const_flags: flags,
+            group_opaque_const_flags: 0,
             init_min_front_t: Some(ten_f),
             anyhit_inits: vec![],
             anyhit_entry_dxil: None,
@@ -7822,6 +8104,7 @@ mod tests {
 
         let inputs = ResolvedRayInputs {
             rq,
+            rq_opaque: None,
             tlas,
             active_ray: Some(s.m.bool(true)),
             origin: [zero, zero, zero],
@@ -7831,6 +8114,7 @@ mod tests {
             instance_mask: None,
             ray_flags: None,
             group_const_flags: flags,
+            group_opaque_const_flags: 0,
             init_min_front_t: None,
             anyhit_inits: vec![zero],
             anyhit_entry_dxil: Some(anyhit_body),
@@ -7839,7 +8123,16 @@ mod tests {
 
         let emitted = emit_ray_loop(&mut s, entry, exit, &rl, &inputs);
         let pending = emitted.pending_anyhit.expect("pending anyhit");
-        // Exercise candidate metadata emission inside the preserved any-hit block.
+        // SKIP_PROCEDURAL_PRIMITIVES elides `cand_check_blk` and redundant `latch_phis`.
+        assert!(pending.cand_check_blk.is_none());
+        assert!(pending.latch_phis.is_empty());
+        // Lazy `CandidateInput::{RayT, Bary, FrontFace}` are NOT eagerly emitted in `outs`.
+        assert!(!emitted.outs.iter().any(|&(v, _)| matches!(v, Value(15) | Value(16) | Value(17))));
+        assert!(emitted.outs.iter().any(|&(v, _)| v == Value(18)));
+        // Exercise lazy candidate query + candidate metadata emission inside the any-hit block.
+        let _cand_t = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::RayT);
+        let _cand_bary = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::Bary(0));
+        let _cand_ff = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::FrontFace);
         let cand_inst = emit_ray_meta_load(&mut s, anyhit_body, rq, true, RayMetaKind::InstanceId, 1);
         let cand_geom =
             emit_ray_meta_load(&mut s, anyhit_body, rq, true, RayMetaKind::GeometryIndexShl8, 1);
@@ -7849,18 +8142,10 @@ mod tests {
             Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
         );
         s.m.set_phi(
-            pending.latch_phis[0],
-            vec![
-                (pending.state_phis[0], pending.cand_check_blk),
-                (cand_geom[0], anyhit_body),
-                (cand_geom[0], pending.do_commit_blk),
-            ],
-        );
-        s.m.set_phi(
             pending.state_phis[0],
             vec![
                 (pending.init_vals[0], pending.start_blk),
-                (pending.latch_phis[0], pending.latch_blk),
+                (cand_geom[0], pending.latch_blk),
             ],
         );
         // Exercise committed metadata emission post-loop.
@@ -7876,5 +8161,429 @@ mod tests {
         ) {
             v.validate(&mut dxbc).expect("AnyHit + meta loads DXIL valid");
         }
+    }
+
+    #[test]
+    fn anyhit_without_skip_procedural_keeps_cand_check_blk_and_validates() {
+        let mut s = Shader::new(false);
+        s.threads = Some([8, 8, 1]);
+        let entry = s.entry;
+        let anyhit_body = s.m.new_block();
+        let exit = s.m.new_block();
+        let tlas = s.rtas_root_srv_handle(entry, 0);
+
+        let flags = ray_flag::CULL_BACK_FACING_TRIANGLES;
+        let rl = RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 3,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::AnyHit(AnyHitInfo {
+                opacity_block: 1,
+                entry_block: 2,
+                tail_block: 2,
+                body_blocks: vec![2],
+                skipped_tail_insts: vec![],
+                accept_mask: Value(20),
+                accept_invert: false,
+                accept_first_hit: false,
+                inputs: vec![(Value(18), CandidateInput::StateVar(0))],
+                const_lane_atoms: vec![],
+                state_vars: vec![AnyHitStateVar {
+                    init: RayInput::Const(0),
+                    next: Value(19),
+                    reg: Reg::V(0),
+                }],
+                cand_meta_loads: vec![],
+            }),
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(3)),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: RayInput::Const(flags),
+            outputs: vec![RayOutputBinding {
+                value: Value(11),
+                output: RayOutput::AnyHitState(0),
+                fallback: Some(Value(0)),
+            }],
+            committed_meta_loads: vec![],
+        };
+
+        let rq = s.allocate_ray_query(entry, flags);
+        let zero = s.m.i32(0);
+        let one_f = s.m.i32(1.0f32.to_bits());
+        let ten_f = s.m.i32(10.0f32.to_bits());
+        let inputs = ResolvedRayInputs {
+            rq,
+            rq_opaque: None,
+            tlas,
+            active_ray: None,
+            origin: [zero, zero, zero],
+            t_min: None,
+            dir: [one_f, zero, zero],
+            t_max: ten_f,
+            instance_mask: None,
+            ray_flags: None,
+            group_const_flags: flags,
+            group_opaque_const_flags: 0,
+            init_min_front_t: None,
+            anyhit_inits: vec![zero],
+            anyhit_entry_dxil: Some(anyhit_body),
+            fallbacks: HashMap::new(),
+        };
+
+        let emitted = emit_ray_loop(&mut s, entry, exit, &rl, &inputs);
+        let pending = emitted.pending_anyhit.expect("pending anyhit");
+        let cb = pending
+            .cand_check_blk
+            .expect("cand_check_blk kept when SKIP_PROCEDURAL_PRIMITIVES is unset");
+        assert_eq!(pending.latch_phis.len(), 1);
+        let cand_t = emit_cand_input(&mut s, anyhit_body, rq, CandidateInput::RayT);
+        let accept = s.m.cmp(anyhit_body, pred::NE, cand_t, zero);
+        s.m.terminate(
+            anyhit_body,
+            Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+        );
+        s.m.set_phi(
+            pending.latch_phis[0],
+            vec![
+                (pending.state_phis[0], cb),
+                (cand_t, anyhit_body),
+                (cand_t, pending.do_commit_blk),
+            ],
+        );
+        s.m.set_phi(
+            pending.state_phis[0],
+            vec![
+                (pending.init_vals[0], pending.start_blk),
+                (pending.latch_phis[0], pending.latch_blk),
+            ],
+        );
+        s.m.terminate(exit, Term::Ret);
+
+        let mut dxbc = s.finish();
+        assert!(dxbc.starts_with(b"DXBC"));
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxbc)
+                .expect("AnyHit without SKIP_PROCEDURAL_PRIMITIVES DXIL valid");
+        }
+    }
+
+    #[test]
+    fn two_pass_eligibility_and_dxil_valid() {
+        let make_anyhit = |flags: RayInput, accept_first_hit: bool, with_state: bool| RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 3,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::AnyHit(AnyHitInfo {
+                opacity_block: 1,
+                entry_block: 2,
+                tail_block: 2,
+                body_blocks: vec![2],
+                skipped_tail_insts: vec![],
+                accept_mask: Value(20),
+                accept_invert: false,
+                accept_first_hit,
+                inputs: vec![(Value(15), CandidateInput::RayT)],
+                const_lane_atoms: vec![],
+                state_vars: if with_state {
+                    vec![AnyHitStateVar {
+                        init: RayInput::Const(0),
+                        next: Value(19),
+                        reg: Reg::V(0),
+                    }]
+                } else {
+                    vec![]
+                },
+                cand_meta_loads: vec![],
+            }),
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(3)),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: flags,
+            outputs: vec![
+                RayOutputBinding {
+                    value: Value(10),
+                    output: RayOutput::CommittedStatusTriNode,
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(11),
+                    output: RayOutput::CommittedRayT,
+                    fallback: Some(Value(3)),
+                },
+                RayOutputBinding {
+                    value: Value(12),
+                    output: RayOutput::CommittedBary(0),
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(13),
+                    output: RayOutput::CommittedFrontFace,
+                    fallback: Some(Value(0)),
+                },
+                RayOutputBinding {
+                    value: Value(14),
+                    output: RayOutput::CommittedInstanceIndex,
+                    fallback: None,
+                },
+                RayOutputBinding {
+                    value: Value(16),
+                    output: RayOutput::CommittedObjectToWorld(0, 0),
+                    fallback: None,
+                },
+            ],
+            committed_meta_loads: vec![],
+        };
+
+        let eligible = make_anyhit(
+            RayInput::Const(
+                ray_flag::CULL_BACK_FACING_TRIANGLES | ray_flag::SKIP_PROCEDURAL_PRIMITIVES,
+            ),
+            false,
+            false,
+        );
+        assert!(is_two_pass_eligible(&eligible));
+        assert!(is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::NONE),
+            false,
+            false
+        )));
+        assert!(!is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::FORCE_NON_OPAQUE),
+            false,
+            false
+        )));
+        assert!(!is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::FORCE_OPAQUE),
+            false,
+            false
+        )));
+        assert!(!is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::CULL_OPAQUE),
+            false,
+            false
+        )));
+        assert!(!is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::CULL_NON_OPAQUE),
+            false,
+            false
+        )));
+        assert!(!is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::NONE),
+            true,
+            false
+        )));
+        assert!(!is_two_pass_eligible(&make_anyhit(
+            RayInput::Const(ray_flag::NONE),
+            false,
+            true
+        )));
+        assert!(!is_two_pass_eligible(&make_anyhit(
+            RayInput::Val(Value(99)),
+            false,
+            false
+        )));
+
+        let mut s = Shader::new(false);
+        s.threads = Some([8, 8, 1]);
+        let entry = s.entry;
+        let anyhit_body = s.m.new_block();
+        let exit = s.m.new_block();
+        let tlas = s.rtas_root_srv_handle(entry, 0);
+
+        let base_flags =
+            ray_flag::CULL_BACK_FACING_TRIANGLES | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let q1_flags = base_flags | ray_flag::CULL_NON_OPAQUE;
+        let q2_flags = base_flags | ray_flag::CULL_OPAQUE;
+        let q1 = s.allocate_ray_query(entry, q1_flags);
+        let q2 = s.allocate_ray_query(entry, q2_flags);
+
+        let zero = s.m.i32(0);
+        let one_f = s.m.i32(1.0f32.to_bits());
+        let ten_f = s.m.i32(10.0f32.to_bits());
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(Value(0), zero);
+        fallbacks.insert(Value(3), ten_f);
+
+        let inputs = ResolvedRayInputs {
+            rq: q2,
+            rq_opaque: Some(q1),
+            tlas,
+            active_ray: Some(s.m.bool(true)),
+            origin: [zero, zero, zero],
+            t_min: None,
+            dir: [one_f, zero, zero],
+            t_max: ten_f,
+            instance_mask: None,
+            ray_flags: None,
+            group_const_flags: q2_flags,
+            group_opaque_const_flags: q1_flags,
+            init_min_front_t: None,
+            anyhit_inits: vec![],
+            anyhit_entry_dxil: Some(anyhit_body),
+            fallbacks,
+        };
+
+        let emitted = emit_ray_loop(&mut s, entry, exit, &eligible, &inputs);
+        let pending = emitted.pending_anyhit.expect("pending anyhit");
+        assert!(pending.cand_check_blk.is_none());
+        let cand_t = emit_cand_input(&mut s, anyhit_body, q2, CandidateInput::RayT);
+        let accept = s.m.cmp(anyhit_body, pred::NE, cand_t, zero);
+        s.m.terminate(
+            anyhit_body,
+            Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk),
+        );
+        s.m.terminate(exit, Term::Ret);
+
+        let mut dxbc = s.finish();
+        assert!(dxbc.starts_with(b"DXBC"));
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxbc)
+                .expect("two-pass CULL_NON_OPAQUE + CULL_OPAQUE DXIL valid");
+        }
+    }
+
+    #[test]
+    fn coalesce_ray_query_groups_ignores_pre_loop_bypass_and_separates_two_pass() {
+        use crate::ir::Block;
+        // CFG:
+        //   0 (entry) -> 1 (L1) -> 2 (branch)
+        //   2 -> 3 (L2) -> 4 (join, reads L2 committed meta) -> 5 (end)
+        //   2 -> 4 (pre-loop bypass around L2!)
+        let blocks = vec![
+            Block {
+                offset: 0,
+                preds: vec![],
+                phis: vec![],
+                insts: vec![],
+                exit: Exit::Jump(1),
+            },
+            Block {
+                offset: 4,
+                preds: vec![0],
+                phis: vec![],
+                insts: vec![],
+                exit: Exit::Jump(2),
+            },
+            Block {
+                offset: 8,
+                preds: vec![1],
+                phis: vec![],
+                insts: vec![],
+                exit: Exit::Branch {
+                    taken: 3,
+                    not_taken: 4,
+                },
+            },
+            Block {
+                offset: 12,
+                preds: vec![2],
+                phis: vec![],
+                insts: vec![],
+                exit: Exit::Jump(4),
+            },
+            Block {
+                offset: 16,
+                preds: vec![2, 3],
+                phis: vec![],
+                insts: vec![],
+                exit: Exit::Jump(5),
+            },
+            Block {
+                offset: 20,
+                preds: vec![4],
+                phis: vec![],
+                insts: vec![],
+                exit: Exit::End,
+            },
+        ];
+        let prog = Program {
+            wave64: false,
+            vgprs: 32,
+            blocks,
+            inputs: vec![],
+        };
+        let st = crate::structure::structure(&prog).unwrap();
+        let res = crate::resource::track(&prog, &[], crate::native::HwStage::Cs, Some(&st)).unwrap();
+        let scalar = HashMap::new();
+        let analyzer = Analyzer::new(&prog, &st, &res, &scalar);
+
+        let make_loop = |rq_group: usize, entry_block: usize, exit_block: usize, kind: RayLoopKind, meta: Vec<(Site, RayMetaKind)>| RayLoop {
+            rq_group,
+            entry_block,
+            exit_block,
+            exit_pred: entry_block,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind,
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Const(0); 3],
+            t_min: None,
+            dir: [RayInput::Const(0); 3],
+            t_max: RayInput::Const(0),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: RayInput::Const(ray_flag::SKIP_PROCEDURAL_PRIMITIVES),
+            outputs: vec![],
+            committed_meta_loads: meta,
+        };
+
+        // Two OpaqueOnly loops separated by a pre-loop bypass around L2:
+        // L2's committed meta load at block 4 must NOT leak backward past the bypass into L1!
+        let mut loops_bypass = vec![
+            make_loop(0, 1, 2, RayLoopKind::OpaqueOnly, vec![]),
+            make_loop(1, 3, 4, RayLoopKind::OpaqueOnly, vec![((4, 0), RayMetaKind::PrimitiveIndex)]),
+        ];
+        analyzer.coalesce_ray_query_groups(&mut loops_bypass);
+        assert_eq!(
+            loops_bypass[0].rq_group, loops_bypass[1].rq_group,
+            "pre-loop bypass must not create spurious interference between L1 and L2"
+        );
+
+        // Two-pass-eligible AnyHit loop must NOT coalesce with a non-two-pass OpaqueOnly loop
+        // even when both share identical constant flags and do not interfere.
+        let ah_two_pass = RayLoopKind::AnyHit(AnyHitInfo {
+            opacity_block: 3,
+            entry_block: 3,
+            tail_block: 3,
+            body_blocks: vec![],
+            skipped_tail_insts: vec![],
+            accept_mask: Value(1),
+            accept_invert: false,
+            accept_first_hit: false,
+            inputs: vec![],
+            const_lane_atoms: vec![],
+            state_vars: vec![],
+            cand_meta_loads: vec![],
+        });
+        let mut loops_mixed = vec![
+            make_loop(0, 1, 2, RayLoopKind::OpaqueOnly, vec![]),
+            make_loop(1, 3, 4, ah_two_pass, vec![((4, 0), RayMetaKind::PrimitiveIndex)]),
+        ];
+        analyzer.coalesce_ray_query_groups(&mut loops_mixed);
+        assert_ne!(
+            loops_mixed[0].rq_group, loops_mixed[1].rq_group,
+            "two-pass group must not coalesce with non-two-pass group"
+        );
     }
 }

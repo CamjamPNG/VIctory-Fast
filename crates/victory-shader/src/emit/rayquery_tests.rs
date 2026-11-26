@@ -22,6 +22,8 @@ const D3D_SHADER_FEATURE_RESOURCE_DESCRIPTOR_HEAP_INDEXING: u64 = 0x200_0000;
 const OPAQUE_LANE_STRIDE_DWORDS: u32 = 24;
 /// Dwords written per lane by the non-opaque proceed/commit shader.
 const PROCEED_LANE_STRIDE_DWORDS: u32 = 4;
+/// Dwords written per lane by the two-pass tMax pre-shrink shader.
+const TWO_PASS_LANE_STRIDE_DWORDS: u32 = 6;
 
 fn err(e: windows::core::Error) -> String {
     e.message().to_string()
@@ -269,6 +271,152 @@ fn emit_non_opaque_proceed_cs() -> Vec<u8> {
     store_i32(&mut s, done, uav, o2, geom_idx);
     let o3 = byte_offset(&mut s, done, base, 3);
     store_i32(&mut s, done, uav, o3, prim_idx);
+
+    s.m.terminate(done, Term::Ret);
+    s.finish()
+}
+
+/// `[numthreads(3, 1, 1)]` compute shader exercising two-pass `tMax` pre-shrink:
+/// Pass 1 (`CULL_NON_OPAQUE | SKIP_PROCEDURAL_PRIMITIVES`) finds the closest opaque
+/// hit and tightens `tMax`, then Pass 2 (`CULL_OPAQUE | SKIP_PROCEDURAL_PRIMITIVES`)
+/// runs `AnyHit` (accepting only on lane 1, rejecting on lane 2) and merges
+/// committed hit metadata from Pass 2 (when hit) else Pass 1.
+fn emit_two_pass_anyhit_cs() -> Vec<u8> {
+    let mut s = Shader::new(false);
+    s.threads = Some([3, 1, 1]);
+    let entry = s.entry;
+    let p1_proceed = s.m.new_block();
+    let p2_start = s.m.new_block();
+    let p2_proceed = s.m.new_block();
+    let anyhit_body = s.m.new_block();
+    let do_commit = s.m.new_block();
+    let latch = s.m.new_block();
+    let after = s.m.new_block();
+    let from_q2 = s.m.new_block();
+    let check_q1 = s.m.new_block();
+    let from_q1 = s.m.new_block();
+    let miss_blk = s.m.new_block();
+    let done = s.m.new_block();
+
+    let uav = s.root_uav_handle(0);
+    let tlas = s.rtas_root_srv_handle(entry, 0);
+
+    let i32t = s.t.i32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+    let zero_i = s.m.i32(0);
+    let one_i = s.m.i32(1);
+    let is_lane0 = s.m.cmp(entry, pred::EQ, tid, zero_i);
+    let is_lane1 = s.m.cmp(entry, pred::EQ, tid, one_i);
+
+    let ox0 = s.m.f32(0.0f32.to_bits());
+    let ox12 = s.m.f32(10.0f32.to_bits());
+    let ox = s.m.select(entry, is_lane0, ox0, ox12);
+    let zero_f = s.m.f32(0.0f32.to_bits());
+    let one_f = s.m.f32(1.0f32.to_bits());
+    let t_min = s.m.f32(0.001f32.to_bits());
+    let t_max = s.m.f32(100.0f32.to_bits());
+
+    // Pass 1: CULL_NON_OPAQUE (0x80) | SKIP_PROCEDURAL_PRIMITIVES (0x200). Never FORCE_OPAQUE!
+    let q1 = s.allocate_ray_query(entry, 0x280);
+    // Pass 2: CULL_OPAQUE (0x40) | SKIP_PROCEDURAL_PRIMITIVES (0x200).
+    let q2 = s.allocate_ray_query(entry, 0x240);
+
+    let mask = s.m.i32(0xFF);
+    s.ray_query_trace_inline(
+        entry,
+        q1,
+        tlas,
+        zero_i,
+        mask,
+        [ox, zero_f, zero_f],
+        t_min,
+        [zero_f, zero_f, one_f],
+        t_max,
+    );
+    s.m.terminate(entry, Term::Br(p1_proceed));
+
+    let p1_more = s.ray_query_proceed(p1_proceed, q1);
+    s.m.terminate(p1_proceed, Term::CondBr(p1_more, p1_proceed, p2_start));
+
+    let p1_status = s.ray_query_state_i32(p2_start, rq_op::COMMITTED_STATUS, q1);
+    let q1_hit = s.m.cmp(p2_start, pred::EQ, p1_status, one_i);
+    let p1_t = s.ray_query_state_f32(p2_start, rq_op::COMMITTED_RAY_T, q1);
+    let t_clamp = s.m.select(p2_start, q1_hit, p1_t, t_max);
+
+    s.ray_query_trace_inline(
+        p2_start,
+        q2,
+        tlas,
+        zero_i,
+        mask,
+        [ox, zero_f, zero_f],
+        t_min,
+        [zero_f, zero_f, one_f],
+        t_clamp,
+    );
+    s.m.terminate(p2_start, Term::Br(p2_proceed));
+
+    let ah_count = s.m.phi(p2_proceed, i32t);
+    let p2_more = s.ray_query_proceed(p2_proceed, q2);
+    s.m.terminate(p2_proceed, Term::CondBr(p2_more, anyhit_body, after));
+
+    let next_count = s.m.bin(anyhit_body, Bin::Add, ah_count, one_i);
+    s.m.terminate(anyhit_body, Term::CondBr(is_lane1, do_commit, latch));
+
+    s.ray_query_commit_non_opaque_triangle_hit(do_commit, q2);
+    s.m.terminate(do_commit, Term::Br(latch));
+
+    s.m.terminate(latch, Term::Br(p2_proceed));
+    s.m.set_phi(ah_count, vec![(zero_i, p2_start), (next_count, latch)]);
+
+    let p2_status = s.ray_query_state_i32(after, rq_op::COMMITTED_STATUS, q2);
+    let q2_hit = s.m.cmp(after, pred::EQ, p2_status, one_i);
+    s.m.terminate(after, Term::CondBr(q2_hit, from_q2, check_q1));
+    s.m.terminate(check_q1, Term::CondBr(q1_hit, from_q1, miss_blk));
+
+    let q2_t = s.ray_query_state_f32(from_q2, rq_op::COMMITTED_RAY_T, q2);
+    let q2_t_i = s.m.cast(from_q2, Cast::Bitcast, q2_t, i32t);
+    let q2_geom = s.ray_query_state_i32(from_q2, rq_op::COMMITTED_GEOMETRY_INDEX, q2);
+    let q2_prim = s.ray_query_state_i32(from_q2, rq_op::COMMITTED_PRIMITIVE_INDEX, q2);
+    let q2_id = s.ray_query_state_i32(from_q2, rq_op::COMMITTED_INSTANCE_ID, q2);
+    s.m.terminate(from_q2, Term::Br(done));
+
+    let q1_t_i = s.m.cast(from_q1, Cast::Bitcast, p1_t, i32t);
+    let q1_geom = s.ray_query_state_i32(from_q1, rq_op::COMMITTED_GEOMETRY_INDEX, q1);
+    let q1_prim = s.ray_query_state_i32(from_q1, rq_op::COMMITTED_PRIMITIVE_INDEX, q1);
+    let q1_id = s.ray_query_state_i32(from_q1, rq_op::COMMITTED_INSTANCE_ID, q1);
+    s.m.terminate(from_q1, Term::Br(done));
+
+    let tmax_i = s.m.i32(100.0f32.to_bits());
+    s.m.terminate(miss_blk, Term::Br(done));
+
+    let status = s.m.phi(done, i32t);
+    s.m.set_phi(status, vec![(one_i, from_q2), (one_i, from_q1), (zero_i, miss_blk)]);
+    let ray_t_i = s.m.phi(done, i32t);
+    s.m.set_phi(ray_t_i, vec![(q2_t_i, from_q2), (q1_t_i, from_q1), (tmax_i, miss_blk)]);
+    let geom_idx = s.m.phi(done, i32t);
+    s.m.set_phi(geom_idx, vec![(q2_geom, from_q2), (q1_geom, from_q1), (zero_i, miss_blk)]);
+    let prim_idx = s.m.phi(done, i32t);
+    s.m.set_phi(prim_idx, vec![(q2_prim, from_q2), (q1_prim, from_q1), (zero_i, miss_blk)]);
+    let inst_id = s.m.phi(done, i32t);
+    s.m.set_phi(inst_id, vec![(q2_id, from_q2), (q1_id, from_q1), (zero_i, miss_blk)]);
+
+    let stride = s.m.i32(TWO_PASS_LANE_STRIDE_DWORDS * 4);
+    let base = s.m.bin(done, Bin::Mul, tid, stride);
+    for (k, val) in [status, ray_t_i, geom_idx, prim_idx, inst_id, ah_count]
+        .into_iter()
+        .enumerate()
+    {
+        let off = byte_offset(&mut s, done, base, k as u32);
+        store_i32(&mut s, done, uav, off, val);
+    }
 
     s.m.terminate(done, Term::Ret);
     s.finish()
@@ -662,6 +810,7 @@ fn dxil_validates_rayquery_bound_and_heap() {
     let bound = emit_opaque_hit_miss_cs(false);
     let heap = emit_opaque_hit_miss_cs(true);
     let proceed = emit_non_opaque_proceed_cs();
+    let two_pass = emit_two_pass_anyhit_cs();
 
     assert_ne!(
         sfi0_flags(&bound) & D3D_SHADER_FEATURE_RAYTRACING_TIER_1_1,
@@ -685,6 +834,7 @@ fn dxil_validates_rayquery_bound_and_heap() {
     validate_dxil("bound RayQuery CS", &bound);
     validate_dxil("heap RayQuery CS", &heap);
     validate_dxil("non-opaque Proceed RayQuery CS", &proceed);
+    validate_dxil("two-pass AnyHit RayQuery CS", &two_pass);
 }
 
 #[test]
@@ -836,4 +986,98 @@ fn gpu_rayquery_non_opaque_proceed_and_commit() {
     assert!((t1 - 2.0).abs() < 1e-4, "lane 1 CommittedRayT got {t1}, want 2.0");
     assert_eq!(lane1[2], 0, "lane 1 CommittedGeometryIndex");
     assert_eq!(lane1[3], 0, "lane 1 CommittedPrimitiveIndex");
+}
+
+#[test]
+fn gpu_rayquery_two_pass_tmax_preshrink() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !has_raytracing_tier_1_1(&host) {
+        eprintln!("hardware device lacks DXR Tier 1.1; skipped");
+        return;
+    }
+
+    // Lane 0 at x=0: closer opaque geom 0 (z=2) before farther non-opaque geom 1 (z=5).
+    let lane0_near_opaque = [[-2.0f32, -2.0, 2.0], [2.0, -2.0, 2.0], [0.0, 2.0, 2.0]];
+    let lane0_far_nonopaque = [[-2.0f32, -2.0, 5.0], [2.0, -2.0, 5.0], [0.0, 2.0, 5.0]];
+    // Lanes 1 & 2 at x=10: closer non-opaque geom 2 (z=2) before farther opaque geom 3 (z=5).
+    let lane12_near_nonopaque = [[8.0f32, -2.0, 2.0], [12.0, -2.0, 2.0], [10.0, 2.0, 2.0]];
+    let lane12_far_opaque = [[8.0f32, -2.0, 5.0], [12.0, -2.0, 5.0], [10.0, 2.0, 5.0]];
+    let geoms = [
+        TriangleGeom {
+            vertices: &lane0_near_opaque,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &lane0_far_nonopaque,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_NONE,
+        },
+        TriangleGeom {
+            vertices: &lane12_near_nonopaque,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_NONE,
+        },
+        TriangleGeom {
+            vertices: &lane12_far_opaque,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+    ];
+    let inst = InstanceSpec {
+        transform: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ],
+        instance_id: 0x5A5A,
+        instance_mask: 0xFF,
+        contrib: 3,
+        flags: 0,
+    };
+
+    let dxil = emit_two_pass_anyhit_cs();
+    let out = run_rayquery_gpu(
+        &host,
+        &dxil,
+        false,
+        &geoms,
+        &inst,
+        3 * TWO_PASS_LANE_STRIDE_DWORDS,
+    )
+    .unwrap_or_else(|e| panic!("two-pass anyhit run_rayquery_gpu failed: {e}"));
+
+    let stride = TWO_PASS_LANE_STRIDE_DWORDS as usize;
+
+    // (a) Lane 0: closer opaque hit (z=2) beats farther non-opaque (z=5); AnyHit skipped.
+    let l0 = &out[0..stride];
+    assert_eq!(l0[0], 1, "lane 0 CommittedStatus");
+    let t0 = f32::from_bits(l0[1]);
+    assert!((t0 - 2.0).abs() < 1e-4, "lane 0 CommittedRayT got {t0}, want 2.0");
+    assert_eq!(l0[2], 0, "lane 0 CommittedGeometryIndex (Pass 1 opaque)");
+    assert_eq!(l0[3], 0, "lane 0 CommittedPrimitiveIndex");
+    assert_eq!(l0[4], 0x5A5A, "lane 0 CommittedInstanceID (Pass 1 metadata)");
+    assert_eq!(l0[5], 0, "lane 0 AnyHit must be skipped when tMax pre-shrinks past non-opaque");
+
+    // (b) Lane 1: closer accepted non-opaque hit (z=2) beats farther opaque (z=5).
+    let l1 = &out[stride..2 * stride];
+    assert_eq!(l1[0], 1, "lane 1 CommittedStatus");
+    let t1 = f32::from_bits(l1[1]);
+    assert!((t1 - 2.0).abs() < 1e-4, "lane 1 CommittedRayT got {t1}, want 2.0");
+    assert_eq!(l1[2], 2, "lane 1 CommittedGeometryIndex (Pass 2 non-opaque)");
+    assert_eq!(l1[3], 0, "lane 1 CommittedPrimitiveIndex");
+    assert_eq!(l1[4], 0x5A5A, "lane 1 CommittedInstanceID (Pass 2 metadata)");
+    assert_eq!(l1[5], 1, "lane 1 AnyHit invoked once");
+
+    // (c) Lane 2: closer rejected non-opaque hit (z=2) falls back to farther opaque (z=5).
+    let l2 = &out[2 * stride..3 * stride];
+    assert_eq!(l2[0], 1, "lane 2 CommittedStatus");
+    let t2 = f32::from_bits(l2[1]);
+    assert!((t2 - 5.0).abs() < 1e-4, "lane 2 CommittedRayT got {t2}, want 5.0");
+    assert_eq!(l2[2], 3, "lane 2 CommittedGeometryIndex (Pass 1 fallback)");
+    assert_eq!(l2[3], 0, "lane 2 CommittedPrimitiveIndex");
+    assert_eq!(l2[4], 0x5A5A, "lane 2 CommittedInstanceID (Pass 1 metadata)");
+    assert_eq!(l2[5], 1, "lane 2 AnyHit invoked once before fallback");
 }

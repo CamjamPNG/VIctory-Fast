@@ -111,6 +111,15 @@ impl Made {
     }
 }
 
+/// Initial dynamic descriptor reservation for raw memory page views.
+pub(crate) const FIRST_RAW_PAGE_SLOTS: u32 = 4096;
+
+struct RawPageRun {
+    base: u32,
+    slots: u32,
+    populated: u32,
+}
+
 pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
@@ -180,6 +189,10 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// Runs of raw-memory copy UAVs grow geometrically. Older reservations
+    /// stay valid until this heap is destroyed because recorded command lists
+    /// still use their base.
+    raw_pages: Mutex<Option<RawPageRun>>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1654,6 +1667,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            raw_pages: Mutex::new(None),
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::default(),
@@ -2471,6 +2485,7 @@ impl HostHeap {
                 self.clear_twin(index);
                 self.made.set(index, key);
                 self.keep(index, kept);
+                self.quick_is(index, key);
                 (true, stale)
             } else {
                 (false, stale)
@@ -2521,7 +2536,7 @@ impl HostHeap {
             {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let len = crate::resource::placed_bytes(resource).unwrap_or(1);
-                if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+                if !crate::texture::any_mapped(address as usize, len as usize) {
                     LATE[4].fetch_add(1, Relaxed);
                     continue;
                 }
@@ -2535,6 +2550,7 @@ impl HostHeap {
                 self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
                 self.keep(f.index, kept);
+                self.quick_is(f.index, f.key);
                 #[cfg(feature = "diagnostics")]
                 if f.late.is_some() && was != 0 {
                     same_bytes(was, f.key);
@@ -3028,6 +3044,63 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 0, 0);
         self.keep(index, None);
+    }
+
+    /// Ensures a contiguous run of raw-memory copy UAVs in this heap covering
+    /// `copies`, growing geometrically as needed while keeping older bases
+    /// reserved for recorded command lists. Returns `(base, count)` where slot
+    /// `base` is the null raw UAV and `base + 1..=base + count` view `copies`.
+    pub(crate) fn raw_page_views(
+        &self,
+        copies: &[std::sync::Arc<crate::shadow::Shadow>],
+    ) -> Option<(u32, u32)> {
+        let mut run = self.raw_pages.lock().unwrap_or_else(|e| e.into_inner());
+        let requested = u32::try_from(copies.len()).ok()?;
+        let needed = requested.saturating_add(1);
+        if run.as_ref().is_none_or(|r| needed > r.slots && r.slots < self.dynamic) {
+            let slots = needed
+                .checked_next_power_of_two()
+                .unwrap_or(u32::MAX)
+                .max(FIRST_RAW_PAGE_SLOTS)
+                .min(self.dynamic);
+            let reservation = self.dynamic(slots).map(|base| (base, slots)).or_else(|| {
+                // An already fragmented heap can still expose a prefix on its
+                // first bind. Subsequent binds retry growth as lists release slots.
+                let small = needed.min(FIRST_RAW_PAGE_SLOTS);
+                if run.is_some() || small >= slots {
+                    return None;
+                }
+                self.dynamic(small).map(|base| (base, small))
+            });
+            if let Some((base, slots)) = reservation {
+                // Every slot of the run: a number shows no view of another kind.
+                for n in 0..slots {
+                    self.null_raw_uav_at(base + n);
+                }
+                if let Some(old) = run.as_ref() {
+                    tracing::info!(previous = old.slots, slots, "grew raw memory descriptor run");
+                }
+                *run = Some(RawPageRun { base, slots, populated: 0 });
+            }
+        }
+        let run = run.as_mut()?;
+        let count = requested.min(run.slots - 1);
+        if count < requested {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| {
+                tracing::warn!(
+                    requested,
+                    count,
+                    "raw memory bindings are limited by the available descriptor heap"
+                );
+            });
+        }
+        for (n, shadow) in copies[..count as usize].iter().enumerate().skip(run.populated as usize) {
+            let (_, len) = shadow.span();
+            self.raw_uav_at(run.base + 1 + n as u32, &shadow.buffer, 0, len);
+        }
+        run.populated = run.populated.max(count);
+        Some((run.base, count))
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of

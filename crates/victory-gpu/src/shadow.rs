@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Exact length of `pending`, maintained under `pending.lock()` so empty
+    /// fast-paths avoid acquiring the mutex.
+    pending_count: AtomicUsize,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -126,6 +129,10 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// Per 64 KiB piece: 1 if the CPU side modified the piece since its hash in
+    /// `before` was last updated (or `before` was just created). Empty until
+    /// `before` exists.
+    hash_stale: Mutex<Vec<u64>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -221,28 +228,17 @@ fn card_vram_headroom_override_mb() -> Option<u64> {
 /// Minimum local VRAM headroom (in bytes) kept below `DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`
 /// before new card buffers stay in shared memory.
 ///
-/// - Explicit `VICTORY_CARD_BUFFERS_VRAM_HEADROOM_MB` always wins (`0` disables).
-/// - Otherwise defaults to 1,024 MiB on `> 12 GiB` budgets (e.g. ~13.3 GiB ceiling on a
-///   14.3 GiB 16 GB budget) and for small buffers admitted below the adapter's default
-///   minimum size (e.g. `VICTORY_CARD_BUFFERS_MIN_KB=64`), preserving the existing
-///   percentage ceiling for default large buffers on `<= 12 GiB` cards.
+/// Opt-in via `VICTORY_CARD_BUFFERS_VRAM_HEADROOM_MB` (`0` / unset uses only
+/// the percentage cap, avoiding premature shared-memory snapshot fallback on
+/// 16 GB adapters).
 fn resolve_card_vram_headroom(
-    budget: u64,
-    size: u64,
-    default_min_bytes: u64,
+    _budget: u64,
+    _size: u64,
+    _default_min_bytes: u64,
     explicit_headroom_mb: Option<u64>,
 ) -> u64 {
     const MIB: u64 = 1 << 20;
-    const TWELVE_GIB: u64 = 12 << 30;
-    const DEFAULT_HEADROOM_MIB: u64 = 1024;
-    if let Some(mb) = explicit_headroom_mb {
-        return mb.saturating_mul(MIB);
-    }
-    if budget > TWELVE_GIB || size < default_min_bytes {
-        DEFAULT_HEADROOM_MIB * MIB
-    } else {
-        0
-    }
+    explicit_headroom_mb.unwrap_or(0).saturating_mul(MIB)
 }
 
 /// Maximum local VRAM usage (in bytes) at which a new card buffer may be allocated:
@@ -388,11 +384,99 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out
 }
 
+/// The number of 64 KiB piece hash slots allocated in `before` for a card
+/// copy of `size` bytes.
+fn card_hash_pieces(size: u64) -> usize {
+    (size / PIECE as u64 + 2) as usize
+}
+
+/// Marks bits `[first, last)` in `bits`.
+fn mark_stale_bits(bits: &mut [u64], first: usize, last: usize) {
+    let cap = bits.len() * 64;
+    let first = first.min(cap);
+    let last = last.min(cap);
+    if first >= last {
+        return;
+    }
+    let (w0, b0) = (first / 64, first % 64);
+    let (w1, b1) = ((last - 1) / 64, (last - 1) % 64);
+    if w0 == w1 {
+        let count = b1 - b0 + 1;
+        let mask = if count == 64 { u64::MAX } else { ((1u64 << count) - 1) << b0 };
+        bits[w0] |= mask;
+        return;
+    }
+    bits[w0] |= u64::MAX << b0;
+    for w in &mut bits[w0 + 1..w1] {
+        *w = u64::MAX;
+    }
+    let mask = if b1 == 63 { u64::MAX } else { (1u64 << (b1 + 1)) - 1 };
+    bits[w1] |= mask;
+}
+
+/// Clears and returns coalesced `CardSpan` runs of all set bits in `bits`
+/// intersecting `[span.first, span.first + span.pieces)`.
+fn take_stale_span(bits: &mut [u64], span: CardSpan, out: &mut Vec<CardSpan>) {
+    let cap = bits.len() * 64;
+    let first = (span.first as usize).min(cap);
+    let last = (span.first as usize + span.pieces as usize).min(cap);
+    if first >= last {
+        return;
+    }
+    let mut run_start: Option<u32> = None;
+    let mut run_end: u32 = 0;
+    let mut w = first / 64;
+    let w_end = (last - 1) / 64;
+    while w <= w_end {
+        let lo = if w == first / 64 { first % 64 } else { 0 };
+        let hi = if w == w_end { (last - 1) % 64 } else { 63 };
+        let count = hi - lo + 1;
+        let window = if count == 64 { u64::MAX } else { ((1u64 << count) - 1) << lo };
+        let mut hit = bits[w] & window;
+        if hit != 0 {
+            bits[w] &= !hit;
+            while hit != 0 {
+                let bit = hit.trailing_zeros() as usize;
+                let piece = (w * 64 + bit) as u32;
+                hit &= hit - 1;
+                match run_start {
+                    Some(_) if piece == run_end => run_end += 1,
+                    Some(start) => {
+                        out.push(CardSpan {
+                            from: span.from,
+                            to: span.to,
+                            first: start,
+                            pieces: run_end - start,
+                            skew: span.skew,
+                        });
+                        run_start = Some(piece);
+                        run_end = piece + 1;
+                    }
+                    None => {
+                        run_start = Some(piece);
+                        run_end = piece + 1;
+                    }
+                }
+            }
+        }
+        w += 1;
+    }
+    if let Some(start) = run_start {
+        out.push(CardSpan {
+            from: span.from,
+            to: span.to,
+            first: start,
+            pieces: run_end - start,
+            skew: span.skew,
+        });
+    }
+}
+
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
 /// has one piece more).
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    card_hash_pieces(size) as u64 * 16
 }
 
 /// A buffer of `size` bytes in the card's memory for a title buffer's
@@ -784,7 +868,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 4 << 20 {
+    if bytes > 512 << 10 {
         wide(copy_jobs(copies));
         return;
     }
@@ -805,8 +889,11 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
         if from >= to {
             continue;
         }
-        let busy: Vec<(usize, usize)> =
-            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        let busy: Vec<(usize, usize)> = if shadow.pending_count.load(Ordering::Acquire) == 0 {
+            Vec::new()
+        } else {
+            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect()
+        };
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
         }
@@ -975,6 +1062,38 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn hash_stale_bitset_marks_and_clears_across_word_boundaries() {
+        use super::{mark_stale_bits, take_stale_span};
+        let mut bits = vec![0u64; 3]; // 192 pieces
+        mark_stale_bits(&mut bits, 60, 70);
+        mark_stale_bits(&mut bits, 127, 130);
+        mark_stale_bits(&mut bits, 180, 181);
+        let span = |first: u32, pieces: u32| CardSpan {
+            from: first * 65536,
+            to: (first + pieces) * 65536,
+            first,
+            pieces,
+            skew: 0,
+        };
+        let mut out = Vec::new();
+        take_stale_span(&mut bits, span(62, 70), &mut out);
+        assert_eq!(
+            out.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(),
+            [(62, 8), (127, 3)]
+        );
+        // Taking the same span again finds nothing (bits were cleared).
+        out.clear();
+        take_stale_span(&mut bits, span(62, 70), &mut out);
+        assert!(out.is_empty());
+        // Pieces outside the queried span remain stale.
+        take_stale_span(&mut bits, span(0, 192), &mut out);
+        assert_eq!(
+            out.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(),
+            [(60, 2), (180, 1)]
+        );
     }
 }
 
@@ -1659,6 +1778,13 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if n == 0 {
+        return;
+    }
+    if n == 1 {
+        work(0);
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
@@ -3052,6 +3178,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_count: AtomicUsize::new(0),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3130,6 +3257,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_count.store(pending.len(), Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3154,6 +3282,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_count.store(pending.len(), Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3443,6 +3572,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_count.store(pending.len(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3500,13 +3630,14 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.pending_count.load(Ordering::Acquire) != 0
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.pending_count.load(Ordering::Acquire) != 0
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3523,7 +3654,7 @@ impl Shadow {
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || self.pending_count.load(Ordering::Acquire) == 0 {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -3567,7 +3698,7 @@ impl Shadow {
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || self.pending_count.load(Ordering::Acquire) == 0 {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -3763,30 +3894,32 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
+        if self.pending_count.load(Ordering::Acquire) != 0 {
+            let mut busy: Vec<(usize, usize)> = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect();
+            if !busy.is_empty() {
+                // Around ranges shaders are writing: the gaps, each as below
+                // (in the world most submissions have such ranges; copying the
+                // gaps whole cost ~1 s per frame).
+                busy.sort_unstable();
+                let (mut at, mut bytes) = (from, 0);
+                for (a, e) in busy {
+                    if a > at {
+                        bytes += self.update_free(at, a);
+                    }
+                    at = at.max(e);
                 }
-                at = at.max(e);
+                if at < to {
+                    bytes += self.update_free(at, to);
+                }
+                return bytes;
             }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
         }
         self.update_free(from, to)
     }
@@ -3795,6 +3928,16 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        self.nothing_new_checked(None, address, len)
+    }
+
+    /// Same as [`Shadow::nothing_new`], reusing a held [`crate::watch::JournalRead`]
+    /// so a chunk of spans acquires `JOURNAL.read()` only once.
+    pub(crate) fn nothing_new_with_journal(&self, j: &crate::watch::JournalRead, address: usize, len: usize) -> bool {
+        self.nothing_new_checked(Some(j), address, len)
+    }
+
+    fn nothing_new_checked(&self, j: Option<&crate::watch::JournalRead>, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -3807,11 +3950,17 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.pending_count.load(Ordering::Acquire) != 0
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let ranged = self.ranged(from, to);
+        let same = match j {
+            Some(j) => crate::watch::nothing_new_in(j, from, to, start / PAGE, &copied, ranged),
+            None => crate::watch::nothing_new(from, to, start / PAGE, &copied, ranged),
+        };
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -4284,8 +4433,58 @@ impl Shadow {
         *before = make(card.size);
         if before.is_some() {
             CARD_BYTES[1].fetch_add(card_hash_bytes(card.size), Ordering::Relaxed);
+            let pieces = card_hash_pieces(card.size);
+            let mut stale = card.hash_stale.lock().unwrap_or_else(|e| e.into_inner());
+            stale.resize(pieces.div_ceil(64), u64::MAX);
+            let rem = pieces % 64;
+            if rem != 0
+                && let Some(last) = stale.last_mut()
+            {
+                *last = (1u64 << rem) - 1;
+            }
         }
         before.is_some()
+    }
+
+    /// Marks the 64 KiB pieces touched by `ranges` (copy offsets) as having
+    /// stale hashes in `Card::before` so they are lazily re-hashed before a
+    /// submission next compares them.
+    pub(crate) fn card_mark_hash_stale(&self, ranges: &[(usize, usize)]) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let mut stale = card.hash_stale.lock().unwrap_or_else(|e| e.into_inner());
+        if stale.is_empty() {
+            return;
+        }
+        for &(a, b) in ranges {
+            if a >= b {
+                continue;
+            }
+            let span = self.card_run(a, b);
+            mark_stale_bits(&mut stale, span.first as usize, (span.first + span.pieces) as usize);
+        }
+    }
+
+    /// Takes and clears the stale piece bits intersecting `spans`, returning
+    /// coalesced `CardSpan` runs to re-hash before GPU writes run.
+    pub(crate) fn card_take_stale_runs(&self, spans: &[CardSpan]) -> Vec<CardSpan> {
+        let Some(card) = &self.card else {
+            return Vec::new();
+        };
+        let mut stale = card.hash_stale.lock().unwrap_or_else(|e| e.into_inner());
+        if stale.is_empty() {
+            return Vec::new();
+        }
+        let mut runs = Vec::new();
+        for &span in spans {
+            take_stale_span(&mut stale, span, &mut runs);
+        }
+        if runs.len() > 1 {
+            joined_piece_runs(runs)
+        } else {
+            runs
+        }
     }
 
     /// The declared range `[address, end)` as the compare on the card
@@ -4502,6 +4701,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                hash_stale: Mutex::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -4657,7 +4857,8 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
-                touched: Default::default(),
+            touched: Default::default(),
+            hash_stale: Mutex::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -4767,6 +4968,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.pending_count.store(1, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5132,7 +5334,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
-                touched: Default::default(),
+                    touched: Default::default(),
+                    hash_stale: Mutex::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5361,6 +5564,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        hash_stale: Mutex::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
@@ -5450,6 +5654,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                hash_stale: Mutex::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5570,43 +5775,33 @@ mod window_tests {
         const MIB: u64 = 1 << 20;
         const KIB: u64 = 1 << 10;
 
-        // 16 GB card (~14.3 GiB DXGI budget): default 1,024 MiB headroom keeps ceiling at ~13.3 GiB.
+        // Default (unset): opt-in headroom is 0, using the existing percentage cap.
         let budget_16g = 14_643 * MIB;
         let default_min_16g = default_card_limits_mb(Some(budget_16g)).0 * MIB;
-        let headroom_small = resolve_card_vram_headroom(budget_16g, 64 * KIB, default_min_16g, None);
-        let headroom_large = resolve_card_vram_headroom(budget_16g, 16 * MIB, default_min_16g, None);
-        assert_eq!(headroom_small, 1024 * MIB);
-        assert_eq!(headroom_large, 1024 * MIB);
-        assert_eq!(
-            resolve_card_vram_ceiling(budget_16g, 97, headroom_small),
-            budget_16g - 1024 * MIB
-        );
-
-        // 12 GB card (10 GiB budget): small buffers (< 16 MiB default min) get 1,024 MiB headroom;
-        // default large buffers preserve the 97% percentage cap.
-        let budget_12g = 10 * GIB;
-        let default_min_12g = default_card_limits_mb(Some(budget_12g)).0 * MIB;
-        assert_eq!(
-            resolve_card_vram_headroom(budget_12g, 64 * KIB, default_min_12g, None),
-            1024 * MIB
-        );
-        assert_eq!(
-            resolve_card_vram_headroom(budget_12g, 16 * MIB, default_min_12g, None),
-            0
-        );
-        assert_eq!(
-            resolve_card_vram_ceiling(budget_12g, 97, 0),
-            (budget_12g / 100) * 97
-        );
-
-        // Explicit headroom override always wins (0 disables; large values saturate to 0 ceiling).
-        assert_eq!(
-            resolve_card_vram_headroom(budget_16g, 64 * KIB, default_min_16g, Some(0)),
-            0
-        );
+        assert_eq!(resolve_card_vram_headroom(budget_16g, 64 * KIB, default_min_16g, None), 0);
+        assert_eq!(resolve_card_vram_headroom(budget_16g, 16 * MIB, default_min_16g, None), 0);
         assert_eq!(
             resolve_card_vram_ceiling(budget_16g, 97, 0),
             (budget_16g / 100) * 97
+        );
+
+        let budget_12g = 10 * GIB;
+        let default_min_12g = default_card_limits_mb(Some(budget_12g)).0 * MIB;
+        assert_eq!(resolve_card_vram_headroom(budget_12g, 64 * KIB, default_min_12g, None), 0);
+        assert_eq!(resolve_card_vram_headroom(budget_12g, 16 * MIB, default_min_12g, None), 0);
+
+        // Explicit headroom override applies the tighter of percentage cap and budget - headroom.
+        assert_eq!(
+            resolve_card_vram_headroom(budget_16g, 64 * KIB, default_min_16g, Some(1024)),
+            1024 * MIB
+        );
+        assert_eq!(
+            resolve_card_vram_ceiling(budget_16g, 97, 1024 * MIB),
+            budget_16g - 1024 * MIB
+        );
+        assert_eq!(
+            resolve_card_vram_headroom(budget_16g, 64 * KIB, default_min_16g, Some(0)),
+            0
         );
         assert_eq!(
             resolve_card_vram_headroom(budget_12g, 16 * MIB, default_min_12g, Some(2048)),

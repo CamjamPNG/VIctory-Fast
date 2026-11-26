@@ -71,6 +71,12 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// `SLOT_STRIDES` / `SLOT_TABLE_STRIDES` loads emitted.
+    #[cfg(test)]
+    pub stride_loads: u32,
+    /// Loop headers instrumented with a `LOOP_LIMIT` safety counter.
+    #[cfg(test)]
+    pub loop_counters: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -315,9 +321,10 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
-    /// Element strides read from the host's table by heap slot
-    /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
-    strides: HashMap<(usize, Site, u8), V>,
+    /// Element strides and counts read from the host's table by heap slot
+    /// ([`super::shader::SLOT_STRIDES`] / `SLOT_TABLE_STRIDES`), by block,
+    /// descriptor load, first dword, and table offset.
+    strides: HashMap<(usize, Site, u8, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -672,12 +679,45 @@ enum Wave {
 // host wave's first lane), and a guarded write of a plain value over a wave-dependent one is
 // the only mix of old and new lanes that is looked at.
 pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'static str)> {
+    wave_local_checked(p, st, None)
+}
+
+/// [`wave_local`] with an added soundness guard for opt-in RDNA Wave32 Mode 2:
+/// rejects any `v_readfirstlane_b32` outside `waterfall.reads`, `own_bits`,
+/// `Wave::Base`, and `lane_uniform`.
+pub(super) fn wave_local_strict(
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+) -> Result<(), (usize, &'static str)> {
+    wave_local_checked(p, st, Some(res))
+}
+
+fn wave_local_checked(
+    p: &Program,
+    st: &Structured,
+    strict_res: Option<&Resources>,
+) -> Result<(), (usize, &'static str)> {
     use super::wave::{Op, Shape};
     const FIRST: Why = "a wave's first-lane number used as data";
     const TOTAL: Why = "a count or sum over the wave used as data";
     const PREFIX: Why = "a count or sum over the lanes below used without a reserved base";
     const MIXED: Why = "a value that depends on the wave on some paths only";
     const EFFECT: Why = "a write by the wave's first lane other than its reservation";
+    const FIRSTLANE_VARYING: Why = "a first-lane read of a lane-varying value";
+    let (uniform, own_bits) = if strict_res.is_some() {
+        let uniform = all_lane_blocks(st)
+            .map(|all| lane_uniform(p, st, &all, false))
+            .unwrap_or_default();
+        let own_bits = if own_bits_on() {
+            super::own_bits::find(p, st, false)
+        } else {
+            Default::default()
+        };
+        (uniform, own_bits)
+    } else {
+        (HashSet::new(), Default::default())
+    };
     fn of(kind: &HashMap<Value, Wave>, v: Option<Value>) -> Wave {
         v.and_then(|v| kind.get(&v).copied()).unwrap_or(Wave::Plain)
     }
@@ -889,6 +929,32 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
                     Err(why) if check => return Err((inst.machine.offset, why)),
                     Err(_) => (Wave::Mixed, false),
                 };
+                if check
+                    && name == "v_readfirstlane_b32"
+                    && let Some(res) = strict_res
+                {
+                    let in_waterfall = inst
+                        .writes
+                        .first()
+                        .is_some_and(|w| res.waterfall.reads.contains(&w.1));
+                    let src_ok = match &inst.fields {
+                        Fields::Valu(v) => match v.src.first() {
+                            Some(&Operand::Vector { reg, .. }) => inst
+                                .read(Reg::V(reg))
+                                .is_some_and(|x| {
+                                    own_bits.alike.contains(&x)
+                                        || of(kind, Some(x)) == Wave::Base
+                                        || uniform.contains(&x)
+                                }),
+                            Some(_) => true,
+                            None => false,
+                        },
+                        _ => false,
+                    };
+                    if !in_waterfall && !src_ok {
+                        return Err((inst.machine.offset, FIRSTLANE_VARYING));
+                    }
+                }
                 // the same test as `Lower::inst`'s `effect`
                 let effect = matches!(inst.fields, Fields::Exp { .. })
                     || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
@@ -1178,6 +1244,20 @@ thread_local! {
     pub(super) static TEST_RDNA: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// Test hook to simulate a lifted `AnyHit` loop for RDNA Wave32 policy unit tests.
     static TEST_FORCE_ANYHIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test hook for [`super::rdna_wave32`], for its thread only.
+    pub(super) static TEST_RDNA_WAVE32: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::loop_limit_enabled`], for its thread only.
+    pub(super) static TEST_LOOP_LIMIT_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn test_rdna_wave32() -> Option<u8> {
+    TEST_RDNA_WAVE32.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_loop_limit_enabled() -> Option<bool> {
+    TEST_LOOP_LIMIT_ENABLED.get()
 }
 
 /// The bits of [`super::rdna`] that count on this host.
@@ -1504,11 +1584,22 @@ impl<'a> Lower<'a> {
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
-            // On AMD RDNA, a Wave64 shader with a lifted `AnyHit` loop prefers Wave32 via the
-            // exact barrier-free paths only (`!crosses` or `wave_local` idiom under
-            // `with_local_waves`); if exact Wave32 does not apply, keep Wave64 cleanly.
+            // On AMD RDNA, a Wave64 shader with a lifted `AnyHit` loop — or any eligible
+            // compute shader under opt-in `VICTORY_RDNA_WAVE32=1|2` — prefers Wave32 via
+            // the exact barrier-free paths only (`!crosses` in mode 1, plus `wave_local`
+            // idiom under `with_local_waves` in mode 2 / AnyHit); never `split_lds`, LDS
+            // exchange, or `LOCAL_ANY`. If exact Wave32 does not apply, keep Wave64 cleanly.
+            let lds_safe_w32 = s.lds_dwords == 0 || group <= 32;
+            let rdna_mode = super::rdna_wave32();
             let rdna_anyhit_wave32 =
                 host_rdna() != 0 && x.native.wave64 && has_anyhit_loop && host_max_wave() != 32;
+            let rdna_compute_wave32 = host_rdna() != 0
+                && x.native.wave64
+                && rdna_mode != 0
+                && host_max_wave() != 32
+                && lds_safe_w32;
+            let rdna_wave32 = rdna_anyhit_wave32 || rdna_compute_wave32;
+            let rdna_allow_local = rdna_anyhit_wave32 || (rdna_compute_wave32 && rdna_mode >= 2);
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
@@ -1518,7 +1609,7 @@ impl<'a> Lower<'a> {
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64
-                && (host_max_wave() == 32 || rdna_anyhit_wave32)
+                && (host_max_wave() == 32 || rdna_wave32)
                 && (console_lanes || one_wave && s.lds_dwords > 0)
             {
                 let crosses = live_insts().any(|i| {
@@ -1530,12 +1621,12 @@ impl<'a> Lower<'a> {
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
-                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                if !crosses && lds_safe_w32 {
                     wave = 32;
-                } else if rdna_anyhit_wave32 {
-                    // Never emit exchange or split_lds barriers on RDNA: engage Wave32 only
-                    // when `emit` verified `wave_local` and invoked `with_local_waves`.
-                    if LOCAL_WAVES.get() && (s.lds_dwords == 0 || group <= 32) {
+                } else if rdna_wave32 {
+                    // Never emit exchange, split_lds barriers, or LOCAL_ANY on RDNA: engage
+                    // Wave32 only when `emit` verified `wave_local` and invoked `with_local_waves`.
+                    if rdna_allow_local && LOCAL_WAVES.get() && !LOCAL_ANY.get() && lds_safe_w32 {
                         wave = 32;
                         exchange = Some((s.lds_dwords, group <= 32, vec![false; p.blocks.len()]));
                     }
@@ -1628,7 +1719,7 @@ impl<'a> Lower<'a> {
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
-            } else if rdna_anyhit_wave32 {
+            } else if rdna_wave32 {
                 s.wave_size = Some(32);
             }
         }
@@ -2511,19 +2602,35 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
-        for &b in &order {
-            if self.ray_skipped.contains(&b) || ray_by_entry.contains_key(&b) {
-                continue;
-            }
-            let header = p.blocks[b]
-                .preds
+        // Loop headers count iterations (`LOOP_LIMIT`), except when explicitly
+        // disabled for profiling (`VICTORY_LOOP_LIMIT=0`) or when a natural
+        // single-latch loop has a provably monotonic constant-bounded induction
+        // variable whose maximum trip count stays within the stage limit.
+        if super::loop_limit_enabled() {
+            let stage_limit = self.stage_loop_limit();
+            let def_site: HashMap<Value, Site> = p
+                .blocks
                 .iter()
-                .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
-            if header {
-                let blk = self.block[b].expect("reachable");
-                let phi = self.s.m.phi(blk, self.s.t.i32);
-                self.counters.insert(b, (phi, Vec::new()));
+                .enumerate()
+                .flat_map(|(b, blk)| {
+                    blk.insts.iter().enumerate().flat_map(move |(i, inst)| {
+                        inst.writes.iter().map(move |&(_, w)| (w, (b, i)))
+                    })
+                })
+                .collect();
+            for &b in &order {
+                if self.ray_skipped.contains(&b) || ray_by_entry.contains_key(&b) {
+                    continue;
+                }
+                let header = p.blocks[b]
+                    .preds
+                    .iter()
+                    .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
+                if header && !self.is_provably_bounded_loop(b, stage_limit, &def_site) {
+                    let blk = self.block[b].expect("reachable");
+                    let phi = self.s.m.phi(blk, self.s.t.i32);
+                    self.counters.insert(b, (phi, Vec::new()));
+                }
             }
         }
         self.cur = self.s.entry;
@@ -2850,6 +2957,8 @@ impl<'a> Lower<'a> {
             }
             self.exit(b)?;
         }
+        #[cfg(test)]
+        let loop_counters = self.counters.len() as u32;
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -2870,6 +2979,10 @@ impl<'a> Lower<'a> {
             half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            stride_loads: self.strides.len() as u32,
+            #[cfg(test)]
+            loop_counters,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -7959,6 +8072,24 @@ impl<'a> Lower<'a> {
         true
     }
 
+    fn val_ready_at(&self, v: Value, block: usize) -> bool {
+        if self.cand_inputs.contains_key(&v) {
+            return false;
+        }
+        if self.params.contains_key(&v) {
+            return true;
+        }
+        match self.vals.get(&v) {
+            Some(Val::I32(V::Const(_)) | Val::Bit(V::Const(_))) => true,
+            Some(Val::I32(_) | Val::Bit(_)) => self.def_block.get(&v).is_none_or(|&db| {
+                !self.ray_entries.contains(&db)
+                    && !self.ray_skipped.contains(&db)
+                    && self.dominates(db, block)
+            }),
+            _ => false,
+        }
+    }
+
     fn can_hoist_heap_index(&self, load: Site) -> bool {
         if !self.scalar.contains_key(&load) {
             return false;
@@ -7980,36 +8111,96 @@ impl<'a> Lower<'a> {
         else {
             return false;
         };
-        let val_ready = |v: Value| -> bool {
-            if self.cand_inputs.contains_key(&v) {
-                return false;
-            }
-            if self.params.contains_key(&v) {
-                return true;
-            }
-            match self.vals.get(&v) {
-                Some(Val::I32(V::Const(_)) | Val::Bit(V::Const(_))) => true,
-                Some(Val::I32(_) | Val::Bit(_)) => self.def_block.get(&v).is_none_or(|&db| {
-                    !self.ray_entries.contains(&db)
-                        && !self.ray_skipped.contains(&db)
-                        && self.dominates(db, load.0)
-                }),
-                _ => false,
-            }
-        };
         let Some(base_v) = li.read(Reg::S(*code)) else {
             return false;
         };
-        if !val_ready(base_v) {
+        if !self.val_ready_at(base_v, load.0) {
             return false;
         }
         match *soffset {
             Operand::Scalar { code: NULL, .. } | Operand::Literal(_) => true,
-            Operand::Const(253) => li.read(Reg::Scc).is_some_and(val_ready),
+            Operand::Const(253) => li.read(Reg::Scc).is_some_and(|v| self.val_ready_at(v, load.0)),
             Operand::Const(_) => true,
-            Operand::Scalar { code, .. } => li.read(Reg::S(code)).is_some_and(val_ready),
-            Operand::Vector { reg, .. } => li.read(Reg::V(reg)).is_some_and(val_ready),
+            Operand::Scalar { code, .. } => {
+                li.read(Reg::S(code)).is_some_and(|v| self.val_ready_at(v, load.0))
+            }
+            Operand::Vector { reg, .. } => {
+                li.read(Reg::V(reg)).is_some_and(|v| self.val_ready_at(v, load.0))
+            }
             _ => false,
+        }
+    }
+
+    fn can_hoist_fetched_index(&self, load: Site) -> bool {
+        if !self.scalar.contains_key(&load) {
+            return false;
+        }
+        let Some(li) = self
+            .x
+            .p
+            .blocks
+            .get(load.0)
+            .and_then(|b| b.insts.get(load.1))
+        else {
+            return false;
+        };
+        let Fields::Flat {
+            addr: Some(Operand::Vector { reg, .. }),
+            saddr,
+            ..
+        } = li.fields
+        else {
+            return false;
+        };
+        let Some(addr_v) = li.read(Reg::V(reg)) else {
+            return false;
+        };
+        if !self.val_ready_at(addr_v, load.0) {
+            return false;
+        }
+        if let Some(Operand::Scalar { code, .. }) = saddr
+            && code != NULL
+        {
+            return li
+                .read(Reg::S(code))
+                .is_some_and(|v| self.val_ready_at(v, load.0));
+        }
+        true
+    }
+
+    /// DXIL block to emit loop-invariant `Source::Loaded` descriptor work in:
+    /// `self.tail[load.0]` before its terminator when `load.0` strictly dominates
+    /// `self.cur_ir` and is not a waterfall or lifted/skipped ray block.
+    fn hoist_loaded_block(&self, load: Site) -> usize {
+        if !self.x.res.waterfall.loads.contains(&load)
+            && load.0 != self.cur_ir
+            && !self.ray_entries.contains(&load.0)
+            && !self.ray_skipped.contains(&load.0)
+            && self.dominates(load.0, self.cur_ir)
+            && let Some(dst_blk) = self.tail[load.0]
+            && self.can_hoist_heap_index(load)
+        {
+            dst_blk
+        } else {
+            self.cur
+        }
+    }
+
+    /// DXIL block to emit loop-invariant non-waterfall `Source::Fetched` handle
+    /// creation in: `self.tail[load.0]` before its terminator when `load.0`
+    /// strictly dominates `self.cur_ir` and all address operands dominate `load.0`.
+    fn hoist_fetched_block(&self, load: Site) -> usize {
+        if !self.x.res.waterfall.loads.contains(&load)
+            && load.0 != self.cur_ir
+            && !self.ray_entries.contains(&load.0)
+            && !self.ray_skipped.contains(&load.0)
+            && self.dominates(load.0, self.cur_ir)
+            && let Some(dst_blk) = self.tail[load.0]
+            && self.can_hoist_fetched_index(load)
+        {
+            dst_blk
+        } else {
+            self.cur
         }
     }
 
@@ -8029,18 +8220,7 @@ impl<'a> Lower<'a> {
                 // Hoist wave-uniform descriptor handles out of inner loops (such as
                 // `RayQuery::Proceed`) into `load.0`'s DXIL tail block before its
                 // terminator whenever `load.0` strictly dominates `self.cur_ir`.
-                let target_blk = if !per_lane
-                    && load.0 != self.cur_ir
-                    && !self.ray_entries.contains(&load.0)
-                    && !self.ray_skipped.contains(&load.0)
-                    && self.dominates(load.0, self.cur_ir)
-                    && let Some(dst_blk) = self.tail[load.0]
-                    && self.can_hoist_heap_index(*load)
-                {
-                    dst_blk
-                } else {
-                    self.cur
-                };
+                let target_blk = self.hoist_loaded_block(*load);
                 let key = (target_blk, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
@@ -8130,7 +8310,37 @@ impl<'a> Lower<'a> {
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
             }
-            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
+            Source::Fetched { load, first } => {
+                // Hoist loop-invariant non-waterfall per-lane descriptor handles
+                // into `load.0`'s DXIL tail block before its terminator so inner
+                // loops reuse the handle instead of re-emitting raw_twin +
+                // createHandleFromHeap + annotateHandle on every iteration.
+                let target_blk = self.hoist_fetched_block(*load);
+                let key = (target_blk, *load, *first, sampler, props);
+                if let Some(&h) = self.handles.get(&key) {
+                    return Ok(h);
+                }
+                let saved_cur = std::mem::replace(&mut self.cur, target_blk);
+                let next_ir = if target_blk == saved_cur {
+                    self.cur_ir
+                } else {
+                    load.0
+                };
+                let saved_ir = std::mem::replace(&mut self.cur_ir, next_ir);
+                let res = (|| -> Result<V, Why> {
+                    let index = self.fetched_index(*load, *first, sampler)?;
+                    let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                    Ok(self
+                        .s
+                        .heap_handle_at(target_blk, index, sampler, true, props, bounded))
+                })();
+                self.cur = saved_cur;
+                self.cur_ir = saved_ir;
+                let h = res?;
+                self.handles.insert(key, h);
+                Ok(h)
+            }
+            Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
@@ -8391,12 +8601,12 @@ impl<'a> Lower<'a> {
             Some(RootType::Table) => super::shader::SLOT_TABLE_STRIDES,
             _ => return Ok(None),
         };
-        let slot = self.heap_index(*load, *first, false)?;
-        Ok(Some(self.slot_dword(
+        Ok(Some(self.hoisted_slot_dword(
+            *load,
+            *first,
             srv_slot,
-            slot,
             super::shader::SLOT_STRIDES_COUNT,
-        )))
+        )?))
     }
 
     /// The host's word for the buffer view `src` names: its stride and
@@ -8416,14 +8626,39 @@ impl<'a> Lower<'a> {
             Some(RootType::Table) if allow_table => super::shader::SLOT_TABLE_STRIDES,
             _ => return Ok(None),
         };
-        let key = (self.cur, *load, *first);
+        Ok(Some(self.hoisted_slot_dword(*load, *first, srv_slot, 0)?))
+    }
+
+    /// Emits and caches a `SLOT_STRIDES` / `SLOT_TABLE_STRIDES` load, hoisting
+    /// it to `self.tail[load.0]` when `load.0` strictly dominates `self.cur_ir`.
+    fn hoisted_slot_dword(
+        &mut self,
+        load: Site,
+        first: u8,
+        srv_slot: u8,
+        from: u32,
+    ) -> Result<V, Why> {
+        let target_blk = self.hoist_loaded_block(load);
+        let key = (target_blk, load, first, from);
         if let Some(&v) = self.strides.get(&key) {
-            return Ok(Some(v));
+            return Ok(v);
         }
-        let slot = self.heap_index(*load, *first, false)?;
-        let v = self.slot_dword(srv_slot, slot, 0);
+        let saved_cur = std::mem::replace(&mut self.cur, target_blk);
+        let next_ir = if target_blk == saved_cur {
+            self.cur_ir
+        } else {
+            load.0
+        };
+        let saved_ir = std::mem::replace(&mut self.cur_ir, next_ir);
+        let res = (|| -> Result<V, Why> {
+            let slot = self.heap_index(load, first, false)?;
+            Ok(self.slot_dword(srv_slot, slot, from))
+        })();
+        self.cur = saved_cur;
+        self.cur_ir = saved_ir;
+        let v = res?;
         self.strides.insert(key, v);
-        Ok(Some(v))
+        Ok(v)
     }
 
     /// Reads dword `from + clamp(slot)` from the host's slot table (`srv_slot`).
@@ -13471,6 +13706,543 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Per-stage safety iteration limit (`128` PS, `256` VS/MS, `4096` CS, or
+    /// custom `VICTORY_SHADER_LOOP_LIMIT`).
+    fn stage_loop_limit(&self) -> u32 {
+        match super::loop_limit() {
+            LOOP_LIMIT if self.s.pixel => 1 << 7,
+            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            LOOP_LIMIT => 1 << 12,
+            named => named,
+        }
+    }
+
+    /// Returns true only when natural loop `header` has a single back-edge latch,
+    /// an unconditional constant non-zero stride integer induction variable
+    /// updated without wraparound on every iteration, and exits at `header` or
+    /// `latch` via an integer comparison against a compile-time constant bound
+    /// whose exact maximum trip count is `<= stage_limit`.
+    fn is_provably_bounded_loop(
+        &self,
+        header: usize,
+        stage_limit: u32,
+        def_site: &HashMap<Value, Site>,
+    ) -> bool {
+        #[derive(Clone, Copy)]
+        enum LoopCmp {
+            Eq,
+            Ne,
+            Lt,
+            Le,
+            Gt,
+            Ge,
+        }
+        impl LoopCmp {
+            fn invert(self) -> Self {
+                match self {
+                    Self::Eq => Self::Ne,
+                    Self::Ne => Self::Eq,
+                    Self::Lt => Self::Ge,
+                    Self::Le => Self::Gt,
+                    Self::Gt => Self::Le,
+                    Self::Ge => Self::Lt,
+                }
+            }
+            fn flip(self) -> Self {
+                match self {
+                    Self::Eq => Self::Eq,
+                    Self::Ne => Self::Ne,
+                    Self::Lt => Self::Gt,
+                    Self::Le => Self::Ge,
+                    Self::Gt => Self::Lt,
+                    Self::Ge => Self::Le,
+                }
+            }
+            fn eval(self, signed: bool, a: u32, b: u32) -> bool {
+                if signed {
+                    let (a, b) = (a as i32, b as i32);
+                    match self {
+                        Self::Eq => a == b,
+                        Self::Ne => a != b,
+                        Self::Lt => a < b,
+                        Self::Le => a <= b,
+                        Self::Gt => a > b,
+                        Self::Ge => a >= b,
+                    }
+                } else {
+                    match self {
+                        Self::Eq => a == b,
+                        Self::Ne => a != b,
+                        Self::Lt => a < b,
+                        Self::Le => a <= b,
+                        Self::Gt => a > b,
+                        Self::Ge => a >= b,
+                    }
+                }
+            }
+        }
+        #[derive(Clone, Copy)]
+        enum LoopArg {
+            Val(Value),
+            Const(u32),
+        }
+        fn eval_operand(inst: &Inst, op: &Operand) -> Option<LoopArg> {
+            match *op {
+                Operand::Scalar { code: NULL, .. } => Some(LoopArg::Const(0)),
+                Operand::Scalar { code, .. } => inst.read(Reg::S(code)).map(LoopArg::Val),
+                Operand::Vector { reg, .. } => inst.read(Reg::V(reg)).map(LoopArg::Val),
+                Operand::Literal(k) => Some(LoopArg::Const(k)),
+                Operand::Const(c) => crate::resource::inline(c).map(LoopArg::Const),
+                _ => None,
+            }
+        }
+        fn clean_valu(inst: &Inst) -> Option<&crate::gfx10::Valu> {
+            let Fields::Valu(fv) = &inst.fields else {
+                return None;
+            };
+            (fv.dpp.is_none()
+                && fv.sdwa.is_none()
+                && fv.abs == 0
+                && fv.neg == 0
+                && !fv.clamp
+                && fv.omod == 0)
+                .then_some(fv)
+        }
+        fn strip_copies(
+            p: &Program,
+            st: &Structured,
+            def_site: &HashMap<Value, Site>,
+            mut v: Value,
+        ) -> Value {
+            for _ in 0..4 {
+                let Some(&(b, i)) = def_site.get(&v) else {
+                    break;
+                };
+                if st.guards[b][i].is_some() {
+                    break;
+                }
+                let inst = &p.blocks[b].insts[i];
+                let src = match inst.name() {
+                    "s_mov_b32" => match &inst.fields {
+                        Fields::Sop { src, .. } if src.len() == 1 => src[0],
+                        _ => break,
+                    },
+                    "v_mov_b32" => match clean_valu(inst) {
+                        Some(fv) if fv.src.len() == 1 => fv.src[0],
+                        _ => break,
+                    },
+                    _ => break,
+                };
+                match eval_operand(inst, &src) {
+                    Some(LoopArg::Val(next)) => v = next,
+                    _ => break,
+                }
+            }
+            v
+        }
+        fn const_u32(
+            p: &Program,
+            st: &Structured,
+            def_site: &HashMap<Value, Site>,
+            v: Value,
+        ) -> Option<u32> {
+            let v = strip_copies(p, st, def_site, v);
+            let &(b, i) = def_site.get(&v)?;
+            if st.guards[b][i].is_some() {
+                return None;
+            }
+            let inst = &p.blocks[b].insts[i];
+            match inst.name() {
+                "s_movk_i32" => match &inst.fields {
+                    Fields::Sop { imm: Some(imm), .. } => Some(*imm as i16 as i32 as u32),
+                    _ => None,
+                },
+                "s_mov_b32" => match &inst.fields {
+                    Fields::Sop { src, .. } => match eval_operand(inst, src.first()?)? {
+                        LoopArg::Const(k) => Some(k),
+                        LoopArg::Val(_) => None,
+                    },
+                    _ => None,
+                },
+                "v_mov_b32" => {
+                    let fv = clean_valu(inst)?;
+                    match eval_operand(inst, fv.src.first()?)? {
+                        LoopArg::Const(k) => Some(k),
+                        LoopArg::Val(_) => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        fn resolve_arg(
+            p: &Program,
+            st: &Structured,
+            def_site: &HashMap<Value, Site>,
+            arg: LoopArg,
+        ) -> LoopArg {
+            match arg {
+                LoopArg::Const(k) => LoopArg::Const(k),
+                LoopArg::Val(v) => match const_u32(p, st, def_site, v) {
+                    Some(k) => LoopArg::Const(k),
+                    None => LoopArg::Val(strip_copies(p, st, def_site, v)),
+                },
+            }
+        }
+        fn parse_cmp(
+            p: &Program,
+            st: &Structured,
+            site: Site,
+        ) -> Option<(LoopArg, LoopArg, LoopCmp, bool)> {
+            if st.guards[site.0][site.1].is_some() {
+                return None;
+            }
+            let inst = &p.blocks[site.0].insts[site.1];
+            let name = inst.name();
+            if let Some(op) = name.strip_prefix("s_cmp_").or(name.strip_prefix("s_cmpk_")) {
+                if !op.ends_with("_i32") && !op.ends_with("_u32") {
+                    return None;
+                }
+                let signed = op.ends_with("_i32");
+                let pred = match op.get(..2)? {
+                    "eq" => LoopCmp::Eq,
+                    "lg" => LoopCmp::Ne,
+                    "lt" => LoopCmp::Lt,
+                    "le" => LoopCmp::Le,
+                    "gt" => LoopCmp::Gt,
+                    "ge" => LoopCmp::Ge,
+                    _ => return None,
+                };
+                let Fields::Sop { src, imm, .. } = &inst.fields else {
+                    return None;
+                };
+                let a = eval_operand(inst, src.first()?)?;
+                let b = if name.starts_with("s_cmpk_") {
+                    let k = (*imm)?;
+                    LoopArg::Const(if signed { k as i16 as i32 as u32 } else { u32::from(k) })
+                } else {
+                    eval_operand(inst, src.get(1)?)?
+                };
+                return Some((a, b, pred, signed));
+            }
+            if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
+                let fv = clean_valu(inst)?;
+                let (op, ty) = rest.rsplit_once('_')?;
+                if !matches!(ty, "i32" | "u32") {
+                    return None;
+                }
+                let signed = ty == "i32";
+                let pred = match op {
+                    "eq" => LoopCmp::Eq,
+                    "ne" | "lg" => LoopCmp::Ne,
+                    "lt" => LoopCmp::Lt,
+                    "le" => LoopCmp::Le,
+                    "gt" => LoopCmp::Gt,
+                    "ge" => LoopCmp::Ge,
+                    _ => return None,
+                };
+                let a = eval_operand(inst, fv.src.first()?)?;
+                let b = eval_operand(inst, fv.src.get(1)?)?;
+                return Some((a, b, pred, signed));
+            }
+            None
+        }
+        fn parse_step(
+            p: &Program,
+            st: &Structured,
+            def_site: &HashMap<Value, Site>,
+            step_v: Value,
+            phi_v: Value,
+        ) -> Option<(usize, Value, i64)> {
+            let v = strip_copies(p, st, def_site, step_v);
+            let &(sb, si) = def_site.get(&v)?;
+            if st.guards[sb][si].is_some() {
+                return None;
+            }
+            let inst = &p.blocks[sb].insts[si];
+            let name = inst.name();
+            let delta = match name {
+                "s_addk_i32" => {
+                    let Fields::Sop {
+                        dst: Some(d),
+                        imm: Some(imm),
+                        ..
+                    } = &inst.fields
+                    else {
+                        return None;
+                    };
+                    match resolve_arg(p, st, def_site, eval_operand(inst, d)?) {
+                        LoopArg::Val(x) if x == phi_v => i64::from(*imm as i16),
+                        _ => return None,
+                    }
+                }
+                "s_add_u32" | "s_add_i32" => {
+                    let Fields::Sop { src, .. } = &inst.fields else {
+                        return None;
+                    };
+                    let a = resolve_arg(p, st, def_site, eval_operand(inst, src.first()?)?);
+                    let b = resolve_arg(p, st, def_site, eval_operand(inst, src.get(1)?)?);
+                    match (a, b) {
+                        (LoopArg::Val(x), LoopArg::Const(k))
+                        | (LoopArg::Const(k), LoopArg::Val(x))
+                            if x == phi_v =>
+                        {
+                            i64::from(k as i32)
+                        }
+                        _ => return None,
+                    }
+                }
+                "s_sub_u32" | "s_sub_i32" => {
+                    let Fields::Sop { src, .. } = &inst.fields else {
+                        return None;
+                    };
+                    let a = resolve_arg(p, st, def_site, eval_operand(inst, src.first()?)?);
+                    let b = resolve_arg(p, st, def_site, eval_operand(inst, src.get(1)?)?);
+                    match (a, b) {
+                        (LoopArg::Val(x), LoopArg::Const(k)) if x == phi_v => -i64::from(k as i32),
+                        _ => return None,
+                    }
+                }
+                "v_add_nc_u32" => {
+                    let fv = clean_valu(inst)?;
+                    let a = resolve_arg(p, st, def_site, eval_operand(inst, fv.src.first()?)?);
+                    let b = resolve_arg(p, st, def_site, eval_operand(inst, fv.src.get(1)?)?);
+                    match (a, b) {
+                        (LoopArg::Val(x), LoopArg::Const(k))
+                        | (LoopArg::Const(k), LoopArg::Val(x))
+                            if x == phi_v =>
+                        {
+                            i64::from(k as i32)
+                        }
+                        _ => return None,
+                    }
+                }
+                "v_sub_nc_u32" => {
+                    let fv = clean_valu(inst)?;
+                    let a = resolve_arg(p, st, def_site, eval_operand(inst, fv.src.first()?)?);
+                    let b = resolve_arg(p, st, def_site, eval_operand(inst, fv.src.get(1)?)?);
+                    match (a, b) {
+                        (LoopArg::Val(x), LoopArg::Const(k)) if x == phi_v => -i64::from(k as i32),
+                        _ => return None,
+                    }
+                }
+                "v_subrev_nc_u32" => {
+                    let fv = clean_valu(inst)?;
+                    let a = resolve_arg(p, st, def_site, eval_operand(inst, fv.src.first()?)?);
+                    let b = resolve_arg(p, st, def_site, eval_operand(inst, fv.src.get(1)?)?);
+                    match (a, b) {
+                        (LoopArg::Const(k), LoopArg::Val(x)) if x == phi_v => -i64::from(k as i32),
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            };
+            if delta == 0 || delta.unsigned_abs() > u64::from(i32::MAX as u32) {
+                return None;
+            }
+            Some((sb, v, delta))
+        }
+        fn bounded_trips(
+            init: u32,
+            delta: i64,
+            bound: u32,
+            pred: LoopCmp,
+            signed: bool,
+            post_inc: bool,
+            stage_limit: u32,
+        ) -> bool {
+            if stage_limit == 0 {
+                return false;
+            }
+            let cap = (stage_limit - 1).min(1 << 16);
+            let step_no_wrap = |cur: u32| -> Option<u32> {
+                if signed {
+                    let next = i64::from(cur as i32) + delta;
+                    (i64::from(i32::MIN)..=i64::from(i32::MAX))
+                        .contains(&next)
+                        .then_some(next as i32 as u32)
+                } else {
+                    let next = i64::from(cur) + delta;
+                    (0..=i64::from(u32::MAX)).contains(&next).then_some(next as u32)
+                }
+            };
+            let mut cur = init;
+            for _ in 0..=cap {
+                if post_inc {
+                    let Some(next) = step_no_wrap(cur) else {
+                        return false;
+                    };
+                    if !pred.eval(signed, next, bound) {
+                        return true;
+                    }
+                    cur = next;
+                } else {
+                    if !pred.eval(signed, cur, bound) {
+                        return true;
+                    }
+                    let Some(next) = step_no_wrap(cur) else {
+                        return false;
+                    };
+                    cur = next;
+                }
+            }
+            false
+        }
+
+        let p = self.x.p;
+        let st = self.x.st;
+        let mut back_preds = Vec::new();
+        let mut entry_preds = Vec::new();
+        for (idx, &q) in p.blocks[header].preds.iter().enumerate() {
+            if self.block[q].is_none() {
+                continue;
+            }
+            if self.rpo[header] <= self.rpo[q] {
+                back_preds.push((idx, q));
+            } else {
+                entry_preds.push((idx, q));
+            }
+        }
+        if back_preds.len() != 1 || entry_preds.is_empty() {
+            return false;
+        }
+        let (latch_pred_idx, latch) = back_preds[0];
+        if !self.dominates(header, latch) {
+            return false;
+        }
+        // Compute natural loop body and reject irreducible loops or lifted ray blocks.
+        let mut body = HashSet::new();
+        body.insert(header);
+        let mut work = Vec::new();
+        if body.insert(latch) {
+            work.push(latch);
+        }
+        while let Some(u) = work.pop() {
+            if self.block[u].is_none()
+                || !self.dominates(header, u)
+                || self.ray_entries.contains(&u)
+                || self.ray_skipped.contains(&u)
+            {
+                return false;
+            }
+            for &pred in &p.blocks[u].preds {
+                if self.block[pred].is_some() && body.insert(pred) {
+                    work.push(pred);
+                }
+            }
+        }
+        if self.ray_entries.contains(&header) || self.ray_skipped.contains(&header) {
+            return false;
+        }
+        let mut exit_candidates = vec![latch];
+        if header != latch {
+            exit_candidates.push(header);
+        }
+        for exit_blk in exit_candidates {
+            if st.wide.contains(&exit_blk) {
+                continue;
+            }
+            let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = st.exits[exit_blk]
+            else {
+                continue;
+            };
+            let stay_when_true = if exit_blk == latch {
+                if taken == header && !body.contains(&not_taken) {
+                    true
+                } else if not_taken == header && !body.contains(&taken) {
+                    false
+                } else {
+                    continue;
+                }
+            } else if body.contains(&taken) && !body.contains(&not_taken) {
+                true
+            } else if body.contains(&not_taken) && !body.contains(&taken) {
+                false
+            } else {
+                continue;
+            };
+            let (atom, cmp_stay_true) = match st.bools.node(when) {
+                Some((atom, Bool::FALSE, Bool::TRUE)) => (atom, stay_when_true),
+                Some((atom, Bool::TRUE, Bool::FALSE)) => (atom, !stay_when_true),
+                _ => continue,
+            };
+            let cmp_val = match atom {
+                Atom::Uniform(v) | Atom::Lane(v) => v,
+                _ => continue,
+            };
+            let Some(&cmp_site) = def_site.get(&cmp_val) else {
+                continue;
+            };
+            if !body.contains(&cmp_site.0) || !self.dominates(cmp_site.0, exit_blk) {
+                continue;
+            }
+            let Some((raw_a, raw_b, raw_pred, signed)) = parse_cmp(p, st, cmp_site) else {
+                continue;
+            };
+            let mut cont_pred = if cmp_stay_true {
+                raw_pred
+            } else {
+                raw_pred.invert()
+            };
+            let (tested_v, bound) = match (
+                resolve_arg(p, st, def_site, raw_a),
+                resolve_arg(p, st, def_site, raw_b),
+            ) {
+                (LoopArg::Val(v), LoopArg::Const(k)) => (v, k),
+                (LoopArg::Const(k), LoopArg::Val(v)) => {
+                    cont_pred = cont_pred.flip();
+                    (v, k)
+                }
+                _ => continue,
+            };
+            for phi in &p.blocks[header].phis {
+                if !matches!(phi.reg, Reg::S(c) if c != EXEC && c != EXEC + 1)
+                    && !matches!(phi.reg, Reg::V(_))
+                {
+                    continue;
+                }
+                let Some((step_blk, step_v, delta)) =
+                    parse_step(p, st, def_site, phi.args[latch_pred_idx], phi.value)
+                else {
+                    continue;
+                };
+                if !body.contains(&step_blk) || !self.dominates(step_blk, latch) {
+                    continue;
+                }
+                let post_inc = if tested_v == phi.value {
+                    false
+                } else if tested_v == step_v {
+                    true
+                } else {
+                    continue;
+                };
+                let mut inits = Vec::with_capacity(entry_preds.len());
+                let mut all_const = true;
+                for &(pred_idx, _) in &entry_preds {
+                    if let Some(k) = const_u32(p, st, def_site, phi.args[pred_idx]) {
+                        inits.push(k);
+                    } else {
+                        all_const = false;
+                        break;
+                    }
+                }
+                if !all_const {
+                    continue;
+                }
+                if inits
+                    .into_iter()
+                    .all(|init| bounded_trips(init, delta, bound, cont_pred, signed, post_inc, stage_limit))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
@@ -13492,13 +14264,7 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
-        let limit = self.s.m.i32(limit);
+        let limit = self.s.m.i32(self.stage_loop_limit());
         self.counters
             .get_mut(&to)
             .expect("header")
@@ -14453,6 +15219,128 @@ mod tests {
     }
 
     #[test]
+    fn rdna_wave32_mode1_mode2_gating_and_lds_guard() {
+        use super::{
+            TEST_FORCE_ANYHIT, TEST_HOST_WAVE, TEST_RDNA, TEST_RDNA_WAVE32, wave_local,
+            wave_local_strict, with_local_waves, with_local_waves_any,
+        };
+
+        let build = |words: &[u32], threads: [u32; 3], rsrc2: u32| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 32,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+                code,
+            };
+            let p = ir::build(&native.code, true, 32).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            (native, p, st, res, io)
+        };
+        let lower_cfg = |words: &[u32], threads: [u32; 3], rsrc2: u32| {
+            let (native, p, st, res, io) = build(words, threads, rsrc2);
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .expect("lowering succeeds")
+        };
+
+        let plain = [S_ENDPGM];
+        let swizzle = [0xD8D4_80E1, 0x0000_0000, S_ENDPGM];
+        let mbcnt = [0xD765_0000, 0x0001_00C1, S_ENDPGM];
+        let lds_rsrc2 = 1 << 15; // 512 bytes LDS (128 dwords)
+
+        let prev_rdna = TEST_RDNA.replace(Some(super::super::rdna::ALL));
+        let prev_wave = TEST_HOST_WAVE.replace(Some(64));
+        let prev_ah = TEST_FORCE_ANYHIT.replace(false);
+        let prev_mode = TEST_RDNA_WAVE32.replace(Some(0));
+
+        // Mode 0 (default OFF): no forced Wave32 on non-AnyHit wave64 compute shaders.
+        assert_eq!(lower_cfg(&plain, [64, 1, 1], 0).wave_size, None);
+        assert_eq!(lower_cfg(&swizzle, [64, 1, 1], 0).wave_size, Some(64));
+
+        // Mode 1: `!crosses` only, strictly gated by `(lds_dwords == 0 || group <= 32)`.
+        TEST_RDNA_WAVE32.set(Some(1));
+        assert_eq!(lower_cfg(&plain, [64, 1, 1], 0).wave_size, Some(32));
+        assert_eq!(lower_cfg(&swizzle, [64, 1, 1], 0).wave_size, Some(32));
+        assert_eq!(
+            with_local_waves(|| lower_cfg(&mbcnt, [64, 1, 1], 0)).wave_size,
+            Some(64),
+            "Mode 1 must NOT engage wave_local on crossing ops"
+        );
+        // LDS guard: group > 32 with LDS must NOT lower to Wave32 (both 1-wave and multi-wave).
+        assert_eq!(lower_cfg(&plain, [64, 1, 1], lds_rsrc2).wave_size, Some(64));
+        assert_eq!(lower_cfg(&plain, [128, 1, 1], lds_rsrc2).wave_size, None);
+        assert_eq!(lower_cfg(&swizzle, [64, 1, 1], lds_rsrc2).wave_size, Some(64));
+        // LDS guard allows group <= 32.
+        assert_eq!(lower_cfg(&plain, [32, 1, 1], lds_rsrc2).wave_size, Some(32));
+        assert_eq!(lower_cfg(&swizzle, [32, 1, 1], lds_rsrc2).wave_size, Some(32));
+
+        // Mode 2: `!crosses` + `wave_local` (never `LOCAL_ANY`, still respects LDS guard).
+        TEST_RDNA_WAVE32.set(Some(2));
+        assert_eq!(lower_cfg(&swizzle, [64, 1, 1], 0).wave_size, Some(32));
+        assert_eq!(lower_cfg(&mbcnt, [64, 1, 1], 0).wave_size, Some(64));
+        assert_eq!(
+            with_local_waves(|| lower_cfg(&mbcnt, [64, 1, 1], 0)).wave_size,
+            Some(32),
+            "Mode 2 under with_local_waves lowers wave_local crossing shader to Wave32"
+        );
+        assert_eq!(
+            with_local_waves_any(|| lower_cfg(&mbcnt, [64, 1, 1], 0)).wave_size,
+            Some(64),
+            "Mode 2 must NEVER engage LOCAL_ANY"
+        );
+        assert_eq!(
+            with_local_waves(|| lower_cfg(&mbcnt, [64, 1, 1], lds_rsrc2)).wave_size,
+            Some(64),
+            "Mode 2 must respect LDS guard for group > 32"
+        );
+
+        // Strict v_readfirstlane_b32 soundness guard for Mode 2:
+        // Lane-varying v0 read via v_readfirstlane_b32 is rejected by wave_local_strict.
+        let readfirst_varying = [
+            (0x3Fu32 << 25) | (0x02u32 << 9) | 256, // v_readfirstlane_b32 s0, v0
+            S_ENDPGM,
+        ];
+        let (_, p_var, st_var, res_var, _) = build(&readfirst_varying, [64, 1, 1], 0);
+        assert!(wave_local(&p_var, &st_var).is_ok());
+        assert!(
+            wave_local_strict(&p_var, &st_var, &res_var).is_err(),
+            "Mode 2 wave_local_strict must reject lane-varying v_readfirstlane_b32"
+        );
+
+        // Uniform VGPR (copied from scalar s0) read via v_readfirstlane_b32 is accepted.
+        let readfirst_uniform = [
+            0x7E02_0200,                                           // v_mov_b32 v1, s0
+            (0x3Fu32 << 25) | (1u32 << 17) | (0x02u32 << 9) | 257, // v_readfirstlane_b32 s1, v1
+            S_ENDPGM,
+        ];
+        let (_, p_uni, st_uni, res_uni, _) = build(&readfirst_uniform, [64, 1, 1], 0);
+        assert!(
+            wave_local_strict(&p_uni, &st_uni, &res_uni).is_ok(),
+            "Mode 2 wave_local_strict must allow lane_uniform v_readfirstlane_b32"
+        );
+
+        TEST_RDNA_WAVE32.set(prev_mode);
+        TEST_FORCE_ANYHIT.set(prev_ah);
+        TEST_HOST_WAVE.set(prev_wave);
+        TEST_RDNA.set(prev_rdna);
+    }
+
+    #[test]
     fn sdwa_16bit_dst_unused_sext_lowers_and_reserved_3_is_refused() {
         // VOP2 v_add_f16 (op 0x32) with src0 = 0xF9 (SDWA), vsrc1 = v0, vdst = v2.
         // SDWA word: src0=v0 (0), dst_sel << 8, dst_unused << 11,
@@ -14550,5 +15438,187 @@ mod tests {
         let row = l.user_data.iter().find(|u| u.root == spread && u.dword == 0).expect("row dword");
         let asked = l.user_data.iter().find(|u| u.root == spread && u.dword == 1).expect("asked dword");
         assert_eq!(asked.index, row.index + 1, "spread dwords must be adjacent");
+    }
+
+    #[test]
+    fn hoists_loop_invariant_strides_and_fetched_handles() {
+        // 1) ResourceHeap buffer descriptor loaded before a 2-block branch/loop,
+        //    indexed in two separate dominated blocks -> SLOT_STRIDES hoisted and
+        //    emitted once in load.0's tail block.
+        let stride_words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (ResourceHeap base)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0 (split into two dominated blocks)
+            0xBF84_0004, // s_cbranch_scc0 +4 -> second load block
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen (block A)
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xE030_2000,
+            0x8002_0200, // buffer_load_dword v2, v0, s[8:11], 0 idxen (block B)
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let layout = vec![
+            root(RootType::ResourceHeap, 0, 0),
+            root(RootType::Constants, 1, 1),
+        ];
+        let mut l = lower_with(&stride_words, layout, vec![]).expect("stride hoist lowers");
+        assert_eq!(
+            l.stride_loads, 1,
+            "loop/branch-invariant SLOT_STRIDES load should hoist to load.0 and emit once"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(None) {
+            v.validate(&mut l.dxil).expect("hoisted stride DXIL must pass validation");
+        }
+
+        // 2) Loop-invariant Source::Fetched descriptor (global_load_dwordx4 in block 0,
+        //    used across two separate dominated waterfall loop blocks) -> hoisted and
+        //    cached once in load.0's tail block (1 nonuniform handle instead of 2).
+        let base = crate::resource::tests::WATERFALL_FETCHED_WAVE32;
+        let save_exec = base
+            .iter()
+            .position(|&w| w == 0xBE94_037E)
+            .expect("s_mov_b32 s20, exec_lo");
+        let endpgm = base
+            .iter()
+            .position(|&w| w == S_ENDPGM)
+            .expect("s_endpgm");
+        let mut fetched_words = base[..endpgm].to_vec();
+        fetched_words.extend_from_slice(&base[save_exec..endpgm]);
+        fetched_words.push(S_ENDPGM);
+        let (tex_layout, tex_used) = texture_tables();
+        let mut lf =
+            lower_with(&fetched_words, tex_layout, tex_used).expect("fetched handle hoist lowers");
+        assert_eq!(
+            lf.nonuniform_handles, 1,
+            "loop-invariant Source::Fetched handle should hoist to load.0 and emit once"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(None) {
+            v.validate(&mut lf.dxil).expect("hoisted fetched handle DXIL must pass validation");
+        }
+    }
+
+    #[test]
+    fn loop_limit_elided_only_for_provably_constant_bounded_monotonic_loops() {
+        use super::TEST_LOOP_LIMIT_ENABLED;
+
+        let layout = || vec![root(RootType::Constants, 0, 0)];
+
+        // 1) Constant-bounded monotonic ascending loop: i = 0; do { i += 1; } while (i < 8);
+        let const_asc = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x8004_8104, // loop: s_add_u32 s4, s4, 1
+            0xBF0A_8804, // s_cmp_lt_u32 s4, 8
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            S_ENDPGM,
+        ];
+        let mut l_asc = lower_with(&const_asc, layout(), vec![]).expect("const_asc lowers");
+        assert_eq!(
+            l_asc.loop_counters, 0,
+            "constant-bounded ascending monotonic loop should elide LOOP_LIMIT counter"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(None) {
+            v.validate(&mut l_asc.dxil).expect("const_asc DXIL must validate");
+        }
+
+        // 2) Constant-bounded monotonic descending loop: i = 8; do { i -= 1; } while (i != 0);
+        let const_desc = [
+            0xBE84_0388, // s_mov_b32 s4, 8
+            0x8084_8104, // loop: s_sub_u32 s4, s4, 1
+            0xBF07_8004, // s_cmp_lg_u32 s4, 0
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            S_ENDPGM,
+        ];
+        let mut l_desc = lower_with(&const_desc, layout(), vec![]).expect("const_desc lowers");
+        assert_eq!(
+            l_desc.loop_counters, 0,
+            "constant-bounded descending monotonic loop should elide LOOP_LIMIT counter"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(None) {
+            v.validate(&mut l_desc.dxil).expect("const_desc DXIL must validate");
+        }
+
+        // 3) Dynamic-bound loop: i = 0; do { i += 1; } while (i < s0);
+        let dyn_bound = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x8004_8104, // loop: s_add_u32 s4, s4, 1
+            0xBF0A_0004, // s_cmp_lt_u32 s4, s0
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            S_ENDPGM,
+        ];
+        let l_dyn = lower_with(&dyn_bound, layout(), vec![]).expect("dyn_bound lowers");
+        assert_eq!(
+            l_dyn.loop_counters, 1,
+            "dynamic-bound loop MUST keep its LOOP_LIMIT safety counter"
+        );
+
+        // 4) Stride-mismatch / non-terminating loop: i = 0; do { i += 2; } while (i != 5);
+        let stride_miss = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0x8004_8204, // loop: s_add_u32 s4, s4, 2
+            0xBF07_8504, // s_cmp_lg_u32 s4, 5
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            S_ENDPGM,
+        ];
+        let l_miss = lower_with(&stride_miss, layout(), vec![]).expect("stride_miss lowers");
+        assert_eq!(
+            l_miss.loop_counters, 1,
+            "stride-mismatch loop that misses bound MUST keep its LOOP_LIMIT counter"
+        );
+
+        // 5) Wrapping loop: i = 0xFFFF_FFFE (-2); do { i += 2; } while (i < 4);
+        let wrapping = [
+            0xBE84_03C2, // s_mov_b32 s4, -2
+            0x8004_8204, // loop: s_add_u32 s4, s4, 2 (wraps u32::MAX -> 0)
+            0xBF0A_8404, // s_cmp_lt_u32 s4, 4
+            0xBF85_FFFD, // s_cbranch_scc1 loop
+            S_ENDPGM,
+        ];
+        let l_wrap = lower_with(&wrapping, layout(), vec![]).expect("wrapping lowers");
+        assert_eq!(
+            l_wrap.loop_counters, 1,
+            "wrapping induction loop MUST keep its LOOP_LIMIT counter"
+        );
+
+        // 6) Conditional multi-step loop: i = 0; do { if (s0 == 0) i += 1; i += 1; } while (i < 8);
+        let multi_step = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBF06_8000, // loop: s_cmp_eq_u32 s0, 0
+            0xBF84_0001, // s_cbranch_scc0 +1 (skip extra +1)
+            0x8004_8104, // s_add_u32 s4, s4, 1
+            0x8004_8104, // s_add_u32 s4, s4, 1
+            0xBF0A_8804, // s_cmp_lt_u32 s4, 8
+            0xBF85_FFFA, // s_cbranch_scc1 loop (-6 dwords)
+            S_ENDPGM,
+        ];
+        let l_multi = lower_with(&multi_step, layout(), vec![]).expect("multi_step lowers");
+        assert_eq!(
+            l_multi.loop_counters, 1,
+            "conditional multi-step loop MUST keep its LOOP_LIMIT counter"
+        );
+
+        // 7) Explicit VICTORY_LOOP_LIMIT=0 benchmark switch disables dynamic loop counters
+        //    and alters translation_fingerprint().
+        let fp_on = super::super::translation_fingerprint();
+        let prev = TEST_LOOP_LIMIT_ENABLED.replace(Some(false));
+        let fp_off = super::super::translation_fingerprint();
+        let l_off = lower_with(&dyn_bound, layout(), vec![]).expect("dyn_bound with switch=0 lowers");
+        TEST_LOOP_LIMIT_ENABLED.set(prev);
+        assert_eq!(
+            l_off.loop_counters, 0,
+            "VICTORY_LOOP_LIMIT=0 must disable loop counters on dynamic loops"
+        );
+        assert_ne!(
+            fp_on, fp_off,
+            "VICTORY_LOOP_LIMIT=0 must be reflected in translation_fingerprint()"
+        );
     }
 }

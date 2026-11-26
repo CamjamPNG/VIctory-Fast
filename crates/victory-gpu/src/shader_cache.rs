@@ -94,6 +94,14 @@ fn build() -> [u8; 32] {
         if victory_shader::emit::constants_raw() {
             bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
         }
+        let rdna_w32 = victory_shader::emit::rdna_wave32();
+        if rdna_w32 != 0 {
+            bytes.extend_from_slice(b"VICTORY_RDNA_WAVE32=");
+            bytes.push(b'0' + rdna_w32);
+        }
+        if !victory_shader::emit::loop_limit_enabled() {
+            bytes.extend_from_slice(b"VICTORY_LOOP_LIMIT=0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

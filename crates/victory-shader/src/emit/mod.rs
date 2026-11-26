@@ -152,6 +152,25 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether translated loops keep their stage-capped safety iteration counter
+/// (`LOOP_LIMIT`) on dynamic loops (`VICTORY_LOOP_LIMIT=0` disables all loop
+/// counters for profiling; on by default). Part of the translation: the shader
+/// cache keys on it.
+pub fn loop_limit_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_loop_limit_enabled() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_LOOP_LIMIT")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            != Some("0")
+    })
+}
+
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
 /// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
 /// the shader cache keys on it.
@@ -345,6 +364,30 @@ pub fn shader_opt() -> u32 {
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
+/// RDNA, [`set_host_rdna`]): whether eligible console `wave64` compute shaders
+/// lower to exact barrier-free Wave32 (`VICTORY_RDNA_WAVE32`):
+/// - unset or `0`: off (only lifted `AnyHit` shaders use exact RDNA Wave32).
+/// - `1`: `!crosses` shaders only (100% bit-exact, zero barriers, zero wave
+///   approximation).
+/// - `2`: `!crosses` plus `wave_local` idiom shaders passing the strict
+///   `v_readfirstlane_b32` soundness guard (never `split_lds`, LDS exchange, or
+///   `LOCAL_ANY`).
+///
+/// Part of the translation: the shader cache keys on it.
+pub fn rdna_wave32() -> u8 {
+    #[cfg(test)]
+    if let Some(mode) = lower::test_rdna_wave32() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_RDNA_WAVE32").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// On a host whose shaders run on the console's own kind of hardware (AMD
 /// RDNA, [`set_host_rdna`]): which of the console's float instructions are
 /// written as the one host operation the driver makes the same instruction
 /// of, instead of spelled out in operations every host agrees on.
@@ -421,6 +464,8 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
+    out.push(rdna_wave32());
+    out.push(u8::from(loop_limit_enabled()));
     out
 }
 
@@ -792,21 +837,40 @@ pub fn emit(
                 }
             }
         }
-    } else if matches!(&original, Ok((_, Some(64), true)))
+    } else if matches!(&original, Ok((_, Some(64), _)))
         && native.stage == HwStage::Cs
         && native.wave64
         && lower::host_rdna() != 0
         && lower::host_max_wave() != 32
+        && {
+            let has_anyhit = matches!(&original, Ok((_, _, true)));
+            let lds_safe = matches!(
+                native.io,
+                crate::native::StageIo::Cs(cs)
+                    if cs.lds_bytes() == 0 || cs.threads.iter().product::<u32>() <= 32
+            );
+            has_anyhit || (rdna_wave32() >= 2 && lds_safe)
+        }
     {
-        // RDNA 4 Wave64 shader with a lifted `AnyHit` loop: attempt ONLY the exact
-        // barrier-free `wave_local` idiom Wave32 lowering (never approximate, never
-        // `widen` barriers). On failure, fall through and keep Wave64 cleanly.
+        // RDNA 4 Wave64 compute shader (lifted `AnyHit` or opt-in `VICTORY_RDNA_WAVE32=2`):
+        // attempt ONLY the exact barrier-free `wave_local` idiom Wave32 lowering (never
+        // approximate, never `LOCAL_ANY`, never `widen`/`split_lds` barriers). On failure,
+        // fall through and keep Wave64 cleanly.
+        let has_anyhit = matches!(&original, Ok((_, _, true)));
+        let strict_firstlane = !has_anyhit;
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
         let done = |r: &Result<(HostShader, Option<u32>, bool), ShaderError>| {
             matches!(r, Ok((_, wave, _)) if *wave != Some(64))
         };
+        let check_local = |p: &ir::Program, st: &structure::Structured, res: &resource::Resources| {
+            if strict_firstlane {
+                lower::wave_local_strict(p, st, res).is_ok()
+            } else {
+                lower::wave_local(p, st).is_ok()
+            }
+        };
         if local_on && !exact_only {
-            if lower::wave_local(p, st).is_ok() {
+            if check_local(p, st, res) {
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 if done(&local) {
                     return local.map(|(shader, _, _)| shader);
@@ -828,6 +892,9 @@ pub fn emit(
                 let Ok(alt_res) = resource::track(&alt, &native.layout, native.stage, Some(&alt_st)) else {
                     continue;
                 };
+                if strict_firstlane && lower::wave_local_strict(&alt, &alt_st, &alt_res).is_err() {
+                    continue;
+                }
                 let local = lower::with_local_waves(|| {
                     emit_program(c, native, &alt, &alt_st, &alt_io, &alt_res)
                 });

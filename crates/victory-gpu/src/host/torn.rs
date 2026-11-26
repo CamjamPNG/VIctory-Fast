@@ -183,12 +183,19 @@ fn step(h: &mut [u32; 4], with: [u32; 4]) {
     *h = std::array::from_fn(|i| x[(i + 1) % 4] ^ (x[i] >> 15));
 }
 
-/// The 64 threads' hashes as one, folded to 31 bits.
+/// The 64 threads' hashes as one (matching `CARD_COMPARE`'s 6-step tree
+/// reduction), folded to 31 bits.
 fn finish(parts: &[[u32; 4]; 64]) -> u32 {
-    let mut h = parts[0];
-    for part in &parts[1..] {
-        step(&mut h, *part);
+    let mut parts = *parts;
+    let mut s = 32;
+    while s > 0 {
+        for t in 0..s {
+            let rhs = parts[t + s];
+            step(&mut parts[t], rhs);
+        }
+        s >>= 1;
     }
+    let h = parts[0];
     let f = h[0] ^ h[1].wrapping_mul(3) ^ h[2].wrapping_mul(5) ^ h[3].wrapping_mul(7);
     f & 0x7FFF_FFFF
 }

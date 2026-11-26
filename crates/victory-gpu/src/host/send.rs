@@ -193,19 +193,43 @@ const RUNS_AT_A_TIME: usize = 4096;
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
-    // Runs of whole words of the copy: only those are pairs. (A byte beside
-    // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    // Classify short (word-pair) vs long (copy) runs in a single pass per copy.
     let mut at = 0u64;
+    let mut total_bytes = 0u64;
+    let mut total_words = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
+    let mut short_ranges: Vec<Vec<(usize, usize)>> = Vec::with_capacity(dirty.len());
+    let mut short_chunk_words: Vec<Vec<usize>> = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let mut shorts = Vec::new();
+        let mut chunk_words = Vec::new();
+        let mut cur_chunk_words = 0usize;
+        let mut words = 0usize;
+        for &(a, b) in ranges {
+            let len = b - a;
+            if short(a, len) {
+                let w = len / 4;
+                words += w;
+                cur_chunk_words += w;
+                shorts.push((a, b));
+                if shorts.len() % RUNS_AT_A_TIME == 0 {
+                    chunk_words.push(cur_chunk_words);
+                    cur_chunk_words = 0;
+                }
+            } else {
+                runs.push((a, at, len));
+                total_bytes += len as u64;
+                at += (len as u64).next_multiple_of(16);
+            }
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+        if cur_chunk_words > 0 {
+            chunk_words.push(cur_chunk_words);
+        }
+        total_words += words as u64;
         copies.push(Copy { runs, pairs: (at, words as u32) });
+        short_ranges.push(shorts);
+        short_chunk_words.push(chunk_words);
         at += (words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
@@ -214,23 +238,20 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
+    for (((shadow, _), copy), (shorts, chunk_words)) in dirty.iter().zip(&copies).zip(short_ranges.iter().zip(&short_chunk_words)) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
         // (80,000 runs of some words a frame: in pieces of work.)
         let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
-            }
+        for (chunk, &words) in shorts.chunks(RUNS_AT_A_TIME).zip(chunk_words) {
+            work.push((from, chunk, to));
+            to += words * 8;
         }
     }
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
+        for &(a, b) in ranges {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
@@ -245,9 +266,9 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         }
     };
     crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[0].fetch_add(total_bytes, Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
-    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
+    STATS[2].fetch_add(total_words, Ordering::Relaxed);
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
@@ -255,8 +276,11 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
 
 impl Own {
     /// Records the sends into `list`; the copies that `looked` says are in
-    /// `COPY_DEST`, the others in the common state. Those with a "before" are
-    /// left readable by compute shaders.
+    /// `COPY_DEST`, the others in the common state. Copies for which
+    /// `needs_read` is true are left in `NON_PIXEL_SHADER_RESOURCE` for
+    /// immediate `CARD_COMPARE` re-hashing; all other touched copies are
+    /// transitioned back to `COMMON` so `sync` can run inside the submission's
+    /// single `ExecuteCommandLists`.
     ///
     /// # Safety
     /// An open list of ours, whose compute state is set anew behind this.
@@ -266,10 +290,12 @@ impl Own {
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
         looked: impl Fn(&Shadow) -> bool,
+        needs_read: impl Fn(&Shadow) -> bool,
     ) {
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+        let common = D3D12_RESOURCE_STATE_COMMON;
         let (mut first, mut last) = (Vec::new(), Vec::new());
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
@@ -283,12 +309,9 @@ impl Own {
                 }
                 state = Some(write);
             }
-            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            if let Some(was) = state
-                && hashed
-                && (!copy.runs.is_empty() || copy.pairs.1 > 0)
-            {
-                last.push(transition(&shadow.buffer, was, read));
+            if let Some(was) = state {
+                let target = if needs_read(shadow) { read } else { common };
+                last.push(transition(&shadow.buffer, was, target));
             }
         }
         // SAFETY: the caller's; live objects.

@@ -36,7 +36,7 @@ Measured on **AMD Ryzen 7 7800X3D · AMD Radeon RX 9070 XT (16 GB, RDNA 4) · 32
 | RT pass (`3592426e3e9142d8`) | `6.01 ms` | **`3.30 ms`** | **-45.1%** |
 | Resident VRAM / faults | ~12–16 GB | **`~10.2 GB` (`0` faults)** | **~2+ GB lower** |
 
-### Configuration FPS Summary (Measured & Estimated)
+### Configuration FPS Summary (Measured)
 
 | Configuration | Build | Median / Typical FPS | Peak FPS | Notes |
 |---|---|---:|---:|---|
@@ -45,7 +45,7 @@ Measured on **AMD Ryzen 7 7800X3D · AMD Radeon RX 9070 XT (16 GB, RDNA 4) · 32
 | **Series S — Software RT** | `--release` (measured, `d1686f1`, 165s) | **~11.7 fps** settled (`12.0 fps` overall med) | **18.8 fps** | `1.4 ms` med / `4.7 ms` settled GPU wait, `54.4 ms` prep, `11.3 GB` max VRAM (`128.6 ms` timed `diag`) |
 | **Series X (1440p) — Software RT** | `--release` (measured) | **~8.2 fps** | **19.9 fps** | Software BVH emulation (`175.8 ms` GPU in timed `diag`) |
 | **Series S — Native DXR 1.1 RT** | `--release` (measured, `c9de853`) | **~12.0–15.1 fps** settled (`12.1 fps` overall med) | **25.1 fps** | CPU `preparing` cut to **`32.5 ms`** (from `58–69 ms`), `0` faults (`12.1 fps` med / `25.1 fps` peak across 21 world samples; `0.0 ms` GPU wait when within local VRAM budget) |
-| **Series X (1440p) — Native DXR 1.1 RT** | `--release` (estimated) | **~11–20+ fps** (est.) | **~20+ fps** (est.) | Pending dedicated Series X `--release` Native RT benchmark pass |
+| **Series X (1440p) — Native DXR 1.1 RT** | `--release` (measured, `c9de853`, VRAM-fit) | **~7.1 fps** settled (`6.9 fps` overall med) | **14.7 fps** | `51.3 ms` prep, `61.3 ms` GPU wait, `24.4 ms` copyback, **`15.1 GB`** max VRAM, `0` faults (with `VICTORY_TEXTURE_BUDGET_MB=4096` / `VICTORY_CARD_BUFFERS_MAX_MB=1536` to stay inside 16 GB VRAM) |
 
 *Note: `diag` runs with `VICTORY_GPU_TIMING=1` and `VICTORY_D3D12_DRED=1` incur heavy instrumentation overhead (~3–6 fps) and are used strictly for apples-to-apples per-shader GPU timing. Use `--release` without timing/DRED flags for gameplay.*
 

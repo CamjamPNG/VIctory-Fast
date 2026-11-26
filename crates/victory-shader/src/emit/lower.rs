@@ -2469,9 +2469,13 @@ impl<'a> Lower<'a> {
                 None => f,
             });
         }
-        for fl in group_flags {
+        let group_flags: Vec<u32> = group_flags
+            .into_iter()
+            .map(|fl| fl.unwrap_or(0))
+            .collect();
+        for &fl in &group_flags {
             self.ray_queries
-                .push(self.s.allocate_ray_query(entry_dxil_blk, fl.unwrap_or(0)));
+                .push(self.s.allocate_ray_query(entry_dxil_blk, fl));
         }
         let mut pending_anyhits: HashMap<usize, super::rayquery_lift::PendingAnyHit> =
             HashMap::new();
@@ -2587,6 +2591,7 @@ impl<'a> Lower<'a> {
                     t_max,
                     instance_mask,
                     ray_flags,
+                    group_const_flags: group_flags[rl.rq_group],
                     init_min_front_t,
                     anyhit_inits,
                     anyhit_entry_dxil,

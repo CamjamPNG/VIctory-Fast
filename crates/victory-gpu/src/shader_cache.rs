@@ -76,6 +76,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_NATIVE_RT",
+            "VICTORY_NATIVE_RT_ANYHIT",
             "VICTORY_NATIVE_RT_FILTER",
         ] {
             bytes.extend_from_slice(name.as_bytes());

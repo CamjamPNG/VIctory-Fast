@@ -296,6 +296,8 @@ pub(crate) struct ResolvedRayInputs {
     pub instance_mask: Option<V>,
     /// Dynamic `ray_flags` `i32` (`None` when `rl.ray_flags` is `Const`).
     pub ray_flags: Option<V>,
+    /// Constant `constRayFlags` baked into `AllocateRayQuery` for this loop's `rq_group`.
+    pub group_const_flags: u32,
     /// Initial `minFrontFaceT` `i32` (`f32` bits) for [`RayLoopKind::FrontBackTrack`].
     pub init_min_front_t: Option<V>,
     /// Initial loop-carried user state values for [`RayLoopKind::AnyHit`].
@@ -684,6 +686,10 @@ impl<'a> Analyzer<'a> {
             }
         }
         lifted.sort_by_key(|rl| self.rpo[rl.entry_block]);
+        // Coalesce non-interfering `rq_group`s with identical constant ray flags onto a single
+        // `AllocateRayQuery` handle so multi-loop shaders (`020`/`018` with 6 disjoint loops)
+        // don't spill 6 concurrent traversal structs into VGPRs/scratch.
+        self.coalesce_ray_query_groups(&mut lifted);
         // Renumber `rq_group` densely `0..num_groups`.
         let mut group_remap: HashMap<usize, usize> = HashMap::new();
         for rl in &mut lifted {
@@ -691,6 +697,113 @@ impl<'a> Analyzer<'a> {
             rl.rq_group = *group_remap.entry(rl.rq_group).or_insert(next_id);
         }
         lifted
+    }
+
+    fn coalesce_ray_query_groups(&self, lifted: &mut [RayLoop]) {
+        if lifted.len() <= 1 {
+            return;
+        }
+        // Group loop indices by current `rq_group`, preserving RPO order.
+        let mut group_ids: Vec<usize> = Vec::new();
+        let mut group_loops: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, rl) in lifted.iter().enumerate() {
+            if !group_loops.contains_key(&rl.rq_group) {
+                group_ids.push(rl.rq_group);
+            }
+            group_loops.entry(rl.rq_group).or_default().push(i);
+        }
+        if group_ids.len() <= 1 {
+            return;
+        }
+
+        // Exact per-group constant flag mask and CFG live/body block sets.
+        struct GroupInfo {
+            id: usize,
+            const_flags: Option<u32>,
+            defs: HashSet<usize>,
+            live: HashSet<usize>,
+        }
+        let mut infos: Vec<GroupInfo> = Vec::with_capacity(group_ids.len());
+        for &gid in &group_ids {
+            let mut const_flags: Option<u32> = None;
+            let mut mixed_flags = false;
+            let mut defs: HashSet<usize> = HashSet::new();
+            let mut live: HashSet<usize> = HashSet::new();
+            let mut work: Vec<usize> = Vec::new();
+            for &idx in &group_loops[&gid] {
+                let rl = &lifted[idx];
+                match rl.ray_flags {
+                    RayInput::Const(f) => match const_flags {
+                        Some(prev) if prev != f => mixed_flags = true,
+                        None => const_flags = Some(f),
+                        _ => {}
+                    },
+                    _ => mixed_flags = true,
+                }
+                defs.insert(rl.entry_block);
+                live.insert(rl.entry_block);
+                live.extend(rl.skipped_blocks.iter().copied());
+                if let RayLoopKind::AnyHit(ah) = &rl.kind {
+                    live.extend(ah.body_blocks.iter().copied());
+                }
+                for &(site, _) in &rl.committed_meta_loads {
+                    if live.insert(site.0) {
+                        work.push(site.0);
+                    }
+                }
+            }
+            // Backward dataflow from post-loop committed metadata loads back to `defs`.
+            while let Some(b) = work.pop() {
+                for &pred in &self.p.blocks[b].preds {
+                    if defs.contains(&pred) {
+                        continue;
+                    }
+                    if live.insert(pred) {
+                        work.push(pred);
+                    }
+                }
+            }
+            infos.push(GroupInfo {
+                id: gid,
+                const_flags: if mixed_flags { None } else { const_flags },
+                defs,
+                live,
+            });
+        }
+
+        // Greedy interference-free merging of groups sharing the exact same constant `ray_flags`.
+        let mut merged: Vec<GroupInfo> = Vec::new();
+        let mut remap: HashMap<usize, usize> = HashMap::new();
+        for g in infos {
+            let mut target_idx: Option<usize> = None;
+            if let Some(cf) = g.const_flags {
+                for (mi, m) in merged.iter().enumerate() {
+                    if m.const_flags != Some(cf) {
+                        continue;
+                    }
+                    let clash = g.defs.iter().any(|b| m.live.contains(b))
+                        || m.defs.iter().any(|b| g.live.contains(b));
+                    if !clash {
+                        target_idx = Some(mi);
+                        break;
+                    }
+                }
+            }
+            if let Some(mi) = target_idx {
+                let target_id = merged[mi].id;
+                merged[mi].defs.extend(g.defs);
+                merged[mi].live.extend(g.live);
+                remap.insert(g.id, target_id);
+            } else {
+                remap.insert(g.id, g.id);
+                merged.push(g);
+            }
+        }
+        for rl in lifted.iter_mut() {
+            if let Some(&new_g) = remap.get(&rl.rq_group) {
+                rl.rq_group = new_g;
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -741,6 +854,16 @@ impl<'a> Analyzer<'a> {
         // 7. Extract `RayFlags` + `InstanceMask`.
         let ray_flags = self.extract_ray_flags(nodes, &tri_hit)?;
         let instance_mask = self.extract_instance_mask(template, nodes, entry_block)?;
+
+        // Closest-hit `AnyHit` loops (`accept_first_hit == false`) execute memory-heavy
+        // material/alpha-test callbacks inside `while (Proceed())`, which is slower on RDNA 4
+        // DXR than the GDK-compiled inline BVH loop; keep them on software BVH by default unless
+        // `VICTORY_NATIVE_RT_ANYHIT=1` is set.
+        if matches!(&tri_hit.mode, HitMode::AnyHit(ah) if !ah.accept_first_hit)
+            && !super::native_rt_anyhit()
+        {
+            return None;
+        }
 
         // For FrontBackTrack, `RAY_FLAG_FORCE_NON_OPAQUE` must be set.
         if matches!(tri_hit.mode, HitMode::FrontBackTrack { .. })
@@ -6827,7 +6950,7 @@ fn emit_trace_body(
     f32t: super::bitcode::Ty,
 ) -> (usize, Vec<(Value, V)>, Vec<(Value, V)>, Option<PendingAnyHit>) {
     let dyn_flags = match rl.ray_flags {
-        RayInput::Const(_) => s.m.i32(0),
+        RayInput::Const(f) => s.m.i32(f & !inputs.group_const_flags),
         RayInput::Val(_) => inputs.ray_flags.unwrap_or_else(|| s.m.i32(0)),
         RayInput::ShiftedMask(_) => s.m.i32(0),
     };
@@ -7510,6 +7633,10 @@ mod tests {
             t_max: ten_f,
             instance_mask: None,
             ray_flags: None,
+            group_const_flags: ray_flag::FORCE_OPAQUE
+                | ray_flag::ACCEPT_FIRST_HIT_AND_END_SEARCH
+                | ray_flag::CULL_BACK_FACING_TRIANGLES
+                | ray_flag::SKIP_PROCEDURAL_PRIMITIVES,
             init_min_front_t: None,
             anyhit_inits: vec![],
             anyhit_entry_dxil: None,
@@ -7593,6 +7720,7 @@ mod tests {
             t_max: ten_f,
             instance_mask: None,
             ray_flags: None,
+            group_const_flags: flags,
             init_min_front_t: Some(ten_f),
             anyhit_inits: vec![],
             anyhit_entry_dxil: None,
@@ -7702,6 +7830,7 @@ mod tests {
             t_max: ten_f,
             instance_mask: None,
             ray_flags: None,
+            group_const_flags: flags,
             init_min_front_t: None,
             anyhit_inits: vec![zero],
             anyhit_entry_dxil: Some(anyhit_body),

@@ -751,6 +751,8 @@ fn gpu_rayquery_opaque_hit_and_miss() {
         assert_eq!(hit[6], 0, "{label}: CommittedGeometryIndex");
         assert_eq!(hit[7], 0, "{label}: CommittedPrimitiveIndex");
         assert_eq!(hit[8], 7, "{label}: CommittedInstanceContributionToHitGroupIndex");
+        // Triangle [(0,0,0),(4,0,0),(0,4,0)] viewed from -Z toward +Z is CCW (back-facing in LH DXR).
+        assert_eq!(hit[9], 0, "{label}: CommittedTriangleFrontFace");
         for (k, &want) in transform.iter().enumerate() {
             let got = f32::from_bits(hit[10 + k]);
             assert!(

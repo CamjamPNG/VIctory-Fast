@@ -686,8 +686,8 @@ fn lock_state() -> std::sync::MutexGuard<'static, Option<DxrState>> {
     guard
 }
 
-/// Diagnostic counters: `[dynamic_blas, static_blas, upgraded_static, tlas, copies, skipped, tlas_srvs]`.
-static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// Diagnostic counters: `[dynamic_blas, static_blas, upgraded_static, tlas, copies, skipped, tlas_srvs, upg_geoms, upg_non_opaque]`.
+static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 const STAT_DYNAMIC_BLAS: usize = 0;
 const STAT_STATIC_BLAS: usize = 1;
 const STAT_UPGRADED_STATIC: usize = 2;
@@ -695,14 +695,16 @@ const STAT_TLAS: usize = 3;
 const STAT_COPIES: usize = 4;
 const STAT_SKIPPED: usize = 5;
 const STAT_TLAS_SRVS: usize = 6;
+const STAT_UPG_GEOMS: usize = 7;
+const STAT_UPG_NON_OPAQUE: usize = 8;
 
 /// Logs native DXR statistics periodically alongside the host frame-rate line.
 pub(crate) fn log_stats(frames: f64) {
     if !enabled() || frames <= 0.0 {
         return;
     }
-    let [dyn_blas, stat_blas, upgraded, tlas, copies, skipped, srvs] =
-        [0, 1, 2, 3, 4, 5, 6].map(|i| STATS[i].swap(0, Ordering::Relaxed));
+    let [dyn_blas, stat_blas, upgraded, tlas, copies, skipped, srvs, upg_geoms, upg_non_opaque] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|i| STATS[i].swap(0, Ordering::Relaxed));
     let total_as = as_map().read().unwrap_or_else(|e| e.into_inner()).len();
     let (patched, missing, nulls) = {
         let guard = DXR_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -725,7 +727,7 @@ pub(crate) fn log_stats(frames: f64) {
     };
     tracing::info!(
         "native DXR per frame: dyn_blas={:.1} static_blas={:.1} upgraded_static={:.1} tlas={:.1} copies={:.1} skipped={:.1} tlas_srvs={:.1} \
-         (instances patched={:.0} missing_blas={:.0} null_blas={:.0}; resident_as={total_as})",
+         (instances patched={:.0} missing_blas={:.0} null_blas={:.0}; resident_as={total_as}; upg_geoms={upg_geoms} non_opaque={upg_non_opaque})",
         dyn_blas as f64 / frames,
         stat_blas as f64 / frames,
         upgraded as f64 / frames,
@@ -1943,6 +1945,14 @@ fn record_static_upgrades(
     for (guest_key, host_va) in &built_entries {
         state.insert_blas_hash(*guest_key, *host_va);
     }
+    let upg_geoms: u64 = prepared.iter().map(|p| p.host_geoms.len() as u64).sum();
+    let upg_non_opaque: u64 = prepared
+        .iter()
+        .flat_map(|p| p.host_geoms.iter())
+        .filter(|g| g.Flags == D3D12_RAYTRACING_GEOMETRY_FLAG_NONE)
+        .count() as u64;
+    STATS[STAT_UPG_GEOMS].fetch_add(upg_geoms, Ordering::Relaxed);
+    STATS[STAT_UPG_NON_OPAQUE].fetch_add(upg_non_opaque, Ordering::Relaxed);
     STATS[STAT_UPGRADED_STATIC].fetch_add(built_entries.len() as u64, Ordering::Relaxed);
     let out: ID3D12CommandList = list.cast().ok()?;
     sub.lists.push((allocator, list));
@@ -2790,11 +2800,15 @@ unsafe fn record_build_tlas(
         effective_instances = 0;
     }
 
-    // Always rebuild TLAS from scratch: D3D12 forbids TLAS `PERFORM_UPDATE` whenever
-    // any instance transitions `AccelerationStructure` or `InstanceMask` between 0 and
-    // non-0 (e.g. streamed/upgraded static BLASes), and full TLAS rebuild takes <50 us.
+    // Always rebuild TLAS from scratch with PREFER_FAST_TRACE: D3D12 forbids TLAS
+    // `PERFORM_UPDATE` whenever any instance transitions `AccelerationStructure` or
+    // `InstanceMask` between 0 and non-0, and a 3.5K-instance fast-trace TLAS build
+    // takes <0.1 ms while reducing overlapping AABB candidate callbacks in AnyHit loops.
+    const ALLOW_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE.0 as u32;
     const PERFORM_UPDATE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE.0 as u32;
-    let flags = raw_flags & !PERFORM_UPDATE;
+    const PREFER_FAST_BUILD: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD.0 as u32;
+    const PREFER_FAST_TRACE: u32 = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE.0 as u32;
+    let flags = (raw_flags & !(ALLOW_UPDATE | PERFORM_UPDATE | PREFER_FAST_BUILD)) | PREFER_FAST_TRACE;
     let host_src_va = 0u64;
 
     let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {

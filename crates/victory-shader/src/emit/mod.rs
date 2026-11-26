@@ -218,6 +218,21 @@ pub fn native_rt() -> bool {
     })
 }
 
+/// Whether closest-hit (`accept_first_hit == false`) `AnyHit` traversal loops
+/// also lift to SM 6.6 `RayQuery::Proceed()` (`VICTORY_NATIVE_RT_ANYHIT=1`,
+/// off by default; `OpaqueOnly`, `FrontBackTrack`, and `accept_first_hit`
+/// `AnyHit` loops always lift under `VICTORY_NATIVE_RT=1`).
+pub fn native_rt_anyhit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_NATIVE_RT_ANYHIT")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            == Some("1")
+    })
+}
+
 /// Whether a shader identified by `hash_hex` is selected by
 /// `VICTORY_NATIVE_RT_FILTER`: when unset or empty, matches every shader;
 /// otherwise matches comma-separated substrings case-insensitively.

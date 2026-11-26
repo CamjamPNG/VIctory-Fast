@@ -157,12 +157,12 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(82) {
+    if used < share(88) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(90) {
-        (IDLE_MS, used - share(76))
+    } else if used < share(92) {
+        (IDLE_MS, used - share(85))
     } else {
-        (SHORT_MS, used - share(76))
+        (SHORT_MS, used - share(85))
     }
 }
 

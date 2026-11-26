@@ -81,6 +81,17 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    static SKIP_RAYMARCHED_LOCAL_LIGHTS: OnceLock<bool> = OnceLock::new();
+    let skip_raymarched = *SKIP_RAYMARCHED_LOCAL_LIGHTS.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        if builder {
+            return std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_some_and(|v| v == "0");
+        }
+        std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_none_or(|v| v == "0")
+    });
+    if skip_raymarched && named(shaders, b"CS_GatherRaymarchedLocalLightsClassified") {
+        return Some("raymarched local lights compute pass in RT-off mode, left out");
+    }
     None
 }
 

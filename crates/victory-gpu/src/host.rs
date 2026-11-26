@@ -2264,6 +2264,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Host buffer copies kept alive through execution (for resource-scoped
+    /// buffer barriers, including any backing placed heap or card twin).
+    kept_shadows: Vec<std::sync::Arc<crate::shadow::Shadow>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -6908,6 +6911,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.kept_shadows.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
@@ -7364,6 +7368,21 @@ impl HostList {
     pub(crate) fn keep(&self, object: &impl Interface) {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
+        }
+    }
+
+    /// Keeps a host buffer copy (including any backing placed heap or card twin)
+    /// alive until the list is reset.
+    pub(crate) fn keep_shadow(&self, shadow: std::sync::Arc<crate::shadow::Shadow>) {
+        let mut deferred = self.deferred();
+        if !deferred
+            .kept_shadows
+            .iter()
+            .rev()
+            .take(16)
+            .any(|s| std::sync::Arc::ptr_eq(s, &shadow))
+        {
+            deferred.kept_shadows.push(shadow);
         }
     }
 

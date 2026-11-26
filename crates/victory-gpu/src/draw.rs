@@ -442,6 +442,10 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// A direct dispatch spread across z, for [`State::host_word`] at its
+    /// bind: `[row, asked x]` (`[0, 0]`: not spread; an indirect one gets
+    /// its words from the clamp through its command signature).
+    dispatch_spread: [u32; 2],
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -1337,7 +1341,13 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS,
+            USER_VIEW_BIAS,
+        };
+        if kind == USER_DISPATCH_SPREAD {
+            return self.dispatch_spread[usize::from(dword != 0)];
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
         }
@@ -1651,7 +1661,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, compute, &spans, &mut staged);
+            let made = self.tables(list, &t.tables, &t.host.half_views, compute, &spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -3134,7 +3144,27 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        // Counted in threads: whole groups of them, and the program is told
+        // how many of the last one run, where it asks (its `bind` set that to
+        // all of them).
+        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
+            .then(|| p.stages.first().and_then(|s| s.translated().threads))
+            .flatten();
+        let threads = [x, y, z];
+        let [gx_req, gy_req, gz_req] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // More than 65,535 groups in x: spread across z for a program that
+        // takes the spread words (`USER_DISPATCH_SPREAD`).
+        let (row, asked, gx, gy, gz) =
+            victory_shader::emit::spread_groups(gx_req, gy_req, gz_req, spreads(p).is_some());
+        if row != 0 {
+            SPREAD[0].fetch_add(1, Ordering::Relaxed);
+        } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
+            once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
+        }
+        self.dispatch_spread = [row, asked];
+        let bound = self.bind(list, p, true);
+        self.dispatch_spread = [0, 0];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -3150,14 +3180,6 @@ impl State {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
         }
-        // Counted in threads: whole groups of them, and the program is told
-        // how many of the last one run, where it asks (its `bind` set that to
-        // all of them).
-        let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
-            .then(|| p.stages.first().and_then(|s| s.translated().threads))
-            .flatten();
-        let threads = [x, y, z];
-        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
         if size.is_some() {
             if !crate::pipeline::is_builder(self.pipeline as This) {
                 once!(pipeline = p.name, "a dispatch counted in threads that is not the structure builder's");
@@ -3168,7 +3190,7 @@ impl State {
             }
         }
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(gx, gy, gz) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3639,16 +3661,53 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         plan: &TablePlan,
+        half: &[(u8, u32)],
         compute: bool,
         spans: &[(u8, u32, u32)],
         staged: &mut Vec<(u64, u32)>,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         for group in &plan.groups {
             let slot = group.slot;
             let needs_snapshot = group.has_cbv
@@ -3702,6 +3761,18 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            let mut half_slots: Vec<u32> = half
+                .iter()
+                .filter(|&&(s, _)| s == slot)
+                .map(|&(_, at)| at / 8)
+                .collect();
+            half_slots.sort_unstable();
+            half_slots.dedup();
+            selected.extend(half_slots.iter().copied());
             selected.sort_unstable();
             selected.dedup();
             let n = (group.max_dword / 8).max(selected.last().copied().unwrap_or(0)) + 1;
@@ -3726,8 +3797,9 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
-            let key = table_hash(table, n);
+            // The table and what its entries hold (record words), plus which
+            // slots are shown as unsigned 16-bit twins (`half_slots`).
+            let key = table_hash(table, n, &half_slots);
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             let same = {
@@ -3735,6 +3807,7 @@ impl State {
                 self.fresh_tables.get_mut(&key).filter(|f| {
                     f.table == table
                         && f.n == n
+                        && f.half == half_slots
                         && fresh_records[f.at..f.at + n as usize]
                             .iter()
                             .enumerate()
@@ -3825,11 +3898,12 @@ impl State {
             };
             let at = self.fresh_records.len();
             self.fresh_records.extend((0..n).map(|k| record(table, k)));
+            let staged_ok = !spans.is_empty() && half_slots.is_empty();
             self.fresh_tables.insert(
                 key,
-                FreshTable { table, n, at, first, epoch: 0, ready: Vec::new() },
+                FreshTable { table, n, at, first, half: half_slots, epoch: 0, ready: Vec::new() },
             );
-            if !spans.is_empty() {
+            if staged_ok {
                 staged.push((table, n));
             }
             self.dynamic
@@ -3855,9 +3929,12 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
+                let shown = halved(self, slot, k * 8);
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
+                // (Skipped when shown as an unsigned 16-bit twin.)
                 if list_views
+                    && shown.is_none()
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
@@ -3910,7 +3987,10 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match shown {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -4302,10 +4382,19 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        // A dispatch of a program that takes the spread words: the clamp
+        // writes [row, asked x, x, y, z] records, run through a signature
+        // that sets the two words, then dispatches.
+        let spread = (kind == DISPATCH && p.compute)
+            .then(|| spreads(p))
             .flatten()
-        else {
+            .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
+        let is_spread = spread.is_some();
+        let Some(signature) = spread.or_else(|| {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        }) else {
             why("no host signature");
             return false;
         };
@@ -4314,7 +4403,9 @@ impl State {
             return false;
         }
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        // Spread dispatches use 20-byte [row, asked x, x, y, z] records and
+        // bypass the unspread 12-byte batch path.
+        let batch = if batches() > 0 && max == 1 && count.is_none() && !is_spread {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -4383,7 +4474,9 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    // (A spread dispatch is never windowed: `windowed` is
+                    // false for dispatches.)
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -4448,6 +4541,9 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if is_spread {
+                SPREAD[1].fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4492,6 +4588,112 @@ mod thread_tests {
         assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
         assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
     }
+}
+
+/// Dispatches spread across z since the frame line last took them: direct,
+/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
+pub(crate) static SPREAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The user-data root parameter of compute pipeline `p` whose program takes
+/// the spread words, and the index of the first in it (the second follows:
+/// one root-constant argument sets both); `None` for any other pipeline.
+fn spreads(p: &HostPipeline) -> Option<(u32, u32)> {
+    if !spread_on() {
+        return None;
+    }
+    let stage = p.stages.first()?;
+    let (param, _) = stage.user_data?;
+    let kind = RootType::Other(victory_shader::emit::USER_DISPATCH_SPREAD);
+    let words = &stage.translated().host.user_data;
+    let first = words.iter().find(|u| u.root == kind && u.dword == 0)?.index;
+    words
+        .iter()
+        .any(|u| u.root == kind && u.dword == 1 && u.index == first + 1)
+        .then_some((param, first))
+}
+
+/// Whether dispatches past 65,535 groups in x are spread across z
+/// (`VICTORY_DISPATCH_SPREAD`: on by default; `0` off, clamped to 65,535;
+/// `alt`: twenty seconds with, twenty without, in turn, each change logged).
+/// Off, a translated program's words stay 0: it runs as dispatched.
+fn spread_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_DISPATCH_SPREAD").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "dispatches past 65,535 groups are spread across z from now (VICTORY_DISPATCH_SPREAD=alt): {}",
+                    if on { "ON" } else { "off, clamped to 65,535 as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The command signature of a spread dispatch: two root constants (row,
+/// asked x) at `index` of root parameter `param`, then the dispatch; 20
+/// bytes a record (the clamp's spread layout). Made once per root
+/// signature, parameter and index. (After upstream VIctory pull request
+/// #2312.)
+fn host_spread_signature(
+    root: &ID3D12RootSignature,
+    param: u32,
+    index: u32,
+) -> Option<ID3D12CommandSignature> {
+    type Key = (usize, u32, u32);
+    static MADE: std::sync::Mutex<Vec<(Key, ID3D12CommandSignature)>> = std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: index,
+                    Num32BitValuesToSet: 2,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 20,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: two valid argument descriptions and a live root signature.
+    let result = unsafe {
+        crate::host::host()?
+            .device
+            .CreateCommandSignature(&desc, Some(root), &mut signature)
+    };
+    if let Err(e) = result {
+        once!(error = %e, param, index, "spread command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
+    Some(signature)
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -4620,6 +4822,10 @@ struct FreshTable {
     n: u32,
     at: usize,
     first: u32,
+    /// Descriptor indices within the table shown as unsigned 16-bit twins
+    /// (`HostShader::half_views`), so shaders with different half-view sets do
+    /// not share dynamic slots.
+    half: Vec<u32>,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that
     /// these readers (a stage's list of what it reads, whether it stores, the
     /// tested depth target) read were brought up to date, and whether that read the
@@ -4649,12 +4855,15 @@ impl std::hash::Hasher for Plain {
 /// A quick hash of `table` and its `n` records. It only finds the table
 /// made before: the records are compared too, so a collision costs a copy,
 /// not wrong descriptors.
-fn table_hash(table: u64, n: u32) -> u64 {
+fn table_hash(table: u64, n: u32, half_slots: &[u32]) -> u64 {
     let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
     let h = (0..n).fold(table, |h, k| {
         let [a, b, c] = record(table, k);
         mix(mix(h, u64::from(a) | u64::from(b) << 32), u64::from(c))
     });
+    let h = half_slots
+        .iter()
+        .fold(mix(h, half_slots.len() as u64), |h, &k| mix(h, u64::from(k)));
     h ^ h >> 32
 }
 
@@ -5053,13 +5262,14 @@ mod record_hash_tests {
         slots[1][..3].copy_from_slice(&[4, 5, 6]);
         let ptr = slots.as_mut_ptr();
         let table = ptr as u64;
-        let key = table_hash(table, 2);
+        let key = table_hash(table, 2, &[]);
+        assert_ne!(table_hash(table, 2, &[1]), key);
         let mut state = State::default();
         let at = state.fresh_records.len();
         state.fresh_records.extend((0..2).map(|k| record(table, k)));
         state.fresh_tables.insert(
             key,
-            FreshTable { table, n: 2, at, first: 42, epoch: 0, ready: Vec::new() },
+            FreshTable { table, n: 2, at, first: 42, half: Vec::new(), epoch: 0, ready: Vec::new() },
         );
         let matches = |state: &State, key: u64, table: u64, n: u32| {
             state.fresh_tables.get(&key).is_some_and(|f| {
@@ -5076,6 +5286,6 @@ mod record_hash_tests {
         // SAFETY: `ptr` points to the live two-slot array on the stack.
         unsafe { (*ptr.add(1))[2] = 99 };
         assert!(!matches(&state, key, table, 2));
-        assert_ne!(table_hash(table, 2), key);
+        assert_ne!(table_hash(table, 2, &[]), key);
     }
 }

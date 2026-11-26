@@ -775,6 +775,21 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Whether guest buffer barriers emit resource-scoped UAV barriers targeting
+/// each buffer's host `Shadow` resource when unambiguous, instead of a global
+/// `pResource = null` UAV barrier (`VICTORY_SCOPED_UAV_BARRIERS=1`; off by default).
+#[cfg(windows)]
+fn scoped_uav_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SCOPED_UAV_BARRIERS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("resource-scoped buffer UAV barriers enabled (VICTORY_SCOPED_UAV_BARRIERS=1)");
+        }
+        on
+    })
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -790,11 +805,60 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             .iter()
             .filter_map(|b| host_barrier(list, b))
             .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
+        if scoped_uav_barriers() {
+            let has_global_uav = host.iter().any(|b| b.kind == 2 && b.first.is_null());
+            if !has_global_uav {
+                let mut scoped: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+                let mut any_buffer = false;
+                let mut all_resolved = true;
+                for b in barriers {
+                    if b.kind == 1 || b.first.is_null() {
+                        continue;
+                    }
+                    let Some((ptr, len)) = crate::resource::buffer_bytes(b.first) else {
+                        continue;
+                    };
+                    any_buffer = true;
+                    if let Some(shadow) = crate::shadow::scoped_barrier_shadow(ptr as u64, len) {
+                        let raw = windows::core::Interface::as_raw(&shadow.buffer);
+                        if !scoped
+                            .iter()
+                            .any(|s| windows::core::Interface::as_raw(&s.buffer) == raw)
+                        {
+                            scoped.push(shadow);
+                        }
+                    } else {
+                        all_resolved = false;
+                        break;
+                    }
+                }
+                if any_buffer {
+                    if all_resolved && !scoped.is_empty() {
+                        for shadow in scoped {
+                            let raw = windows::core::Interface::as_raw(&shadow.buffer)
+                                .cast_const()
+                                .cast();
+                            list.keep_shadow(shadow);
+                            host.push(Barrier {
+                                kind: 2,
+                                flags: 0,
+                                first: raw,
+                                second: 0,
+                                last: 0,
+                            });
+                        }
+                    } else {
+                        host.push(UAV_BARRIER);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+                    }
+                }
+            }
+        } else if barriers.iter().any(|b| {
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
+            // Buffers have host copies, not resources the barrier can name:
+            // a barrier on one waits for every shader write before it.
             host.push(UAV_BARRIER);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);

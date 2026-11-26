@@ -53,8 +53,9 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   yet; with [`MEMORY_READ_ONLY`]: stores there are dropped) and the page's
 ///   byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
-///   reads zeros and drops writes;
+///   dword 0 of kind [`USER_MEMORY_BASE`]. Dword 1 is the last copy number
+///   prepared for the recorded bind; later numbers and slot `base` itself
+///   read zeros and drop writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
 ///   host reads afterwards to make those copies for the frames to come.
@@ -99,6 +100,14 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes, for a
+/// compute program that reads its group id x: dword 0 the groups per row of
+/// a dispatch spread across z (0: not spread), dword 1 the x group count
+/// the title asked for. A dispatch of more than 65,535 groups in x (the
+/// most Direct3D 12 runs) runs as `(row, y, rows)`; the program takes group
+/// `(x + z * row, y, 0)` and leaves at once past the asked count. (After
+/// upstream VIctory pull request #2312, Xvania7.)
+pub const USER_DISPATCH_SPREAD: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

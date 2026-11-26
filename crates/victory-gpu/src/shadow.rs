@@ -207,10 +207,57 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// Optional explicit VRAM headroom override (`VICTORY_CARD_BUFFERS_VRAM_HEADROOM_MB`),
+/// in MiB (`Some(0)` disables the headroom cap and uses only the percentage cap).
+fn card_vram_headroom_override_mb() -> Option<u64> {
+    static OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("VICTORY_CARD_BUFFERS_VRAM_HEADROOM_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// Minimum local VRAM headroom (in bytes) kept below `DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`
+/// before new card buffers stay in shared memory.
+///
+/// - Explicit `VICTORY_CARD_BUFFERS_VRAM_HEADROOM_MB` always wins (`0` disables).
+/// - Otherwise defaults to 1,024 MiB on `> 12 GiB` budgets (e.g. ~13.3 GiB ceiling on a
+///   14.3 GiB 16 GB budget) and for small buffers admitted below the adapter's default
+///   minimum size (e.g. `VICTORY_CARD_BUFFERS_MIN_KB=64`), preserving the existing
+///   percentage ceiling for default large buffers on `<= 12 GiB` cards.
+fn resolve_card_vram_headroom(
+    budget: u64,
+    size: u64,
+    default_min_bytes: u64,
+    explicit_headroom_mb: Option<u64>,
+) -> u64 {
+    const MIB: u64 = 1 << 20;
+    const TWELVE_GIB: u64 = 12 << 30;
+    const DEFAULT_HEADROOM_MIB: u64 = 1024;
+    if let Some(mb) = explicit_headroom_mb {
+        return mb.saturating_mul(MIB);
+    }
+    if budget > TWELVE_GIB || size < default_min_bytes {
+        DEFAULT_HEADROOM_MIB * MIB
+    } else {
+        0
+    }
+}
+
+/// Maximum local VRAM usage (in bytes) at which a new card buffer may be allocated:
+/// the tighter of `budget * hundredths / 100` and `budget - headroom_bytes`.
+fn resolve_card_vram_ceiling(budget: u64, hundredths: u64, headroom_bytes: u64) -> u64 {
+    let pct_cap = (budget / 100).saturating_mul(hundredths);
+    let headroom_cap = budget.saturating_sub(headroom_bytes);
+    pct_cap.min(headroom_cap)
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` / `VICTORY_CARD_BUFFERS_MIN_KB` and
+/// `VICTORY_CARD_BUFFERS_MAX_MB` (or `VICTORY_CARD_BUFFERS_MB`).
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
@@ -219,10 +266,11 @@ fn card_limits() -> (u64, u64) {
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let max_override = env_mb("VICTORY_CARD_BUFFERS_MAX_MB").or_else(|| env_mb("VICTORY_CARD_BUFFERS_MB"));
         let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            max_override,
         );
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
@@ -237,10 +285,15 @@ fn card_limits() -> (u64, u64) {
         if card_all() {
             min_bytes = 0;
         }
+        let headroom_mb = vram_budget.map(|b| {
+            let default_min = default_card_limits_mb(Some(b)).0 << 20;
+            resolve_card_vram_headroom(b, min_bytes, default_min, card_vram_headroom_override_mb()) >> 20
+        });
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
+            card_buffers_vram_headroom_mb = headroom_mb,
             "card buffer limits"
         );
         (min_bytes, max_bytes)
@@ -397,22 +450,48 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
     let hundredths = if card_room_kept_on() { 97 } else { 80 };
-    if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
-    {
-        // Said, with the numbers it was decided by: run 193 made 31 copies
-        // of 95 and no line named the others. The first 64, then every
-        // 32nd.
+    if let Some([budget, used, ..]) = host.video_memory() {
+        let default_min_bytes = default_card_limits_mb(Some(budget)).0 << 20;
+        let headroom = resolve_card_vram_headroom(
+            budget,
+            size,
+            default_min_bytes,
+            card_vram_headroom_override_mb(),
+        );
+        let ceiling = resolve_card_vram_ceiling(budget, hundredths, headroom);
+        if used.saturating_add(size) > ceiling {
+            // Said, with the numbers it was decided by: run 193 made 31 copies
+            // of 95 and no line named the others. The first 64, then every
+            // 32nd.
+            let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+            if n <= 64 || n.is_multiple_of(32) {
+                tracing::info!(
+                    "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
+                     {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
+                    size >> 10,
+                    used >> 20,
+                    budget >> 20,
+                    ceiling >> 20,
+                    CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                    most >> 20,
+                    n,
+                    bytes >> 20,
+                    crate::frame::current()
+                );
+            }
+            return None;
+        }
+    }
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed).saturating_add(size) > most {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
         if n <= 64 || n.is_multiple_of(32) {
             tracing::info!(
-                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
-                 {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
+                "no card copy for a title buffer of {} KiB: card-buffer cap reached ({} MB of at most {} MB); \
+                 {} buffers turned down so far ({} MB), frame {}",
                 size >> 10,
-                used >> 20,
-                budget >> 20,
-                (budget / 100 * hundredths) >> 20,
                 CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
                 most >> 20,
                 n,
@@ -420,10 +499,6 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
                 crate::frame::current()
             );
         }
-        return None;
-    }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
-        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -4930,6 +5005,66 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
+/// Resolves a guest buffer `[address, address + len)` to its single unambiguous
+/// live host [`Shadow`] for a resource-scoped UAV barrier.
+///
+/// Returns `None` if no live `Shadow` covers the full range, or if any aliased
+/// buffer, exact-view copy, or loose window overlaps `[address, address + len)`.
+pub(crate) fn scoped_barrier_shadow(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address == 0 || len == 0 {
+        return None;
+    }
+    let end = address.checked_add(len)?;
+    let chosen = {
+        let map = buffers_read();
+        let mut found: Option<Arc<Shadow>> = None;
+        for (_, entry) in map.range(..=(address, usize::MAX)).rev().take(64) {
+            if entry.end <= address {
+                continue;
+            }
+            let Some(shadow) = &entry.shadow else {
+                continue;
+            };
+            if found.is_none() && entry.end >= end && shadow.left(address) >= len {
+                found = Some(shadow.clone());
+            } else if found.as_ref().is_none_or(|f| !Arc::ptr_eq(f, shadow)) {
+                return None;
+            }
+        }
+        let chosen = found?;
+        for (_, entry) in map.range((address.saturating_add(1), 0)..(end, 0)) {
+            if let Some(shadow) = &entry.shadow
+                && !Arc::ptr_eq(&chosen, shadow)
+            {
+                return None;
+            }
+        }
+        chosen
+    };
+    {
+        let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        if !exact.1.is_empty() {
+            const EXACT_MOST: u64 = 64 << 20;
+            for (&(ex_start, ex_len), _) in exact.1.range((address.saturating_sub(EXACT_MOST), 0)..(end, 0)) {
+                if ex_start.saturating_add(ex_len) > address {
+                    return None;
+                }
+            }
+        }
+    }
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if !loose.is_empty() {
+            for (&(w_start, w_len), _) in loose.range((address.saturating_sub(WINDOW), 0)..(end, 0)) {
+                if w_start.saturating_add(w_len) > address {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(chosen)
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
@@ -5426,8 +5561,62 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        resolve_card_vram_ceiling, resolve_card_vram_headroom, tail_of, window_of,
     };
+
+    #[test]
+    fn card_vram_headroom_caps_small_and_16gb_buffers_below_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        const KIB: u64 = 1 << 10;
+
+        // 16 GB card (~14.3 GiB DXGI budget): default 1,024 MiB headroom keeps ceiling at ~13.3 GiB.
+        let budget_16g = 14_643 * MIB;
+        let default_min_16g = default_card_limits_mb(Some(budget_16g)).0 * MIB;
+        let headroom_small = resolve_card_vram_headroom(budget_16g, 64 * KIB, default_min_16g, None);
+        let headroom_large = resolve_card_vram_headroom(budget_16g, 16 * MIB, default_min_16g, None);
+        assert_eq!(headroom_small, 1024 * MIB);
+        assert_eq!(headroom_large, 1024 * MIB);
+        assert_eq!(
+            resolve_card_vram_ceiling(budget_16g, 97, headroom_small),
+            budget_16g - 1024 * MIB
+        );
+
+        // 12 GB card (10 GiB budget): small buffers (< 16 MiB default min) get 1,024 MiB headroom;
+        // default large buffers preserve the 97% percentage cap.
+        let budget_12g = 10 * GIB;
+        let default_min_12g = default_card_limits_mb(Some(budget_12g)).0 * MIB;
+        assert_eq!(
+            resolve_card_vram_headroom(budget_12g, 64 * KIB, default_min_12g, None),
+            1024 * MIB
+        );
+        assert_eq!(
+            resolve_card_vram_headroom(budget_12g, 16 * MIB, default_min_12g, None),
+            0
+        );
+        assert_eq!(
+            resolve_card_vram_ceiling(budget_12g, 97, 0),
+            (budget_12g / 100) * 97
+        );
+
+        // Explicit headroom override always wins (0 disables; large values saturate to 0 ceiling).
+        assert_eq!(
+            resolve_card_vram_headroom(budget_16g, 64 * KIB, default_min_16g, Some(0)),
+            0
+        );
+        assert_eq!(
+            resolve_card_vram_ceiling(budget_16g, 97, 0),
+            (budget_16g / 100) * 97
+        );
+        assert_eq!(
+            resolve_card_vram_headroom(budget_12g, 16 * MIB, default_min_12g, Some(2048)),
+            2048 * MIB
+        );
+        assert_eq!(
+            resolve_card_vram_ceiling(budget_12g, 97, u64::MAX),
+            0
+        );
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {

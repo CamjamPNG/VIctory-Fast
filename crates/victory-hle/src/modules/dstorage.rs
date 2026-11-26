@@ -564,6 +564,11 @@ struct Lanes {
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
     since: Option<std::time::Instant>,
+    /// Since the last 5 s line: the slowest request run (ms, destination
+    /// bytes, options), and requests over 250 ms and over 1 s, plain and
+    /// BCPack apart.
+    slowest: (u64, u32, u64),
+    slow: [u64; 4],
 }
 
 /// A queue's requests in the scheduler.
@@ -622,6 +627,8 @@ fn scheduler() -> Option<&'static Scheduler> {
                     refused: 0,
                     bcpack: Default::default(),
                     since: None,
+                    slowest: (0, 0, 0),
+                    slow: [0; 4],
                 }),
                 work: Condvar::new(),
                 finished: Condvar::new(),
@@ -812,6 +819,17 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        let ms = started.elapsed().as_millis() as u64;
+        let bc = job.request.options & BCPACK != 0;
+        if ms > self.slowest.0 {
+            self.slowest = (ms, job.request.destination_size, job.request.options);
+        }
+        if ms >= 250 {
+            self.slow[usize::from(bc) * 2] += 1;
+        }
+        if ms >= 1000 {
+            self.slow[usize::from(bc) * 2 + 1] += 1;
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -828,6 +846,18 @@ impl Lanes {
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
+            );
+            let (ms, bytes, options) = std::mem::take(&mut self.slowest);
+            let slow = std::mem::take(&mut self.slow);
+            tracing::info!(
+                "dstorage, slowest request in the last {:.1} s: {ms} ms for {:.1} MB (options {options:#x}{}); requests over 250 ms: {} plain, {} BCPack; over 1 s: {} plain, {} BCPack (a status behind such a request on its queue waits that long)",
+                elapsed.as_secs_f64(),
+                f64::from(bytes) / 1e6,
+                if options & BCPACK != 0 { ", BCPack" } else { "" },
+                slow[0],
+                slow[2],
+                slow[1],
+                slow[3],
             );
             self.done = Default::default();
             self.bcpack = Default::default();
@@ -2219,6 +2249,8 @@ mod tests {
             refused: 0,
             bcpack: Default::default(),
             since: None,
+            slowest: (0, 0, 0),
+            slow: [0; 4],
         }
     }
 

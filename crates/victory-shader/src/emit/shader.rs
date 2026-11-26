@@ -108,6 +108,14 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// `(x + z * row, y, 0)` and leaves at once past the asked count. (After
 /// upstream VIctory pull request #2312, Xvania7.)
 pub const USER_DISPATCH_SPREAD: u32 = 0x107;
+/// `RootType::Other` code of a user-data dword the host computes, for a
+/// compute program with a spilled user-data table (the ray-tracing
+/// structure builder's stages): dword `n` is the thread count along axis `n`
+/// of a `DispatchX` with `USE_THREAD_DIMENSIONS` (flags bit 5, 0x20) when
+/// it is not a whole number of groups, else 0 (every thread runs). The
+/// threads at or past the count do nothing, as the console leaves them out
+/// of EXEC.
+pub const USER_DISPATCH_THREADS: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

@@ -3005,3 +3005,25 @@ fn a_spread_dispatch_runs_each_asked_group_once() {
     eprintln!("ran on {ran:?}");
     assert!(!ran.is_empty(), "no device ran the test");
 }
+
+#[test]
+fn v_cvt_f32_u32_rounds_full_width_inputs_once() {
+    let shader = build_valu_cs(&[vop1(0x06, 0, vgpr(1))]);
+    let mut unsigned = vec![0u32, 1, 0xFFFF, 0x1_0000, 0xDE84_975E, 0xFFFF_FF7F, u32::MAX];
+    for exponent in 24..32 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+            unsigned.extend([midpoint - 1, midpoint, midpoint + 1]);
+        }
+    }
+    let inputs: Vec<[u32; 4]> = unsigned.iter().map(|&x| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, _, inp, got| {
+        let want = (inp[0] as f32).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_f32_u32({:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0]
+        );
+    });
+}

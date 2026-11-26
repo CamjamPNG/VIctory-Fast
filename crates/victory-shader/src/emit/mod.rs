@@ -263,6 +263,20 @@ pub fn native_rt_two_pass() -> bool {
     })
 }
 
+/// Whether `FrontBackTrack` loops fall back to the legacy single-pass `FORCE_NON_OPAQUE`
+/// `Proceed()` loop instead of two pure-opaque zero-exit traces
+/// (`VICTORY_NATIVE_RT_FBT_LEGACY=1`; off by default).
+pub fn native_rt_fbt_legacy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_NATIVE_RT_FBT_LEGACY")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            == Some("1")
+    })
+}
+
 /// Whether a shader identified by `hash_hex` is selected by
 /// `VICTORY_NATIVE_RT_FILTER`: when unset or empty, matches every shader;
 /// otherwise matches comma-separated substrings case-insensitively.

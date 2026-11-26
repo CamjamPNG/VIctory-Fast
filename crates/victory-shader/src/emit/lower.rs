@@ -422,15 +422,19 @@ struct Lower<'a> {
     ray_entries: HashSet<usize>,
     /// IR blocks skipped during lowering (deleted BVH scaffolding).
     ray_skipped: HashSet<usize>,
+    /// Dead `ds_write*` sentinel stores outside lifted BVH loops when `@lds` has no live readers.
+    dead_lds_writes: HashSet<Site>,
     /// Whether any lifted `RayLoop` is a `RayLoopKind::AnyHit`.
     has_anyhit_loop: bool,
     /// Pre-allocated `RayQuery` handles indexed by lifted `rq_group`.
     ray_queries: Vec<V>,
     /// Optional Pass 1 opaque-only (`CULL_NON_OPAQUE`) `RayQuery` handle per `rq_group`.
     ray_queries_opaque: Vec<Option<V>>,
-    /// Lazy candidate triangle queries (`RayT`, `Bary`, `FrontFace`) materialized on demand.
-    cand_inputs: HashMap<Value, (V, super::rayquery_lift::CandidateInput)>,
-    /// Per-DXIL-block cache of materialized lazy candidate queries.
+    /// Lazy candidate triangle queries (`RayT`, `Bary`, `FrontFace`) materialized on demand,
+    /// storing `(anyhit_bridge_blk, rq, ci)`.
+    cand_inputs: HashMap<Value, (usize, V, super::rayquery_lift::CandidateInput)>,
+    /// Cache of materialized lazy candidate queries keyed by `(emit_block, rq, ci)`.
+    /// `CandidateInput::RayT` emits in `anyhit_bridge_blk` (once per `Proceed()` iteration).
     cand_cache: HashMap<(usize, V, super::rayquery_lift::CandidateInput), V>,
 }
 
@@ -1505,6 +1509,52 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+fn is_lds_memory_inst(i: &Inst) -> bool {
+    (matches!(i.fields, Fields::Ds { .. })
+        && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute")))
+        || matches!(
+            i.fields,
+            Fields::Buffer { lds: true, .. } | Fields::Flat { lds: true, .. }
+        )
+}
+
+/// Returns sites of provably dead `ds_write*` stores (e.g. XDXR's pre-loop BVH stack
+/// sentinel `store i32 -1, @lds[...]`) when lifted BVH traversal loops owned `@lds` and
+/// no remaining non-lifted block reads or atomically accesses `@lds`.
+fn dead_bvh_lds_writes(
+    p: &Program,
+    ray_entries: &HashSet<usize>,
+    ray_skipped: &HashSet<usize>,
+) -> Option<HashSet<Site>> {
+    if ray_entries.is_empty() {
+        return None;
+    }
+    let lifted_used_lds = p.blocks.iter().enumerate().any(|(b, blk)| {
+        (ray_entries.contains(&b) || ray_skipped.contains(&b))
+            && blk.insts.iter().any(is_lds_memory_inst)
+    });
+    if !lifted_used_lds {
+        return None;
+    }
+    let mut dead_writes = HashSet::new();
+    for (b, blk) in p.blocks.iter().enumerate() {
+        if ray_entries.contains(&b) || ray_skipped.contains(&b) {
+            continue;
+        }
+        for (i, inst) in blk.insts.iter().enumerate() {
+            if !is_lds_memory_inst(inst) {
+                continue;
+            }
+            if inst.name().starts_with("ds_write") && inst.writes.is_empty() {
+                dead_writes.insert((b, i));
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(dead_writes)
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -1528,6 +1578,8 @@ impl<'a> Lower<'a> {
             .iter()
             .flat_map(|rl| rl.skipped_blocks.iter().copied())
             .collect();
+        let dead_lds_writes = dead_bvh_lds_writes(p, &ray_entries, &ray_skipped);
+        let dead_bvh_lds = dead_lds_writes.is_some();
         let has_anyhit_loop = ray_loops
             .iter()
             .any(|rl| matches!(rl.kind, super::rayquery_lift::RayLoopKind::AnyHit(_)))
@@ -1565,7 +1617,7 @@ impl<'a> Lower<'a> {
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
-            s.lds_dwords = cs.lds_bytes() / 4;
+            s.lds_dwords = if dead_bvh_lds { 0 } else { cs.lds_bytes() / 4 };
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -1927,6 +1979,7 @@ impl<'a> Lower<'a> {
             ray_loops,
             ray_entries,
             ray_skipped,
+            dead_lds_writes: dead_lds_writes.unwrap_or_default(),
             has_anyhit_loop,
             ray_queries: Vec::new(),
             ray_queries_opaque: Vec::new(),
@@ -2557,7 +2610,7 @@ impl<'a> Lower<'a> {
             .filter_map(|rl| rl.tlas_root_load)
             .collect();
         self.ray_meta_loads.clear();
-        let mut ray_skipped_insts: HashSet<Site> = HashSet::new();
+        let mut ray_skipped_insts: HashSet<Site> = self.dead_lds_writes.clone();
         let mut ray_anyhit_tail: HashMap<usize, usize> = HashMap::new();
         for (idx, rl) in ray_loops.iter().enumerate() {
             for &(site, kind) in &rl.committed_meta_loads {
@@ -2666,10 +2719,7 @@ impl<'a> Lower<'a> {
         let mut group_flags: Vec<Option<u32>> = vec![None; num_groups];
         let mut group_two_pass: Vec<bool> = vec![super::native_rt_two_pass(); num_groups];
         for rl in &ray_loops {
-            let f = match rl.ray_flags {
-                super::rayquery_lift::RayInput::Const(f) => f,
-                _ => 0,
-            };
+            let f = super::rayquery_lift::effective_const_ray_flags(rl).unwrap_or(0);
             group_flags[rl.rq_group] = Some(match group_flags[rl.rq_group] {
                 Some(prev) => prev & f,
                 None => f,
@@ -2842,7 +2892,8 @@ impl<'a> Lower<'a> {
                                 | super::rayquery_lift::CandidateInput::Bary(_)
                                 | super::rayquery_lift::CandidateInput::FrontFace
                         ) {
-                            self.cand_inputs.insert(val_id, (rq, ci));
+                            self.cand_inputs
+                                .insert(val_id, (pending.anyhit_bridge_blk, rq, ci));
                         }
                     }
                     for &(atom_v, const_b) in &ah.const_lane_atoms {
@@ -3284,8 +3335,8 @@ impl<'a> Lower<'a> {
             Some(&val) => return Ok(val),
             None => {}
         }
-        if let Some(&(rq, ci)) = self.cand_inputs.get(&v) {
-            let x = self.materialize_cand_input(self.cur, rq, ci);
+        if let Some(&(bridge_blk, rq, ci)) = self.cand_inputs.get(&v) {
+            let x = self.materialize_cand_input(self.cur, bridge_blk, rq, ci);
             return Ok(Val::I32(x));
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
@@ -3303,14 +3354,22 @@ impl<'a> Lower<'a> {
     fn materialize_cand_input(
         &mut self,
         block: usize,
+        bridge_blk: usize,
         rq: V,
         ci: super::rayquery_lift::CandidateInput,
     ) -> V {
-        if let Some(&x) = self.cand_cache.get(&(block, rq, ci)) {
+        // Hoist `CandidateTriangleRayT` to `anyhit_bridge_blk` (which strictly dominates every
+        // block in the AnyHit sub-CFG) so it is emitted at most once per `Proceed()` iteration.
+        let emit_blk = if matches!(ci, super::rayquery_lift::CandidateInput::RayT) {
+            bridge_blk
+        } else {
+            block
+        };
+        if let Some(&x) = self.cand_cache.get(&(emit_blk, rq, ci)) {
             return x;
         }
-        let x = super::rayquery_lift::emit_cand_input(&mut self.s, block, rq, ci);
-        self.cand_cache.insert((block, rq, ci), x);
+        let x = super::rayquery_lift::emit_cand_input(&mut self.s, emit_blk, rq, ci);
+        self.cand_cache.insert((emit_blk, rq, ci), x);
         x
     }
 
@@ -14376,8 +14435,8 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                if !bit && let Some(&(rq, ci)) = self.cand_inputs.get(&arg) {
-                    let x = self.materialize_cand_input(qb, rq, ci);
+                if !bit && let Some(&(bridge_blk, rq, ci)) = self.cand_inputs.get(&arg) {
+                    let x = self.materialize_cand_input(qb, bridge_blk, rq, ci);
                     incoming.push((x, qb));
                     continue;
                 }
@@ -15620,5 +15679,265 @@ mod tests {
             fp_on, fp_off,
             "VICTORY_LOOP_LIMIT=0 must be reflected in translation_fingerprint()"
         );
+    }
+
+    #[test]
+    fn dead_bvh_lds_writes_only_elides_when_all_lds_readers_are_lifted() {
+        use super::dead_bvh_lds_writes;
+        use crate::ir::{Block, Exit, Inst, Program, Reg, Value};
+        use std::collections::HashSet;
+
+        let decode_one = |words: &[u32]| {
+            let mut bytes = Vec::with_capacity((words.len() + 1) * 4);
+            for &w in words {
+                bytes.extend_from_slice(&w.to_le_bytes());
+            }
+            bytes.extend_from_slice(&S_ENDPGM.to_le_bytes());
+            let m = crate::gfx10::decode(&bytes)
+                .expect("valid GFX10 inst")
+                .into_iter()
+                .next()
+                .unwrap();
+            let fields = m.fields(false);
+            Inst {
+                machine: m,
+                fields,
+                reads: vec![],
+                writes: vec![],
+            }
+        };
+
+        // ds_write_b32 v0, v1 (sentinel store), ds_read_b32 v2, v0 (stack pop).
+        let ds_write = || decode_one(&[0xD834_0000, 0x0000_0100]);
+        let ds_read = || {
+            let mut inst = decode_one(&[0xD8D8_0000, 0x0200_0000]);
+            inst.writes.push((Reg::V(2), Value(9)));
+            inst
+        };
+
+        let make_prog = |lifted_lds: bool, live_read: bool| Program {
+            wave64: false,
+            vgprs: 8,
+            blocks: vec![
+                // Block 0: pre-loop sentinel `ds_write_b32 v0, -1`
+                Block {
+                    offset: 0,
+                    preds: vec![],
+                    phis: vec![],
+                    insts: vec![ds_write()],
+                    exit: Exit::Jump(1),
+                },
+                // Block 1: lifted BVH loop entry
+                Block {
+                    offset: 8,
+                    preds: vec![0, 2],
+                    phis: vec![],
+                    insts: vec![],
+                    exit: Exit::Branch {
+                        taken: 2,
+                        not_taken: 3,
+                    },
+                },
+                // Block 2: lifted BVH loop body (uses `@lds` when `lifted_lds`)
+                Block {
+                    offset: 12,
+                    preds: vec![1],
+                    phis: vec![],
+                    insts: if lifted_lds { vec![ds_read()] } else { vec![] },
+                    exit: Exit::Jump(1),
+                },
+                // Block 3: post-loop exit (optionally has live `ds_read_b32`)
+                Block {
+                    offset: 20,
+                    preds: vec![1],
+                    phis: vec![],
+                    insts: if live_read { vec![ds_read()] } else { vec![] },
+                    exit: Exit::End,
+                },
+            ],
+            inputs: vec![],
+        };
+
+        let ray_entries: HashSet<usize> = [1].into_iter().collect();
+        let ray_skipped: HashSet<usize> = [2].into_iter().collect();
+
+        // 1) All `@lds` reads are inside lifted BVH blocks -> pre-loop sentinel `ds_write_b32` elided.
+        let p_dead = make_prog(true, false);
+        let dead = dead_bvh_lds_writes(&p_dead, &ray_entries, &ray_skipped)
+            .expect("dead sentinel store must be elided");
+        assert_eq!(dead, [(0, 0)].into_iter().collect());
+
+        // 2) Live `ds_read_b32` remains outside lifted loops -> keep `@lds` and sentinel store.
+        let p_live = make_prog(true, true);
+        assert!(
+            dead_bvh_lds_writes(&p_live, &ray_entries, &ray_skipped).is_none(),
+            "must never elide @lds when a non-lifted block still reads @lds"
+        );
+
+        // 3) No lifted loops -> never elide write-only LDS (preserves non-RT tests).
+        let empty = HashSet::new();
+        assert!(dead_bvh_lds_writes(&p_dead, &empty, &empty).is_none());
+
+        // 4) Lifted loop did not touch LDS -> leave LDS untouched.
+        let p_no_bvh_lds = make_prog(false, false);
+        assert!(dead_bvh_lds_writes(&p_no_bvh_lds, &ray_entries, &ray_skipped).is_none());
+    }
+
+    #[test]
+    fn candidate_ray_t_cse_hoists_to_anyhit_bridge_and_validates() {
+        use super::super::bitcode::{Bin, Term, pred};
+        use super::super::rayquery_lift::{
+            AnyHitInfo, CandidateInput, RayInput, RayLoop, RayLoopKind, RayOutput,
+            RayOutputBinding, RayTemplate, ResolvedRayInputs, emit_ray_loop, ray_flag,
+        };
+        use super::Lower;
+        use crate::ir::Value;
+        use std::collections::HashMap;
+
+        let code: Vec<u8> = [S_ENDPGM].iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                threads: [8, 8, 1],
+                rsrc2: 0,
+            }),
+            code,
+        };
+        let prog = ir::build(&native.code, false, 8).unwrap();
+        let st = structure::structure(&prog).unwrap();
+        let io_info = io::raise(&prog, &native).unwrap();
+        let res = resource::track(&prog, &native.layout, native.stage, Some(&st)).unwrap();
+        let parts = Parts {
+            p: &prog,
+            st: &st,
+            io: &io_info,
+            res: &res,
+            native: &native,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = HashMap::new();
+        let mut lower = Lower::new(&parts, &bad);
+
+        let entry = lower.s.entry;
+        let ah_head = lower.s.m.new_block();
+        let ah_left = lower.s.m.new_block();
+        let ah_right = lower.s.m.new_block();
+        let ah_tail = lower.s.m.new_block();
+        let exit = lower.s.m.new_block();
+        let tlas = lower.s.rtas_root_srv_handle(entry, 0);
+
+        let flags = ray_flag::CULL_BACK_FACING_TRIANGLES | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+        let rl = RayLoop {
+            rq_group: 0,
+            entry_block: 1,
+            exit_block: 3,
+            exit_pred: 1,
+            skipped_blocks: vec![],
+            template: RayTemplate::Bvh64,
+            kind: RayLoopKind::AnyHit(AnyHitInfo {
+                opacity_block: 1,
+                entry_block: 2,
+                tail_block: 2,
+                body_blocks: vec![2],
+                skipped_tail_insts: vec![],
+                accept_mask: Value(20),
+                accept_invert: false,
+                accept_first_hit: false,
+                inputs: vec![
+                    (Value(15), CandidateInput::RayT),
+                    (Value(16), CandidateInput::Bary(0)),
+                ],
+                const_lane_atoms: vec![],
+                state_vars: vec![],
+                cand_meta_loads: vec![],
+            }),
+            tlas_load: (0, 0),
+            tlas_root_load: None,
+            active_ray_mask: None,
+            origin: [RayInput::Val(Value(1)); 3],
+            t_min: None,
+            dir: [RayInput::Val(Value(2)); 3],
+            t_max: RayInput::Val(Value(3)),
+            instance_mask: RayInput::Const(0xFF),
+            ray_flags: RayInput::Const(flags),
+            outputs: vec![RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            }],
+            committed_meta_loads: vec![],
+        };
+
+        let rq = lower.s.allocate_ray_query(entry, flags);
+        let zero = lower.s.m.i32(0);
+        let one_f = lower.s.m.i32(1.0f32.to_bits());
+        let ten_f = lower.s.m.i32(10.0f32.to_bits());
+        let inputs = ResolvedRayInputs {
+            rq,
+            rq_opaque: None,
+            tlas,
+            active_ray: None,
+            origin: [zero, zero, zero],
+            t_min: None,
+            dir: [one_f, zero, zero],
+            t_max: ten_f,
+            instance_mask: None,
+            ray_flags: None,
+            group_const_flags: flags,
+            group_opaque_const_flags: 0,
+            init_min_front_t: None,
+            anyhit_inits: vec![],
+            anyhit_entry_dxil: Some(ah_head),
+            fallbacks: HashMap::new(),
+        };
+
+        let emitted = emit_ray_loop(&mut lower.s, entry, exit, &rl, &inputs);
+        let pending = emitted.pending_anyhit.expect("pending anyhit");
+        let bridge = pending.anyhit_bridge_blk;
+
+        // Materialize `CandidateInput::RayT` from TWO separate sibling blocks inside AnyHit:
+        // both must share the single SSA value hoisted into `anyhit_bridge_blk`.
+        let cond = lower.s.m.cmp(ah_head, pred::NE, one_f, zero);
+        lower.s.m.terminate(ah_head, Term::CondBr(cond, ah_left, ah_right));
+
+        let t_left = lower.materialize_cand_input(ah_left, bridge, rq, CandidateInput::RayT);
+        let b_left = lower.materialize_cand_input(ah_left, bridge, rq, CandidateInput::Bary(0));
+        lower.s.m.terminate(ah_left, Term::Br(ah_tail));
+
+        let t_right = lower.materialize_cand_input(ah_right, bridge, rq, CandidateInput::RayT);
+        let b_right = lower.materialize_cand_input(ah_right, bridge, rq, CandidateInput::Bary(0));
+        lower.s.m.terminate(ah_right, Term::Br(ah_tail));
+
+        assert_eq!(
+            t_left, t_right,
+            "CandidateTriangleRayT must be CSE'd once per Proceed() iteration in anyhit_bridge_blk"
+        );
+        assert_ne!(
+            b_left, b_right,
+            "Barycentrics remain lazy per-block so skipped branches avoid extra queries"
+        );
+
+        let sum = lower.s.m.bin(ah_tail, Bin::Add, t_left, t_right);
+        let accept = lower.s.m.cmp(ah_tail, pred::NE, sum, zero);
+        lower
+            .s
+            .m
+            .terminate(ah_tail, Term::CondBr(accept, pending.do_commit_blk, pending.latch_blk));
+        lower.s.m.terminate(exit, Term::Ret);
+
+        let mut dxbc = lower.s.finish();
+        assert!(dxbc.starts_with(b"DXBC"));
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(None) {
+            v.validate(&mut dxbc)
+                .expect("CSE'd CandidateTriangleRayT DXIL must pass dxil.dll validation");
+        }
     }
 }

@@ -24,6 +24,8 @@ const OPAQUE_LANE_STRIDE_DWORDS: u32 = 24;
 const PROCEED_LANE_STRIDE_DWORDS: u32 = 4;
 /// Dwords written per lane by the two-pass tMax pre-shrink shader.
 const TWO_PASS_LANE_STRIDE_DWORDS: u32 = 6;
+/// Dwords written per lane by the two-pass pure-opaque FrontBackTrack shader.
+const FBT_LANE_STRIDE_DWORDS: u32 = 7;
 
 fn err(e: windows::core::Error) -> String {
     e.message().to_string()
@@ -422,6 +424,175 @@ fn emit_two_pass_anyhit_cs() -> Vec<u8> {
     s.finish()
 }
 
+/// `[numthreads(6, 1, 1)]` compute shader emitted directly through `rayquery_lift::emit_ray_loop`
+/// for `RayLoopKind::FrontBackTrack` (two-pass pure-opaque with non-zero `tMin = 0.5`):
+/// - Lane 0 (`x=0`): front-only
+/// - Lane 1 (`x=10`): back-only
+/// - Lane 2 (`x=20`): front closer than back
+/// - Lane 3 (`x=30`): back closer than front
+/// - Lane 4 (`x=40`): miss
+/// - Lane 5 (`x=20`, `init_min_front_t=1.5`): front closer than back with tighter init
+fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
+    use super::rayquery_lift::{
+        RayInput, RayLoop, RayLoopKind, RayOutput, RayOutputBinding, RayTemplate,
+        ResolvedRayInputs, effective_const_ray_flags, emit_ray_loop, ray_flag,
+    };
+    use crate::ir::Value;
+    use std::collections::HashMap;
+
+    let mut s = Shader::new(false);
+    s.threads = Some([6, 1, 1]);
+    let entry = s.entry;
+    let done = s.m.new_block();
+
+    let uav = s.root_uav_handle(0);
+    let tlas = s.rtas_root_srv_handle(entry, 0);
+
+    let i32t = s.t.i32;
+    let tid = s.op(
+        entry,
+        "flattenedThreadIdInGroup.i32",
+        Attr::ReadNone,
+        i32t,
+        96,
+        &[],
+    );
+
+    let mut ox = s.m.i32(0.0f32.to_bits());
+    for (lane, x) in [
+        (1u32, 10.0f32),
+        (2, 20.0),
+        (3, 30.0),
+        (4, 40.0),
+        (5, 20.0),
+    ] {
+        let lc = s.m.i32(lane);
+        let is_lane = s.m.cmp(entry, pred::EQ, tid, lc);
+        let xv = s.m.i32(x.to_bits());
+        ox = s.m.select(entry, is_lane, xv, ox);
+    }
+    let lane5 = s.m.i32(5);
+    let is_lane5 = s.m.cmp(entry, pred::EQ, tid, lane5);
+    let t_max_i = s.m.i32(100.0f32.to_bits());
+    let init_tight = s.m.i32(1.5f32.to_bits());
+    let init_min_front_t = s.m.select(entry, is_lane5, init_tight, t_max_i);
+
+    let zero_i = s.m.i32(0);
+    let zero_f_i = s.m.i32(0.0f32.to_bits());
+    let one_f_i = s.m.i32(1.0f32.to_bits());
+    let t_min_i = s.m.i32(0.5f32.to_bits());
+
+    let guest_flags = ray_flag::FORCE_NON_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
+    let rl = RayLoop {
+        rq_group: 0,
+        entry_block: 1,
+        exit_block: 2,
+        exit_pred: 1,
+        skipped_blocks: vec![],
+        template: RayTemplate::Bvh64,
+        kind: RayLoopKind::FrontBackTrack {
+            init_min_front_t: RayInput::Val(Value(8)),
+        },
+        tlas_load: (0, 0),
+        tlas_root_load: None,
+        active_ray_mask: None,
+        origin: [
+            RayInput::Val(Value(1)),
+            RayInput::Val(Value(2)),
+            RayInput::Val(Value(3)),
+        ],
+        t_min: Some(RayInput::Val(Value(9))),
+        dir: [
+            RayInput::Val(Value(4)),
+            RayInput::Val(Value(5)),
+            RayInput::Val(Value(6)),
+        ],
+        t_max: RayInput::Val(Value(7)),
+        instance_mask: RayInput::Const(0xFF),
+        ray_flags: RayInput::Const(guest_flags),
+        outputs: vec![
+            RayOutputBinding {
+                value: Value(10),
+                output: RayOutput::CommittedStatusTriNode,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(11),
+                output: RayOutput::CommittedRayT,
+                fallback: Some(Value(7)),
+            },
+            RayOutputBinding {
+                value: Value(12),
+                output: RayOutput::FrontBackMinFrontT,
+                fallback: Some(Value(8)),
+            },
+            RayOutputBinding {
+                value: Value(13),
+                output: RayOutput::CommittedFrontFace,
+                fallback: Some(Value(0)),
+            },
+            RayOutputBinding {
+                value: Value(14),
+                output: RayOutput::CommittedGeometryIndex,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(15),
+                output: RayOutput::CommittedPrimitiveIndex,
+                fallback: None,
+            },
+            RayOutputBinding {
+                value: Value(16),
+                output: RayOutput::CommittedInstanceId,
+                fallback: None,
+            },
+        ],
+        committed_meta_loads: vec![],
+    };
+
+    let alloc_flags = effective_const_ray_flags(&rl).expect("const effective flags");
+    assert_eq!(
+        alloc_flags,
+        ray_flag::FORCE_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES
+    );
+    let rq = s.allocate_ray_query(entry, alloc_flags);
+
+    let mut fallbacks = HashMap::new();
+    fallbacks.insert(Value(0), zero_i);
+    fallbacks.insert(Value(7), t_max_i);
+    fallbacks.insert(Value(8), init_min_front_t);
+
+    let inputs = ResolvedRayInputs {
+        rq,
+        rq_opaque: None,
+        tlas,
+        active_ray: None,
+        origin: [ox, zero_f_i, zero_f_i],
+        t_min: Some(t_min_i),
+        dir: [zero_f_i, zero_f_i, one_f_i],
+        t_max: t_max_i,
+        instance_mask: None,
+        ray_flags: None,
+        group_const_flags: alloc_flags,
+        group_opaque_const_flags: 0,
+        init_min_front_t: Some(init_min_front_t),
+        anyhit_inits: vec![],
+        anyhit_entry_dxil: None,
+        fallbacks,
+    };
+
+    let emitted = emit_ray_loop(&mut s, entry, done, &rl, &inputs);
+    let stride = s.m.i32(FBT_LANE_STRIDE_DWORDS * 4);
+    let base = s.m.bin(done, Bin::Mul, tid, stride);
+    for (k, &(_, val)) in emitted.outs.iter().enumerate() {
+        let off = byte_offset(&mut s, done, base, k as u32);
+        store_i32(&mut s, done, uav, off, val);
+    }
+
+    s.m.terminate(done, Term::Ret);
+    s.finish()
+}
+
 struct TriangleGeom<'a> {
     vertices: &'a [[f32; 3]],
     flags: D3D12_RAYTRACING_GEOMETRY_FLAGS,
@@ -811,6 +982,7 @@ fn dxil_validates_rayquery_bound_and_heap() {
     let heap = emit_opaque_hit_miss_cs(true);
     let proceed = emit_non_opaque_proceed_cs();
     let two_pass = emit_two_pass_anyhit_cs();
+    let fbt_two_pass = emit_front_back_track_two_pass_cs();
 
     assert_ne!(
         sfi0_flags(&bound) & D3D_SHADER_FEATURE_RAYTRACING_TIER_1_1,
@@ -835,6 +1007,7 @@ fn dxil_validates_rayquery_bound_and_heap() {
     validate_dxil("heap RayQuery CS", &heap);
     validate_dxil("non-opaque Proceed RayQuery CS", &proceed);
     validate_dxil("two-pass AnyHit RayQuery CS", &two_pass);
+    validate_dxil("two-pass pure-opaque FrontBackTrack RayQuery CS", &fbt_two_pass);
 }
 
 #[test]
@@ -1080,4 +1253,179 @@ fn gpu_rayquery_two_pass_tmax_preshrink() {
     assert_eq!(l2[3], 0, "lane 2 CommittedPrimitiveIndex");
     assert_eq!(l2[4], 0x5A5A, "lane 2 CommittedInstanceID (Pass 1 metadata)");
     assert_eq!(l2[5], 1, "lane 2 AnyHit invoked once before fallback");
+}
+
+#[test]
+fn gpu_rayquery_front_back_track_two_pass_opaque() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    if !has_raytracing_tier_1_1(&host) {
+        eprintln!("hardware device lacks DXR Tier 1.1; skipped");
+        return;
+    }
+
+    // Viewed from z=0 looking along +Z in LH DXR:
+    // - CW winding [(x-2,-2,z), (x,2,z), (x+2,-2,z)] is FRONT-FACING.
+    // - CCW winding [(x-2,-2,z), (x+2,-2,z), (x,2,z)] is BACK-FACING.
+    let front_tri = |x: f32, z: f32| [[x - 2.0, -2.0, z], [x, 2.0, z], [x + 2.0, -2.0, z]];
+    let back_tri = |x: f32, z: f32| [[x - 2.0, -2.0, z], [x + 2.0, -2.0, z], [x, 2.0, z]];
+
+    // Mix OPAQUE and NONE geometry flags to verify FORCE_OPAQUE handles both without Proceed() exits.
+    let g0_l0_front = front_tri(0.0, 3.0);
+    let g1_l1_back = back_tri(10.0, 4.0);
+    let g2_l2_front = front_tri(20.0, 2.0);
+    let g3_l2_back = back_tri(20.0, 6.0);
+    let g4_l3_back = back_tri(30.0, 2.0);
+    let g5_l3_front = front_tri(30.0, 6.0);
+    let geoms = [
+        TriangleGeom {
+            vertices: &g0_l0_front,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_NONE,
+        },
+        TriangleGeom {
+            vertices: &g1_l1_back,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_NONE,
+        },
+        TriangleGeom {
+            vertices: &g2_l2_front,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &g3_l2_back,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_NONE,
+        },
+        TriangleGeom {
+            vertices: &g4_l3_back,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+        },
+        TriangleGeom {
+            vertices: &g5_l3_front,
+            flags: D3D12_RAYTRACING_GEOMETRY_FLAG_NONE,
+        },
+    ];
+    let inst = InstanceSpec {
+        transform: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ],
+        instance_id: 0x7B71,
+        instance_mask: 0xFF,
+        contrib: 5,
+        flags: 0,
+    };
+
+    let dxil = emit_front_back_track_two_pass_cs();
+    let out = run_rayquery_gpu(
+        &host,
+        &dxil,
+        false,
+        &geoms,
+        &inst,
+        6 * FBT_LANE_STRIDE_DWORDS,
+    )
+    .unwrap_or_else(|e| panic!("FrontBackTrack two-pass opaque run_rayquery_gpu failed: {e}"));
+
+    let stride = FBT_LANE_STRIDE_DWORDS as usize;
+    let lane = |k: usize| &out[k * stride..(k + 1) * stride];
+
+    // Lane 0: front-only (z=3.0) -> no committed back-face hit, minFrontFaceT=3.0.
+    let l0 = lane(0);
+    assert_eq!(l0[0], 0, "lane 0 (front-only) CommittedStatus");
+    assert!(
+        (f32::from_bits(l0[1]) - 100.0).abs() < 1e-4,
+        "lane 0 CommittedRayT got {}",
+        f32::from_bits(l0[1])
+    );
+    assert!(
+        (f32::from_bits(l0[2]) - 3.0).abs() < 1e-4,
+        "lane 0 minFrontFaceT got {}, want 3.0",
+        f32::from_bits(l0[2])
+    );
+    assert_eq!(l0[3], 0, "lane 0 miss CommittedFrontFace fallback");
+
+    // Lane 1: back-only (z=4.0) -> committed back-face hit at t=4.0, minFrontFaceT=100.0.
+    let l1 = lane(1);
+    assert_eq!(l1[0], 1, "lane 1 (back-only) CommittedStatus");
+    assert!(
+        (f32::from_bits(l1[1]) - 4.0).abs() < 1e-4,
+        "lane 1 CommittedRayT got {}, want 4.0",
+        f32::from_bits(l1[1])
+    );
+    assert!(
+        (f32::from_bits(l1[2]) - 100.0).abs() < 1e-4,
+        "lane 1 minFrontFaceT got {}, want 100.0",
+        f32::from_bits(l1[2])
+    );
+    assert_eq!(l1[3], 0xFF, "lane 1 CommittedFrontFace must be back (0xFF)");
+    assert_eq!(l1[4], 1, "lane 1 CommittedGeometryIndex");
+    assert_eq!(l1[5], 0, "lane 1 CommittedPrimitiveIndex");
+    assert_eq!(l1[6], 0x7B71, "lane 1 CommittedInstanceID");
+
+    // Lane 2: front closer than back (front z=2.0, back z=6.0) -> committed back at 6.0, minFrontFaceT=2.0.
+    let l2 = lane(2);
+    assert_eq!(l2[0], 1, "lane 2 (front<back) CommittedStatus");
+    assert!(
+        (f32::from_bits(l2[1]) - 6.0).abs() < 1e-4,
+        "lane 2 CommittedRayT got {}, want 6.0",
+        f32::from_bits(l2[1])
+    );
+    assert!(
+        (f32::from_bits(l2[2]) - 2.0).abs() < 1e-4,
+        "lane 2 minFrontFaceT got {}, want 2.0",
+        f32::from_bits(l2[2])
+    );
+    assert_eq!(l2[3], 0xFF, "lane 2 CommittedFrontFace must be back (0xFF)");
+    assert_eq!(l2[4], 3, "lane 2 CommittedGeometryIndex (back tri)");
+    assert_eq!(l2[6], 0x7B71, "lane 2 CommittedInstanceID");
+
+    // Lane 3: back closer than front (back z=2.0, front z=6.0) -> committed back at 2.0, minFrontFaceT=6.0.
+    let l3 = lane(3);
+    assert_eq!(l3[0], 1, "lane 3 (back<front) CommittedStatus");
+    assert!(
+        (f32::from_bits(l3[1]) - 2.0).abs() < 1e-4,
+        "lane 3 CommittedRayT got {}, want 2.0",
+        f32::from_bits(l3[1])
+    );
+    assert!(
+        (f32::from_bits(l3[2]) - 6.0).abs() < 1e-4,
+        "lane 3 minFrontFaceT got {}, want 6.0",
+        f32::from_bits(l3[2])
+    );
+    assert_eq!(l3[3], 0xFF, "lane 3 CommittedFrontFace must be back (0xFF)");
+    assert_eq!(l3[4], 4, "lane 3 CommittedGeometryIndex (back tri)");
+    assert_eq!(l3[6], 0x7B71, "lane 3 CommittedInstanceID");
+
+    // Lane 4: miss -> status=0, committed_t=100.0, minFrontFaceT=100.0.
+    let l4 = lane(4);
+    assert_eq!(l4[0], 0, "lane 4 (miss) CommittedStatus");
+    assert!(
+        (f32::from_bits(l4[1]) - 100.0).abs() < 1e-4,
+        "lane 4 CommittedRayT got {}",
+        f32::from_bits(l4[1])
+    );
+    assert!(
+        (f32::from_bits(l4[2]) - 100.0).abs() < 1e-4,
+        "lane 4 minFrontFaceT got {}",
+        f32::from_bits(l4[2])
+    );
+
+    // Lane 5: front at z=2.0, back at z=6.0, init_min_front_t=1.5 -> minFrontFaceT stays 1.5!
+    let l5 = lane(5);
+    assert_eq!(l5[0], 1, "lane 5 (tight init) CommittedStatus");
+    assert!(
+        (f32::from_bits(l5[1]) - 6.0).abs() < 1e-4,
+        "lane 5 CommittedRayT got {}, want 6.0",
+        f32::from_bits(l5[1])
+    );
+    assert!(
+        (f32::from_bits(l5[2]) - 1.5).abs() < 1e-4,
+        "lane 5 minFrontFaceT got {}, want 1.5",
+        f32::from_bits(l5[2])
+    );
 }

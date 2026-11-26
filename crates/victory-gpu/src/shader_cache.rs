@@ -78,6 +78,7 @@ fn build() -> [u8; 32] {
             "VICTORY_NATIVE_RT",
             "VICTORY_NATIVE_RT_ANYHIT",
             "VICTORY_NATIVE_RT_FILTER",
+            "VICTORY_NATIVE_RT_FBT_LEGACY",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

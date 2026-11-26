@@ -114,10 +114,14 @@ impl Target {
     pub(crate) fn new(resource: This) -> Option<Self> {
         // Keep the host copy independently of the title's resource lifetime.
         let copy = crate::resource::host_copy(resource)?;
-        let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
-        let ticket = track(resource as usize, at, end);
+        // Register the ticket while no mapping change is in progress so a
+        // concurrent remap cannot miss it.
+        let ticket = {
+            let _mapping = crate::watch::title_memory_reading();
+            track(resource as usize, at, end)
+        };
         Some(Self { copy, layout, ticket })
     }
 
@@ -197,25 +201,50 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
+fn note_stale() {
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+    if skipped.is_power_of_two() {
+        tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+    }
+}
+
+/// Runs `write` on the title slice `[at, end)` only if `ticket` is still valid,
+/// holding both the title-memory read lock and the ticket lock across the write
+/// so no remap or resource release can race with it.
+fn commit_if_valid(ticket: &Ticket, write: impl FnOnce(usize, usize)) -> bool {
+    let _mapping = crate::watch::title_memory_reading();
+    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !ticket.valid.load(Ordering::Acquire) {
+        return false;
+    }
+    write(ticket.at, ticket.end - ticket.at);
+    true
+}
+
 /// Once the list has run, tile its texels back into the same title allocation.
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
-    static STALE: AtomicU64 = AtomicU64::new(0);
-    let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
-        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
-        if skipped.is_power_of_two() {
-            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
-        }
+        note_stale();
         return;
     }
     let (at, end) = back.range();
     let size = end - at;
     let mut tiled = vec![0u8; size];
-    // Keep title bytes the subresources do not cover.
-    if !crate::host::read_into(at as *const u8, &mut tiled) {
-        return;
+    // Hold the mapping read lock only while snapshotting existing title bytes
+    // so uncovered subresource padding is preserved without stalling remaps
+    // across buffer Map/Unmap and CPU retiling.
+    {
+        let _mapping = crate::watch::title_memory_reading();
+        if !back.ticket.valid.load(Ordering::Acquire) {
+            drop(_mapping);
+            note_stale();
+            return;
+        }
+        if !crate::host::read_into(at as *const u8, &mut tiled) {
+            return;
+        }
     }
     let mut data = std::ptr::null_mut();
     // SAFETY: our read-back buffer, written by the list that has run.
@@ -241,7 +270,12 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
-    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    if !commit_if_valid(&back.ticket, |at, size| {
+        crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    }) {
+        note_stale();
+        return;
+    }
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
@@ -269,5 +303,22 @@ mod tests {
         released(93);
         assert!(!far.valid.load(Ordering::Acquire));
         assert!(track(94, 0x2000, 0x3000).valid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn commit_skips_write_if_invalidated_before_final_lock() {
+        let ticket = track(101, 0x8000, 0x9000);
+        let mut wrote = false;
+        assert!(commit_if_valid(&ticket, |at, size| {
+            assert_eq!((at, size), (0x8000, 0x1000));
+            wrote = true;
+        }));
+        assert!(wrote);
+
+        // Simulate a remap/release arriving while tiling ran unlocked.
+        remapped(0x8800, 0x100);
+        let mut wrote_stale = false;
+        assert!(!commit_if_valid(&ticket, |_, _| wrote_stale = true));
+        assert!(!wrote_stale);
     }
 }

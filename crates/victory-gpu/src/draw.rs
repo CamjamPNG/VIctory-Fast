@@ -446,6 +446,10 @@ pub(crate) struct State {
     /// bind: `[row, asked x]` (`[0, 0]`: not spread; an indirect one gets
     /// its words from the clamp through its command signature).
     dispatch_spread: [u32; 2],
+    /// A `DispatchX` that counts threads, for [`State::host_word`] at its
+    /// bind: the count per axis where it is not a whole number of groups,
+    /// else 0 (`USER_DISPATCH_THREADS`; fork pull request #646).
+    dispatch_threads: [u32; 3],
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -888,7 +892,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         crate::book::root(gpu, len);
         return Some(gpu);
     }
-    list.fill_scratch(address as *const u8, len)
+    if crate::host::list_reuse() {
+        return list.fill_scratch(address as *const u8, len);
+    }
+    let (gpu, to) = list.scratch(len)?;
+    list.defer_fill(to, address as *const u8, len as usize);
+    Some(gpu)
 }
 
 macro_rules! once {
@@ -1374,11 +1383,14 @@ impl State {
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
         use victory_shader::emit::{
-            USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS,
-            USER_VIEW_BIAS,
+            USER_DISPATCH_SPREAD, USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_ROOT_ADDRESS,
+            USER_VIEW_ADDRESS, USER_VIEW_BIAS,
         };
         if kind == USER_DISPATCH_SPREAD {
             return self.dispatch_spread[usize::from(dword != 0)];
+        }
+        if kind == USER_DISPATCH_THREADS {
+            return self.dispatch_threads.get(dword as usize).copied().unwrap_or(0);
         }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| if dword == 0 { m.base } else { m.count });
@@ -1680,7 +1692,13 @@ impl State {
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
             // The title may release the pipeline before it submits the list.
-            list.bind_pipeline(&p.name, &p.pso, &p.root);
+            if crate::host::list_reuse() {
+                list.bind_pipeline(&p.name, &p.pso, &p.root);
+            } else {
+                list.used_pipeline(&p.name);
+                list.keep(&p.pso);
+                list.keep(&p.root);
+            }
         }
         // With `table_stages`: what the stages of this draw read of each
         // table, and the tables its earlier stages made afresh (address,
@@ -3253,14 +3271,36 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        // Counted in threads: whole groups of them, and the program is told
-        // how many of the last one run, where it asks (its `bind` set that to
-        // all of them).
+        // Counted in threads (`USE_THREAD_DIMENSIONS`, flags bit 5; fork pull
+        // request #646): whole groups of them, and the per-axis counts where
+        // the last group is cut (`USER_DISPATCH_THREADS`).
         let size = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
             .then(|| p.stages.first().and_then(|s| s.translated().threads))
             .flatten();
         let threads = [x, y, z];
-        let [gx_req, gy_req, gz_req] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        let ([gx_req, gy_req, gz_req], partial) = match size {
+            Some(group) => match dispatch_dimensions(threads, group, flags) {
+                Some(dims) => dims,
+                None => return,
+            },
+            None if flags & THREAD_DIMENSIONS != 0 && thread_dimensions() && threads.contains(&0) => return,
+            None => (threads, [0; 3]),
+        };
+        if partial != [0; 3]
+            && let Some(stage) = p.stages.first()
+            && !stage.translated().host.user_data.iter().any(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS)
+                    || u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)
+            })
+        {
+            once!(
+                pipeline = %p.name,
+                threads = ?partial,
+                group = ?size.unwrap_or([0; 3]),
+                "a DispatchX counting threads cuts its last group, and its program does not take the count: \
+                 the threads past it run"
+            );
+        }
         // More than 65,535 groups in x: spread across z for a program that
         // takes the spread words (`USER_DISPATCH_SPREAD`).
         let (row, asked, gx, gy, gz) =
@@ -3271,8 +3311,10 @@ impl State {
             once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
         }
         self.dispatch_spread = [row, asked];
+        self.dispatch_threads = partial;
         let bound = self.bind(list, p, true);
         self.dispatch_spread = [0, 0];
+        self.dispatch_threads = [0; 3];
         if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -4687,8 +4729,30 @@ fn thread_dimensions() -> bool {
 }
 
 /// The groups of `size` threads that hold `threads`.
+#[cfg(test)]
 fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+}
+
+/// A console dispatch `(x, y, z)` with `DispatchX` flags `flags`, as host
+/// groups and the thread counts the program is to keep to: per axis the
+/// count where it is not a whole number of `group`-thread groups, else 0
+/// (`USER_DISPATCH_THREADS`). Without [`THREAD_DIMENSIONS`] the counts are
+/// groups and go as they are. `None`: no thread along some axis, so nothing
+/// to run. (Fork pull request #646, mynzjerko.)
+fn dispatch_dimensions(dims: [u32; 3], group: [u32; 3], flags: u32) -> Option<([u32; 3], [u32; 3])> {
+    if flags & THREAD_DIMENSIONS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    if dims.contains(&0) {
+        return None;
+    }
+    let groups = std::array::from_fn(|c| dims[c].div_ceil(group[c].max(1)));
+    let partial = std::array::from_fn(|c| {
+        let g = group[c].max(1);
+        if g > 1 && !dims[c].is_multiple_of(g) { dims[c] } else { 0 }
+    });
+    Some((groups, partial))
 }
 
 /// Where a compute pipeline's user data has a word the host computes: the
@@ -4710,6 +4774,25 @@ mod thread_tests {
         assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), [2, 1, 1]);
         assert_eq!(dispatch_groups([32, 1, 1], [32, 1, 1]), [1, 1, 1]);
         assert_eq!(dispatch_groups([0, 12, 9], [64, 4, 4]), [0, 3, 3]);
+    }
+
+    /// Fork pull request #646: a `DispatchX` with bit 5 counts threads.
+    #[test]
+    fn a_dispatch_counting_threads_runs_the_groups_that_hold_them() {
+        // Without bit 5 (plain Dispatch, or only the 32-lane bit 0x8000): groups.
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0), Some(([48, 1, 1], [0; 3])));
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x8000), Some(([48, 1, 1], [0; 3])));
+        // Threads: the groups that hold them, and the count where the last is cut.
+        assert_eq!(dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x20), Some(([1, 1, 1], [48, 0, 0])));
+        assert_eq!(dispatch_dimensions([1, 1, 1], [64, 1, 1], 0x8020), Some(([1, 1, 1], [1, 0, 0])));
+        assert_eq!(dispatch_dimensions([65, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], [65, 0, 0])));
+        // The builder's box stage: 5,348 nodes of one thread each in groups of 64.
+        assert_eq!(dispatch_dimensions([5348, 1, 1], [64, 1, 1], 0x20), Some(([84, 1, 1], [5348, 0, 0])));
+        // A whole number of groups needs no count.
+        assert_eq!(dispatch_dimensions([128, 1, 1], [64, 1, 1], 0x20), Some(([2, 1, 1], [0; 3])));
+        assert_eq!(dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20), Some(([2, 2, 2], [10, 0, 5])));
+        // No thread along an axis: nothing runs.
+        assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
     }
 }
 

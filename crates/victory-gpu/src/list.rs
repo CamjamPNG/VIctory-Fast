@@ -134,6 +134,11 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
+    /// True for a `VICTORY_THIN=1` front-end list (never holds a `host`);
+    /// false for direct lists and thin's backing lists (which re-acquire
+    /// `host` on [`reset`] after [`detach`]).
+    #[cfg(windows)]
+    is_thin: bool,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -652,6 +657,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
+        #[cfg(windows)]
+        is_thin: thin,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -715,7 +722,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         list.gate.clear();
         if let Some(host) = list.host.as_ref() {
             host.reset();
-        } else if !thin::on() {
+        } else if !list.is_thin {
             list.host = fresh_list();
         }
         if list.host.is_some() {

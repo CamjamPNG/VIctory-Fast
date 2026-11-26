@@ -338,8 +338,6 @@ fn rest() -> u32 {
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    #[cfg(feature = "diagnostics")]
-    let batched = source == batch::SOURCE;
     let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -435,8 +433,14 @@ pub(crate) fn bound(
     spread: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    // Spread dispatch records are 20 bytes each ([row, asked x, x, y, z]).
-    let bytes = if spread { bytes.max(20 * u64::from(spec.2)) } else { bytes };
+    // Spread dispatch records are 20 bytes each ([row, asked x, x, y, z]);
+    // keep `id.x * 20u` inside 32-bit byte offsets in the clamp shader.
+    let bytes = if spread && spec.0 == 2 {
+        let spread_bytes = 20u64.checked_mul(u64::from(spec.2)).filter(|&b| b <= u64::from(u32::MAX))?;
+        bytes.max(spread_bytes)
+    } else {
+        bytes
+    };
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
 }
@@ -526,6 +530,9 @@ fn record_clamp_with(
     ) else {
         return false;
     };
+    if spread && kind == 2 && u64::from(records).checked_mul(20).is_none_or(|b| b > u64::from(u32::MAX)) {
+        return false;
+    }
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
@@ -654,6 +661,7 @@ pub(crate) fn open_batch(
     // A source there is none of is the first again, which no job names.
     let mut ids = [0u64; batch::SOURCES];
     let mut sources = [gpu(source.1)?; batch::SOURCES];
+    list.keep(source.1);
     ids[0] = source.0;
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
     for (i, (id, buffer)) in others.enumerate() {

@@ -50,6 +50,10 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+pub mod port;
+#[cfg(windows)]
+pub mod port_descriptors;
+#[cfg(windows)]
 mod port_cbv;
 #[cfg(windows)]
 mod port_journal;

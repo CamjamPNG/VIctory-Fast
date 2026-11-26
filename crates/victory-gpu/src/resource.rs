@@ -534,7 +534,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = host.shared_twin_scratch(bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
@@ -1269,12 +1269,75 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
+/// The share of the card's local VRAM budget in use, in percent (cached for
+/// a tenth of a second via [`crate::host::now_ms`]).
+#[cfg(windows)]
+fn video_memory_percent() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 8 == tenth {
+        return last & 0xff;
+    }
+    let pct = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .and_then(|[budget, used, ..]| {
+            (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64)
+        })
+        .unwrap_or(0);
+    LAST.store((tenth << 8) | pct, Relaxed);
+    pct
+}
+
+/// Pure threshold logic for [`over_cap`]: skips top mips so neither side passes
+/// `set` (0: uncapped) or the VRAM-pressure cap (1024 below 92 %, 512 at
+/// 92..97 %, 256 at 97 %+).
+#[cfg(any(windows, test))]
+fn over_cap_for(desc: &ResourceDesc, set: Option<u64>, vram_pct: u64) -> u32 {
+    if set == Some(0) {
+        return 0;
+    }
+    let max = set.unwrap_or_else(|| match vram_pct {
+        0..92 => 1024,
+        92..97 => 512,
+        _ => 256,
+    });
+    let mut skip = 0u32;
+    while (desc.width >> skip) > max || (u64::from(desc.height) >> skip) > max {
+        if skip + 1 >= u32::from(desc.mip_levels) {
+            break;
+        }
+        skip += 1;
+    }
+    skip
+}
+
+/// How many of a streamed placed 2D texture's largest mips to skip so no side
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
+/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
+/// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
+#[cfg(windows)]
+fn over_cap(desc: &ResourceDesc) -> u32 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MAX")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    });
+    if set == Some(0) {
+        return 0;
+    }
+    over_cap_for(desc, set, video_memory_percent())
+}
+
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`]; block-compressed
-/// formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
+    let first = first.max(over_cap(desc));
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1607,13 +1670,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // The levels views show ([`held_only`]), those of the slots shaders
         // pick by index among them.
         let mut base = 0;
-        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+        if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            if first != u32::MAX {
-                base = base_level(&r.desc, first);
-            }
+            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
         }
         let texture = match texture {
             Some(texture) => Ok(texture),
@@ -4665,6 +4726,49 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn over_cap_tracks_vram_pressure_and_explicit_max() {
+        let mut t4k = texture(4096, 4096, 98, 1);
+        t4k.mip_levels = 13;
+        let mut t2k = texture(2048, 512, 98, 1);
+        t2k.mip_levels = 12;
+        let mut t1k = texture(1024, 1024, 98, 1);
+        t1k.mip_levels = 11;
+        let mut t256 = texture(256, 256, 98, 1);
+        t256.mip_levels = 9;
+
+        // Below 92 %: cap at 1024.
+        assert_eq!(over_cap_for(&t4k, None, 0), 2);
+        assert_eq!(over_cap_for(&t4k, None, 91), 2);
+        assert_eq!(over_cap_for(&t2k, None, 80), 1);
+        assert_eq!(over_cap_for(&t1k, None, 91), 0);
+
+        // 92..97 %: cap at 512.
+        assert_eq!(over_cap_for(&t4k, None, 92), 3);
+        assert_eq!(over_cap_for(&t4k, None, 96), 3);
+        assert_eq!(over_cap_for(&t1k, None, 92), 1);
+        assert_eq!(over_cap_for(&t256, None, 96), 0);
+
+        // 97 %+: cap at 256.
+        assert_eq!(over_cap_for(&t4k, None, 97), 4);
+        assert_eq!(over_cap_for(&t4k, None, 100), 4);
+        assert_eq!(over_cap_for(&t1k, None, 97), 2);
+        assert_eq!(over_cap_for(&t256, None, 100), 0);
+
+        // Explicit VICTORY_TEXTURE_MAX overrides VRAM pressure; 0 disables cap.
+        assert_eq!(over_cap_for(&t4k, Some(0), 100), 0);
+        assert_eq!(over_cap_for(&t4k, Some(2048), 99), 1);
+        assert_eq!(over_cap_for(&t4k, Some(512), 10), 3);
+        assert_eq!(over_cap_for(&t4k, Some(4096), 99), 0);
+
+        // Never skips past the last available mip.
+        let mut few_mips = texture(4096, 4096, 98, 1);
+        few_mips.mip_levels = 2;
+        assert_eq!(over_cap_for(&few_mips, None, 99), 1);
+        few_mips.mip_levels = 1;
+        assert_eq!(over_cap_for(&few_mips, None, 99), 0);
     }
 
     #[test]

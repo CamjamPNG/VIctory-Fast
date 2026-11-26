@@ -400,6 +400,96 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     }
 }
 
+/// System-RAM pressure band for optional caches. Resident working set and
+/// private bytes describe this process; free physical and commit headroom
+/// guard the PC and other processes. Windows API queries never change the
+/// pagefile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RamBand {
+    Calm,
+    Watch,
+    High,
+}
+
+/// Band for one sample. Entering Watch or High needs a higher watermark than
+/// leaving it, so a value near a threshold does not toggle the policy every
+/// sample.
+pub(crate) fn ram_band(
+    previous: RamBand,
+    working: u64,
+    private: u64,
+    free_physical: u64,
+    commit_headroom: u64,
+    total_physical: u64,
+    commit_limit: u64,
+) -> RamBand {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    // Fractions of the machine, so a 64 GB host is not treated like the
+    // 32 GB one. The free and headroom floors stay absolute: pressure is
+    // pressure however big the machine is.
+    let high = private * 5 >= commit_limit * 4
+        || working * 2 >= total_physical
+        || free_physical < 2 * GIB
+        || commit_headroom < GIB;
+    let watch = private * 10 >= commit_limit * 7
+        || working * 4 >= total_physical
+        || free_physical < 4 * GIB
+        || commit_headroom < 2 * GIB;
+    let wanted = if high {
+        RamBand::High
+    } else if watch {
+        RamBand::Watch
+    } else {
+        RamBand::Calm
+    };
+    let safe_high = private * 20 <= commit_limit * 13
+        && working * 4 <= total_physical
+        && free_physical >= 4 * GIB
+        && commit_headroom >= 3 * GIB;
+    let safe_watch = private * 5 <= commit_limit * 3
+        && working * 5 <= total_physical
+        && free_physical >= 6 * GIB
+        && commit_headroom >= 3 * GIB;
+    match (previous, wanted) {
+        (RamBand::High, RamBand::Calm) if !safe_high => RamBand::Watch,
+        (RamBand::Watch, RamBand::Calm) if !safe_watch => RamBand::Watch,
+        _ => wanted,
+    }
+}
+
+/// The six numbers [`ram_band`] needs, from Windows. `None` if a query fails,
+/// so a caller can keep its old band instead of guessing.
+#[cfg(windows)]
+pub(crate) fn ram_sample() -> Option<(u64, u64, u64, u64, u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: plain data the call fills in.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return None;
+    }
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } == 0 {
+        return None;
+    }
+    Some((
+        c.WorkingSetSize as u64,
+        c.PagefileUsage as u64,
+        m.ullAvailPhys,
+        m.ullAvailPageFile,
+        m.ullTotalPhys,
+        m.ullTotalPageFile,
+    ))
+}
+
 /// How many references are held on a host object (its COM count): ours
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it
@@ -444,6 +534,8 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
+    crate::list::trim_idle();
+    trim_idle_preludes();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -500,6 +592,21 @@ fn bury_lag() -> u64 {
         let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
         std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     })
+}
+
+/// How many fence-completed flights remain buffered in `line.landed` before
+/// their `HostList`s are reset and recycled. Shrinks under RAM pressure so
+/// finished command allocators are reused or freed instead of forcing new ones.
+fn land_lag(base_lag: usize, private_bytes: u64, pressured: bool, critical: bool) -> usize {
+    const HIGH_PRIVATE: u64 = 18 << 30;
+    const WATCH_PRIVATE: u64 = 14 << 30;
+    if critical || private_bytes >= HIGH_PRIVATE {
+        0
+    } else if pressured || private_bytes >= WATCH_PRIVATE {
+        (base_lag / 4).min(4)
+    } else {
+        base_lag
+    }
 }
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
@@ -768,9 +875,154 @@ pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync:
 /// makes at its start).
 pub(crate) static LISTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// The process's private bytes (diagnostics: around the making of lists).
-#[cfg(feature = "diagnostics")]
-fn private_bytes() -> u64 {
+/// Live preludes owned by `HostList`s and `IDLE_PRELUDES`, and those currently
+/// sitting idle in `IDLE_PRELUDES`.
+static PRELUDES_LIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PRELUDES_POOLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A prelude whose lifetime is tracked in [`PRELUDES_LIVE`].
+struct TrackedPrelude(Prelude);
+
+// SAFETY: D3D12 command allocators and command lists are free-threaded; a
+// pooled prelude is never touched while executing.
+unsafe impl Send for TrackedPrelude {}
+
+impl TrackedPrelude {
+    fn new(prelude: Prelude) -> Self {
+        PRELUDES_LIVE.fetch_add(1, Ordering::Relaxed);
+        Self(prelude)
+    }
+}
+
+impl Drop for TrackedPrelude {
+    fn drop(&mut self) {
+        PRELUDES_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Fence-completed preludes reset and kept for reuse across all `HostList`s.
+static IDLE_PRELUDES: Mutex<Vec<TrackedPrelude>> = Mutex::new(Vec::new());
+
+/// Computes pressure-adjusted `(idle_lists, idle_preludes)` caps from configured
+/// base caps, current process private commit, and host RAM pressure flags.
+pub(crate) fn allocator_pool_caps(
+    base_lists: usize,
+    base_preludes: usize,
+    private_bytes: u64,
+    pressured: bool,
+    critical: bool,
+) -> (usize, usize) {
+    const WATCH_PRIVATE: u64 = 14 << 30;
+    const HIGH_PRIVATE: u64 = 18 << 30;
+    if critical || private_bytes >= HIGH_PRIVATE {
+        ((base_lists / 4).min(32), (base_preludes / 4).min(16))
+    } else if pressured || private_bytes >= WATCH_PRIVATE {
+        ((base_lists / 2).min(64), (base_preludes / 2).min(32))
+    } else {
+        (base_lists, base_preludes)
+    }
+}
+
+fn resolve_base_allocator_caps(
+    alloc_env: Option<&str>,
+    prelude_env: Option<&str>,
+    limited_ram: bool,
+) -> (usize, usize) {
+    let default_lists = if limited_ram { 128 } else { 256 };
+    let lists = alloc_env
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default_lists);
+    let default_preludes = if alloc_env.is_some() {
+        (lists / 2).max(16).min(lists)
+    } else if limited_ram {
+        64
+    } else {
+        128
+    };
+    let preludes = prelude_env
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(default_preludes);
+    (lists, preludes)
+}
+
+fn base_allocator_caps() -> (usize, usize) {
+    static CAPS: OnceLock<(usize, usize)> = OnceLock::new();
+    *CAPS.get_or_init(|| {
+        let alloc_env = std::env::var("VICTORY_ALLOCATOR_CAP").ok();
+        let prelude_env = std::env::var("VICTORY_PRELUDE_CAP").ok();
+        resolve_base_allocator_caps(
+            alloc_env.as_deref(),
+            prelude_env.as_deref(),
+            crate::residency::limited_host_ram(),
+        )
+    })
+}
+
+/// Current idle pool caps `(host_lists, preludes)` after RAM pressure scaling.
+pub(crate) fn current_allocator_caps() -> (usize, usize) {
+    let (base_lists, base_preludes) = base_allocator_caps();
+    allocator_pool_caps(
+        base_lists,
+        base_preludes,
+        process_private_bytes(),
+        crate::residency::pressured(),
+        crate::residency::critical_commit(),
+    )
+}
+
+/// Live and pooled allocator counts: `(lists_live, lists_pooled, preludes_live, preludes_pooled)`.
+pub(crate) fn allocator_counts() -> (u64, u64, u64, u64) {
+    (
+        ALIVE[0].load(Ordering::Relaxed),
+        crate::list::idle_count(),
+        PRELUDES_LIVE.load(Ordering::Relaxed),
+        PRELUDES_POOLED.load(Ordering::Relaxed),
+    )
+}
+
+/// Returns a fence-completed prelude to the global pool up to its cap, or drops
+/// it outside the lock so the driver frees its command-allocator commit.
+fn recycle_prelude(prelude: TrackedPrelude) {
+    let cap = current_allocator_caps().1;
+    if cap == 0 || PRELUDES_POOLED.load(Ordering::Relaxed) >= cap as u64 {
+        drop(prelude);
+        return;
+    }
+    // SAFETY: called only after the submission that ran this prelude has completed.
+    if unsafe { prelude.0.0.Reset() }.is_err() {
+        drop(prelude);
+        return;
+    }
+    let excess = {
+        let mut pool = IDLE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < cap {
+            pool.push(prelude);
+            PRELUDES_POOLED.store(pool.len() as u64, Ordering::Relaxed);
+            None
+        } else {
+            Some(prelude)
+        }
+    };
+    drop(excess);
+}
+
+/// Drops excess idle preludes past the current pressure-adjusted cap.
+fn trim_idle_preludes() {
+    let cap = current_allocator_caps().1;
+    let dropped: Vec<TrackedPrelude> = {
+        let mut pool = IDLE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() <= cap {
+            return;
+        }
+        let excess = pool.drain(cap..).collect();
+        PRELUDES_POOLED.store(pool.len() as u64, Ordering::Relaxed);
+        excess
+    };
+    drop(dropped);
+}
+
+/// Process memory counters: `(working_set_bytes, private_commit_bytes, page_fault_count)`.
+pub(crate) fn process_memory_counters() -> Option<(u64, u64, u32)> {
     use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut c = PROCESS_MEMORY_COUNTERS {
@@ -778,8 +1030,59 @@ fn private_bytes() -> u64 {
         ..Default::default()
     };
     // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-    c.PagefileUsage as u64
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } == 0 {
+        return None;
+    }
+    Some((c.WorkingSetSize as u64, c.PagefileUsage as u64, c.PageFaultCount))
+}
+
+/// 32-bit wraparound-safe delta of `PROCESS_MEMORY_COUNTERS::PageFaultCount`.
+pub(crate) fn page_fault_delta(prev: u32, now: u32) -> u64 {
+    u64::from(now.wrapping_sub(prev))
+}
+
+/// The process's private committed bytes (`PagefileUsage`).
+pub(crate) fn process_private_bytes() -> u64 {
+    process_memory_counters().map_or(0, |(_, private, _)| private)
+}
+
+/// Periodic RAM, DXGI local/shared VRAM, allocator pool, and OS page-fault
+/// summary emitted in both release and diagnostics builds.
+fn memory_summary_line(frames: f64) {
+    let mb = |v: u64| v as f64 / (1 << 20) as f64;
+    let (working, private, faults_now) = process_memory_counters().unwrap_or((0, 0, 0));
+    static PREV_FAULTS: AtomicU32 = AtomicU32::new(0);
+    static HAS_PREV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let faults_delta = if HAS_PREV.swap(true, Ordering::Relaxed) {
+        page_fault_delta(PREV_FAULTS.swap(faults_now, Ordering::Relaxed), faults_now)
+    } else {
+        PREV_FAULTS.store(faults_now, Ordering::Relaxed);
+        0
+    };
+    let [local_budget, local_used, shared_budget, shared_used] =
+        host().and_then(|h| h.video_memory()).unwrap_or_default();
+    let (lists_live, lists_pooled, preludes_live, preludes_pooled) = allocator_counts();
+    let frames = frames.max(1.0);
+    tracing::info!(
+        "memory summary: RAM private {:.0} MB, working set {:.0} MB; \
+         VRAM local {:.0}/{:.0} MB, SHR {:.0}/{:.0} MB; \
+         allocators: lists {lists_live} live ({lists_pooled} pooled), \
+         preludes {preludes_live} live ({preludes_pooled} pooled); \
+         OS page faults {:.1}/frame",
+        mb(private),
+        mb(working),
+        mb(local_used),
+        mb(local_budget),
+        mb(shared_used),
+        mb(shared_budget),
+        faults_delta as f64 / frames,
+    );
+}
+
+/// The process's private bytes (diagnostics: around the making of lists).
+#[cfg(feature = "diagnostics")]
+fn private_bytes() -> u64 {
+    process_private_bytes()
 }
 
 /// What the runtime does when the host GPU fails for good: report it like a
@@ -1175,9 +1478,9 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
-    /// The list that runs those transitions just before this one, made
-    /// when the list first has such transitions ([`lazy_prelude`]).
-    prelude: OnceLock<Option<Prelude>>,
+    /// The list that runs those transitions just before this one, borrowed from
+    /// [`IDLE_PRELUDES`] when needed and returned on [`HostList::reset`].
+    prelude: Mutex<Option<TrackedPrelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// What its indirect executions ran, for the report of a removed device.
@@ -3338,9 +3641,15 @@ pub(crate) fn settle_for_fence() {
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
+    let lag = land_lag(
+        bury_lag() as usize,
+        process_private_bytes(),
+        crate::residency::pressured(),
+        crate::residency::critical_commit(),
+    );
     let landed: Vec<_> = {
         let mut line = line();
-        let n = line.landed.len().saturating_sub(bury_lag() as usize);
+        let n = line.landed.len().saturating_sub(lag);
         line.landed.drain(..n).collect()
     };
     for (lists, order) in landed {
@@ -4176,6 +4485,19 @@ impl Host {
         }
     }
 
+    /// Takes a fence-completed prelude from [`IDLE_PRELUDES`] or creates a new one.
+    fn take_prelude(&self) -> Option<TrackedPrelude> {
+        let pooled = {
+            let mut pool = IDLE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+            let taken = pool.pop();
+            if taken.is_some() {
+                PRELUDES_POOLED.store(pool.len() as u64, Ordering::Relaxed);
+            }
+            taken
+        };
+        pooled.or_else(|| self.make_prelude().map(TrackedPrelude::new))
+    }
+
     fn make_list(&self) -> windows::core::Result<HostList> {
         // SAFETY: plain object creation.
         unsafe {
@@ -4188,10 +4510,7 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude = OnceLock::new();
-            if !lazy_prelude() {
-                let _ = prelude.set(self.make_prelude());
-            }
+            let prelude = Mutex::new(if !lazy_prelude() { self.take_prelude() } else { None });
             #[cfg(feature = "diagnostics")]
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
@@ -6576,6 +6895,14 @@ impl HostList {
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
     }
 
+    /// Returns any prelude held by this finished list to the global pool (or
+    /// drops it if over cap). Only call after the list's last submission finished.
+    pub(crate) fn release_prelude(&self) {
+        if let Some(prelude) = self.prelude.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            recycle_prelude(prelude);
+        }
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -6584,6 +6911,7 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        self.release_prelude();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6980,11 +7308,11 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        let mut guard = self.prelude.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = host().and_then(|h| h.take_prelude());
+        }
+        let Some(TrackedPrelude((allocator, list))) = guard.as_ref() else {
             fail(format_args!("no host list for a state prelude"));
         };
         // SAFETY: the prelude is not executing (every submission is waited
@@ -9653,6 +9981,7 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            memory_summary_line(frames);
             #[cfg(feature = "diagnostics")]
             {
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -10381,6 +10710,32 @@ impl Host {
             }
         }
     }
+
+    /// Shared depth-twin stencil-copy scratch buffer of at least `size` bytes,
+    /// one per power-of-two class (>= 64 KiB). Safe to share across twins
+    /// because every copy in [`record_twin_copy`] begins and ends in `COMMON`
+    /// on the single direct queue.
+    pub(crate) fn shared_twin_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        struct TwinScratch(Vec<(u64, ID3D12Resource)>);
+        // SAFETY: D3D12 resources are free-threaded.
+        unsafe impl Send for TwinScratch {}
+        static SCRATCH: Mutex<TwinScratch> = Mutex::new(TwinScratch(Vec::new()));
+
+        let class = twin_scratch_class(size);
+        let mut all = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
+            return Some(buffer.clone());
+        }
+        let buffer = self.uav_buffer(class)?;
+        name(&buffer, || format!("depth twin copies {class:#x}"));
+        all.0.push((class, buffer.clone()));
+        Some(buffer)
+    }
+}
+
+/// Power-of-two size class (>= 64 KiB) for shared depth-twin copy scratch buffers.
+fn twin_scratch_class(size: u64) -> u64 {
+    size.max(1 << 16).checked_next_power_of_two().unwrap_or(size.max(1 << 16))
 }
 
 /// For adapters without device-removed data (the software one): the last
@@ -11300,8 +11655,56 @@ mod refresh_tests {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, RamBand, ram_band};
     use std::sync::Arc;
+
+    #[test]
+    fn ram_band_tracks_resident_and_commit_pressure() {
+        const M: u64 = 1 << 20;
+        // The measured local Series S baseline stayed calm (32 GB machine,
+        // roughly 11 GB commit limit).
+        assert_eq!(
+            ram_band(RamBand::Calm, 3857 * M, 7500 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Calm
+        );
+        // Private commit alone crosses the watch watermark.
+        assert_eq!(
+            ram_band(RamBand::Calm, 3857 * M, 8200 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Watch
+        );
+        // The measured Series X commit failure was High.
+        assert_eq!(
+            ram_band(RamBand::Calm, 4452 * M, 10191 * M, 16047 * M, 154 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::High
+        );
+    }
+
+    #[test]
+    fn ram_band_exits_only_below_lower_watermarks() {
+        const M: u64 = 1 << 20;
+        assert_eq!(
+            ram_band(RamBand::High, 4452 * M, 8900 * M, 16047 * M, 1200 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Watch,
+            "just under the entry mark does not drop straight to calm"
+        );
+        assert_eq!(
+            ram_band(RamBand::Watch, 3857 * M, 6600 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M),
+            RamBand::Calm,
+            "all lower watermarks met"
+        );
+    }
+
+    #[test]
+    fn ram_band_does_not_toggle_below_the_entry_watermark() {
+        const M: u64 = 1 << 20;
+        let mut band = RamBand::Calm;
+        for private in [7500 * M, 8200 * M, 8200 * M, 8200 * M] {
+            band = ram_band(band, 3857 * M, private, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M);
+        }
+        assert_eq!(band, RamBand::Watch);
+        band = ram_band(band, 3857 * M, 7800 * M, 15900 * M, 3962 * M, 32 * 1024 * M, 11 * 1024 * M);
+        assert_eq!(band, RamBand::Watch);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
@@ -11426,6 +11829,53 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn allocator_pool_caps_trim_under_ram_pressure() {
+        const GIB: u64 = 1 << 30;
+        // Defaults scale down on <=32 GB hosts and honor explicit env overrides.
+        assert_eq!(super::resolve_base_allocator_caps(None, None, true), (128, 64));
+        assert_eq!(super::resolve_base_allocator_caps(None, None, false), (256, 128));
+        assert_eq!(super::resolve_base_allocator_caps(Some("96"), None, true), (96, 48));
+        assert_eq!(super::resolve_base_allocator_caps(Some("96"), Some("24"), true), (96, 24));
+        assert_eq!(super::resolve_base_allocator_caps(Some("0"), None, true), (0, 0));
+
+        // Calm keeps configured caps.
+        assert_eq!(super::allocator_pool_caps(128, 64, 10 * GIB, false, false), (128, 64));
+        assert_eq!(super::allocator_pool_caps(256, 128, 13 * GIB, false, false), (256, 128));
+        // Watch / >=14 GiB private halves caps (capped at 64/32).
+        assert_eq!(super::allocator_pool_caps(128, 64, 14 * GIB, false, false), (64, 32));
+        assert_eq!(super::allocator_pool_caps(256, 128, 8 * GIB, true, false), (64, 32));
+        // Critical / >=18 GiB private trims aggressively (capped at 32/16).
+        assert_eq!(super::allocator_pool_caps(128, 64, 18 * GIB, false, false), (32, 16));
+        assert_eq!(super::allocator_pool_caps(256, 128, 8 * GIB, true, true), (32, 16));
+        // Respects smaller explicit caps.
+        assert_eq!(super::allocator_pool_caps(40, 20, 18 * GIB, false, false), (10, 5));
+
+        // Landed-flight lag shrinks to 0 under high commit so finished allocators recycle immediately.
+        assert_eq!(super::land_lag(16, 10 * GIB, false, false), 16);
+        assert_eq!(super::land_lag(16, 14 * GIB, false, false), 4);
+        assert_eq!(super::land_lag(64, 10 * GIB, true, false), 4);
+        assert_eq!(super::land_lag(16, 18 * GIB, false, false), 0);
+        assert_eq!(super::land_lag(16, 10 * GIB, false, true), 0);
+    }
+
+    #[test]
+    fn twin_scratch_class_rounds_up_to_power_of_two_with_64k_floor() {
+        assert_eq!(super::twin_scratch_class(0), 1 << 16);
+        assert_eq!(super::twin_scratch_class(1), 1 << 16);
+        assert_eq!(super::twin_scratch_class(1 << 16), 1 << 16);
+        assert_eq!(super::twin_scratch_class((1 << 16) + 1), 1 << 17);
+        assert_eq!(super::twin_scratch_class(3 << 20), 4 << 20);
+        assert_eq!(super::twin_scratch_class(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn page_fault_delta_handles_normal_and_u32_wraparound() {
+        assert_eq!(super::page_fault_delta(100, 100), 0);
+        assert_eq!(super::page_fault_delta(100, 250), 150);
+        assert_eq!(super::page_fault_delta(u32::MAX - 9, 5), 15);
     }
 }
 

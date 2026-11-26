@@ -235,15 +235,38 @@ unsafe impl Send for Idle {}
 /// made 21.2 ms" a frame, and the graphics kernel's time to free them).
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
-
-/// The most host lists kept idle (128 were too few: flights land several at
-/// a time, so lists were thrown away and others made in the same frame, with
-/// their preludes and buffers, 12 % of the submitting thread in the opening,
-/// profile cpu-1), and the most upload memory they may keep
-/// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+static IDLE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Maximum upload scratch bytes idle host lists may keep between them when
+/// scratch chunks are not pooled (`VICTORY_SCRATCH_POOL=0`).
+#[cfg(windows)]
+const IDLE_BYTES_MOST: u64 = 128 << 20;
+
+/// Number of idle `HostList`s currently pooled for reuse.
+#[cfg(windows)]
+pub(crate) fn idle_count() -> u64 {
+    IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Drops excess idle `HostList`s past the current pressure-adjusted cap
+/// outside the pool lock so the driver frees their command-allocator commit.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let cap = crate::host::current_allocator_caps().0;
+    let dropped: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.0.len() <= cap {
+            return;
+        }
+        let excess: Vec<Idle> = idle.0.drain(cap..).collect();
+        let freed_bytes: u64 = excess.iter().map(|Idle(_, b)| *b).sum();
+        idle.1 = idle.1.saturating_sub(freed_bytes);
+        IDLE_COUNT.store(idle.0.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        excess
+    };
+    drop(dropped);
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -261,7 +284,8 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
         if let Some(Idle(_, bytes)) = &taken {
-            idle.1 -= bytes;
+            idle.1 = idle.1.saturating_sub(*bytes);
+            IDLE_COUNT.store(idle.0.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         taken
     };
@@ -274,28 +298,44 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
 /// The host sides of lists whose submission has run (submissions are
 /// waited for; `ran` names the ones it ran, by their place in `lists`):
 /// what they held is let go, as before, and the host lists are reset and
-/// kept for [`fresh_list`].
+/// kept for [`fresh_list`] up to the current pressure-adjusted cap.
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let cap = crate::host::current_allocator_caps().0;
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i)
+            || cap == 0
+            || IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= cap as u64
+        {
+            host.release_prelude();
             continue;
         }
         // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
+        // goes (including returning its prelude to the prelude pool), its
+        // allocator stays for reuse.
         host.reset();
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
-        }
+        let excess = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            if idle.0.len() < cap && idle.1 + bytes <= IDLE_BYTES_MOST {
+                idle.0.push(Idle(host, bytes));
+                idle.1 += bytes;
+                IDLE_COUNT.store(idle.0.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                None
+            } else {
+                Some(host)
+            }
+        };
+        drop(excess);
+    }
+    if IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) > cap as u64 {
+        trim_idle();
     }
 }
 
@@ -408,16 +448,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
+        // into it until the title resets it (which lazily takes a fresh list).
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = list.host.take() else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -480,17 +514,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
-        // into it until the title resets it.
+        // into it until the title resets it (which lazily takes a fresh list).
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (*list).host.take() else {
                 continue;
             };
             let uploads =
@@ -611,13 +639,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
-            }
-        }),
+        host: (!thin).then(fresh_list).flatten(),
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -684,17 +706,27 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     // (a submission takes the parts it runs).
     #[cfg(windows)]
     {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
         // SAFETY: the title passes one of our lists, and neither records
         // into it nor submits it during its reset.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        if let Some(host) = list.host.as_ref() {
+            host.reset();
+        } else if !thin::on() {
+            list.host = fresh_list();
+        }
+        if list.host.is_some() {
+            list.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset(pipeline);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::recorded(started);
+        }
     }
-    #[cfg(windows)]
-    with_state(this, |host, state| {
-        host.reset();
-        state.reset(pipeline);
-    });
     crate::pipeline::bound(pipeline);
     #[cfg(not(windows))]
     let _ = this;

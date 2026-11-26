@@ -459,6 +459,23 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     }
 }
 
+/// Whether textures of 64 KiB and less are placed at multiples of 4 KiB in
+/// their block, where the host allows it (`VICTORY_POOL_SMALL=1`; otherwise
+/// at multiples of 64 KiB, as every other texture).
+fn small_placement() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_POOL_SMALL") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_SMALL").is_some_and(|v| v != "0"))
+}
+
+/// Requested placement alignment for pooled textures.
+fn texture_alignment(small: bool) -> u64 {
+    if small { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 }
+}
+
 /// Textures made in the last second ([`fresh`]), and when.
 static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
 
@@ -508,10 +525,11 @@ pub(crate) unsafe fn texture(
         return None;
     }
     // Small textures lie at multiples of 4 KiB where the host allows it
-    // (the top mip is 64 KiB at most): 64 KiB each otherwise.
+    // (the top mip is 64 KiB at most) and [`small_placement`] says so: 64 KiB
+    // each otherwise.
     // SAFETY: the caller's description.
     let mut d = unsafe { *desc };
-    d.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+    d.Alignment = texture_alignment(small_placement());
     // SAFETY: plain queries.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
     if info.SizeInBytes == u64::MAX || info.Alignment != d.Alignment {
@@ -582,6 +600,59 @@ pub(crate) unsafe fn texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_placement_alignment_defaults_to_64k() {
+        assert_eq!(texture_alignment(false), 0);
+        assert_eq!(texture_alignment(true), u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT));
+    }
+
+    /// What the pool's letting go of a block relies on: a texture placed in
+    /// a heap holds a reference to it (the heap lives while the texture does,
+    /// whatever the pool drops).
+    #[test]
+    fn a_placed_texture_holds_its_heap() {
+        let Some(host) = crate::host::host() else { return };
+        let desc = D3D12_HEAP_DESC {
+            SizeInBytes: 1 << 20,
+            Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            Alignment: 0,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: plain creation.
+        unsafe { host.device.CreateHeap(&desc, &mut heap) }.unwrap();
+        let heap = heap.unwrap();
+        let before = crate::host::references(&heap);
+        let texture_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: a live heap, a valid description.
+        unsafe {
+            host.device.CreatePlacedResource(
+                &heap,
+                0,
+                &texture_desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut made,
+            )
+        }
+        .unwrap();
+        let made = made.unwrap();
+        let held = crate::host::references(&heap);
+        assert!(held > before, "a placed texture holds no reference to its heap");
+        drop(made);
+        assert_eq!(crate::host::references(&heap), before);
+    }
 
     #[test]
     fn ranges_are_cut_aligned_and_join_again() {

@@ -707,11 +707,29 @@ const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
 
+fn default_runs_most(limited_ram: bool) -> usize {
+    if limited_ram { 32 } else { 64 }
+}
+
+fn effective_runs_most(configured: usize, pressured: bool, critical: bool) -> usize {
+    if critical {
+        configured.min(8).max(1)
+    } else if pressured {
+        configured.min(16).max(1)
+    } else {
+        configured.max(1)
+    }
+}
+
 /// How many submissions may be in the line when a submit call returns
-/// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
+/// (`VICTORY_SUBMIT_DEPTH`; defaults to 32 on <=32 GB RAM hosts, 64 otherwise).
 fn runs_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_DEPTH").unwrap_or(64).max(1))
+    *MOST.get_or_init(|| {
+        number("VICTORY_SUBMIT_DEPTH")
+            .unwrap_or_else(|| default_runs_most(crate::residency::limited_host_ram()))
+            .max(1)
+    })
 }
 
 /// How many presents may be in the line when a present call returns
@@ -848,10 +866,15 @@ pub(super) fn submit(this: This, lists: &[This]) {
 
 /// Waits for room in the line, with `queued` submissions in it.
 fn room(queued: u64) {
-    if queued > runs_most() as u64 {
+    let limit = effective_runs_most(
+        runs_most(),
+        crate::residency::pressured(),
+        crate::residency::critical_commit(),
+    );
+    if queued > limit as u64 {
         let began = Instant::now();
         let _waiting = crate::timeline::span("a submission waits for room in the line");
-        LANE.wait_runs(runs_most());
+        LANE.wait_runs(limit);
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
@@ -1235,5 +1258,15 @@ mod tests {
         while log.lock().unwrap().len() < 6 {
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn submit_depth_throttles_under_ram_pressure() {
+        assert_eq!(super::default_runs_most(true), 32);
+        assert_eq!(super::default_runs_most(false), 64);
+        assert_eq!(super::effective_runs_most(64, false, false), 64);
+        assert_eq!(super::effective_runs_most(32, true, false), 16);
+        assert_eq!(super::effective_runs_most(32, true, true), 8);
+        assert_eq!(super::effective_runs_most(4, true, true), 4);
     }
 }

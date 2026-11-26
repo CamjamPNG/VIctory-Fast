@@ -859,6 +859,33 @@ fn stale_rule() -> Rule {
     })
 }
 
+/// Appends `range` to `ranges`, coalescing adjacent/overlapping entries on
+/// overflow before ever dropping anything. Returns how many ranges were dropped
+/// (0 in normal play; if `ranges` still reaches `most` disjoint ranges after
+/// coalescing, drops only the oldest half rather than clearing the whole queue).
+fn push_remapped(ranges: &mut Vec<(u64, u64)>, (start, end): (u64, u64), most: usize) -> u64 {
+    if let Some(last) = ranges.last_mut()
+        && last.1 >= start
+        && last.0 <= end
+    {
+        last.0 = last.0.min(start);
+        last.1 = last.1.max(end);
+        return 0;
+    }
+    let mut dropped = 0u64;
+    if ranges.len() >= most {
+        join(ranges);
+        if ranges.len() >= most {
+            let keep = (most / 2).min(most.saturating_sub(1));
+            let drop = ranges.len() - keep;
+            ranges.drain(..drop);
+            dropped = drop as u64;
+        }
+    }
+    ranges.push((start, end));
+    dropped
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
 /// about to write it through the kernel (`crate::watch`): the placed
 /// textures there may have arrived, gone, or changed with no descriptor
@@ -867,28 +894,18 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
+    /// Disjoint ranges kept until a pass takes them.
+    const MOST: usize = 1 << 16;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let dropped = push_remapped(&mut ranges, (start, end), MOST);
+    if dropped > 0 {
+        STALE[2].fetch_add(dropped, Relaxed);
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -2324,7 +2341,7 @@ impl HostHeap {
             let old = view_at(shown as u32, (shown >> 32) as u32);
             let kept = old.is_some_and(|old| match kin(&old, &view) {
                 Kin::Same => true,
-                kin => kin.kept(keep_shown()),
+                kin => crate::resource::room_lately() && kin.kept(keep_shown()),
             });
             if shown == 0 || !kept {
                 #[cfg(feature = "diagnostics")]
@@ -3523,7 +3540,7 @@ impl HostHeap {
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
                 if is_texture_view(&old) {
-                    let kept = kin.kept(keep_shown());
+                    let kept = crate::resource::room_lately() && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
                         drop(held);
@@ -4621,7 +4638,9 @@ fn make_twinned(
                 if copy.base > 0
                     && let Some(desc) = &mut desc
                 {
-                    from_base(desc, copy.base);
+                    // SAFETY: a live resource.
+                    let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+                    from_base(desc, copy.base, own_mips);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -4707,7 +4726,7 @@ fn make_twinned(
             Some(None)
         }
         View::ConsoleSampler(words) => {
-            let desc = crate::sampler::console(words);
+            let desc = console_sampler(words, aniso_point_mip(device));
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
@@ -4760,21 +4779,78 @@ fn make_twinned(
     }
 }
 
+/// Whether the host GPU filters anisotropically with point mips
+/// (`D3D12_OPTIONS19`, optional): asked once. Older runtimes do not know
+/// the query, which means no.
+fn aniso_point_mip(device: &ID3D12Device) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool()
+    })
+}
+
+/// Console sampler description for the host, keeping point mips on anisotropic
+/// samplers where the host supports it (`#2031`, matching static samplers).
+fn console_sampler(words: &[u32; 27], aniso_point_mip: bool) -> D3D12_SAMPLER_DESC {
+    let mut desc = crate::sampler::console(words);
+    let aniso = words[1] >= 2 || words[2] >= 2;
+    if aniso && aniso_point_mip && words[3] != 2 {
+        desc.Filter.0 &= !1;
+    }
+    desc
+}
+
 /// The view `desc` of a texture, of a host copy of its levels from `base`
 /// on (`crate::resource::held_only`). What it shows of larger ones, if any,
-/// is left out.
-fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32) {
-    if desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D {
-        return;
+/// is left out, and the shifted range is clamped to `own_mips`.
+fn from_base(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, base: u32, own_mips: u32) {
+    let clamp_mips = |most: &mut u32, levels: &mut u32, lod: &mut f32| {
+        let lost = base.saturating_sub(*most);
+        *most = most.saturating_sub(base);
+        if own_mips > 0 {
+            *most = (*most).min(own_mips - 1);
+        }
+        if *levels != u32::MAX {
+            *levels = levels.saturating_sub(lost).max(1);
+            if own_mips > 0 {
+                *levels = (*levels).min(own_mips.saturating_sub(*most)).max(1);
+            }
+        }
+        *lod = (*lod - base as f32).max(0.0);
+    };
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: the member its dimension says.
+            let t = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            clamp_mips(&mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+        }
+        _ => {}
     }
-    // SAFETY: the member its dimension says.
-    let t = unsafe { &mut desc.Anonymous.Texture2D };
-    let lost = base.saturating_sub(t.MostDetailedMip);
-    t.MostDetailedMip = t.MostDetailedMip.saturating_sub(base);
-    if t.MipLevels != u32::MAX {
-        t.MipLevels = t.MipLevels.saturating_sub(lost).max(1);
-    }
-    t.ResourceMinLODClamp = (t.ResourceMinLODClamp - base as f32).max(0.0);
 }
 
 /// Writes of a slot with another view of the placed texture it showed,
@@ -5288,21 +5364,94 @@ mod tests {
     }
 
     /// A view of a host copy that begins at a later level shows the same
-    /// levels of it.
+    /// levels of it, across 2D, 2DArray, and Cube views, clamped to `own_mips`.
     #[test]
     fn views_count_from_the_first_level_of_the_host_copy() {
-        let view = |first, levels, clamp| {
+        let view = |first, levels, clamp, own_mips| {
             let mut desc = srv_desc(&[98, 4, 5768, 0, first, levels, 0, 0, 0, 0]);
             desc.Anonymous.Texture2D.ResourceMinLODClamp = clamp;
-            from_base(&mut desc, 3);
+            from_base(&mut desc, 3, own_mips);
             // SAFETY: the member its dimension says.
             let t = unsafe { desc.Anonymous.Texture2D };
             (t.MostDetailedMip, t.MipLevels, t.ResourceMinLODClamp)
         };
-        assert_eq!(view(3, 4, 0.0), (0, 4, 0.0));
-        assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
+        assert_eq!(view(3, 4, 0.0, 10), (0, 4, 0.0));
+        assert_eq!(view(5, u32::MAX, 5.5, 10), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
-        assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+        assert_eq!(view(1, 4, 0.0, 10), (0, 2, 0.0));
+        // Clamps MostDetailedMip and MipLevels to `own_mips`.
+        assert_eq!(view(9, 4, 0.0, 4), (3, 1, 0.0));
+        assert_eq!(view(4, 8, 0.0, 4), (1, 3, 0.0));
+
+        // 2DArray (dimension 5) and Cube (dimension 9) shift & clamp identically.
+        let mut array = srv_desc(&[98, 5, 5768, 0, 4, 6, 0, 2, 0, 0]);
+        array.Anonymous.Texture2DArray.ResourceMinLODClamp = 4.5;
+        from_base(&mut array, 3, 4);
+        // SAFETY: the member its dimension says.
+        let ta = unsafe { array.Anonymous.Texture2DArray };
+        assert_eq!((ta.MostDetailedMip, ta.MipLevels, ta.ResourceMinLODClamp), (1, 3, 1.5));
+
+        let mut cube = srv_desc(&[98, 9, 5768, 0, 2, 6, 0, 0, 0, 0]);
+        cube.Anonymous.TextureCube.ResourceMinLODClamp = 3.25;
+        from_base(&mut cube, 3, 4);
+        // SAFETY: the member its dimension says.
+        let tc = unsafe { cube.Anonymous.TextureCube };
+        assert_eq!((tc.MostDetailedMip, tc.MipLevels, tc.ResourceMinLODClamp), (0, 4, 0.25));
+    }
+
+    #[test]
+    fn remapped_coalesces_before_dropping_and_never_clears_all() {
+        // Interleaved multi-threaded adjacent ranges coalesce with 0 drops.
+        let mut ranges = Vec::new();
+        let mut dropped = 0;
+        for i in 0..16u64 {
+            dropped += push_remapped(&mut ranges, (i * 0x1000, (i + 1) * 0x1000), 8);
+            dropped += push_remapped(&mut ranges, (0x10_0000 + i * 0x1000, 0x10_0000 + (i + 1) * 0x1000), 8);
+        }
+        assert_eq!(dropped, 0);
+        join(&mut ranges);
+        assert_eq!(ranges, vec![(0, 0x1_0000), (0x10_0000, 0x11_0000)]);
+
+        // Truly disjoint overflow keeps half + newest instead of clearing all.
+        let mut disjoint = Vec::new();
+        let mut total_dropped = 0;
+        for i in 0..10u64 {
+            total_dropped += push_remapped(&mut disjoint, (i * 0x10_0000, i * 0x10_0000 + 0x1000), 8);
+        }
+        assert_eq!(total_dropped, 4);
+        assert_eq!(disjoint.len(), 6);
+        assert_eq!(disjoint.last().copied(), Some((9 * 0x10_0000, 9 * 0x10_0000 + 0x1000)));
+    }
+
+    #[test]
+    fn anisotropic_samplers_keep_point_mips_where_the_host_can() {
+        let mut w = [0u32; 27];
+        w[1] = 3; // anisotropic bilinear magnification
+        w[2] = 3; // and minification
+        w[13] = 8;
+        for (mip, supported, filter) in [
+            (1, true, 0x54),
+            (1, false, 0x55),
+            (2, true, 0x55),
+            (2, false, 0x55),
+            (0, true, 0x54),
+        ] {
+            w[3] = mip;
+            let d = console_sampler(&w, supported);
+            assert_eq!(d.Filter.0, filter, "mip {mip}, supported {supported}");
+            assert_eq!(d.MaxAnisotropy, 8);
+        }
+        w[3] = 1;
+        w[16] = 4; // comparison
+        assert_eq!(console_sampler(&w, true).Filter.0, 0xd4);
+        assert_eq!(console_sampler(&w, false).Filter.0, 0xd5);
+        w[16] = 0;
+        w[5] = 2; // maximum reduction
+        assert_eq!(console_sampler(&w, true).Filter.0, 0x1d4);
+        assert_eq!(console_sampler(&w, false).Filter.0, 0x1d5);
+        w[5] = 1; // minimum reduction
+        assert_eq!(console_sampler(&w, true).Filter.0, 0x154);
+        assert_eq!(console_sampler(&w, false).Filter.0, 0x155);
     }
 
     /// 2D textures and arrays have a neutral stand-in, others a null view.

@@ -769,8 +769,7 @@ fn log_memory() {
          host copies the host renders to or writes: {} alive {:.0} MB; host copies the title \
          fills: {} alive {:.0} MB ({} of them placed), {} let go {:.0} MB and {} made again \
          {:.0} MB since the start; {} host copies made in all; passes that made none for lack of \
-         room: {}; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
-         shared with it in use",
+         room: {}; the card: local {:.0}/{:.0} MB, SHR {:.0}/{:.0} MB",
         census[2],
         mb(census[3]),
         census[0],
@@ -787,6 +786,7 @@ fn log_memory() {
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),
+        mb(card[2]),
     );
     {
         let [textures, staging] = crate::pool::memory();
@@ -896,11 +896,13 @@ fn log_memory() {
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.
     let lists: Vec<u64> = crate::host::LISTS.iter().map(|l| l.load(Relaxed)).collect();
+    let (lists_live, lists_pooled, preludes_live, preludes_pooled) = crate::host::allocator_counts();
     tracing::info!(
         "memory, more: views named whole in their records since the start: {} constant buffer \
          views, {} views of placed memory; of the view table's entries {} are constant buffer \
          views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
-         made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
+         made by the host ({lists_live} live, {lists_pooled} pooled), {} preludes made for them \
+         ({preludes_live} live, {preludes_pooled} pooled), private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
          them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
@@ -1118,18 +1120,8 @@ pub(crate) fn presented() {
     SUBMITTED_SINCE.store(false, Relaxed);
 }
 
-fn page_faults() -> u64 {
-    use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
-    };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let mut c = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
-    u64::from(c.PageFaultCount)
+fn page_faults() -> u32 {
+    crate::host::process_memory_counters().map_or(0, |(_, _, faults)| faults)
 }
 
 /// Logs the counters per frame, and the ranges that took most bytes. The
@@ -1140,9 +1132,9 @@ fn page_faults() -> u64 {
 pub(crate) fn log(frames: f64) {
     let counted = taken(C::Frames as usize);
     let frames = if counted > 0 { counted as f64 } else { frames };
-    static FAULTS: AtomicU64 = AtomicU64::new(0);
-    let faults = page_faults();
-    let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
+    static FAULTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let faults_now = page_faults();
+    let faults = crate::host::page_fault_delta(FAULTS.swap(faults_now, Relaxed), faults_now);
     let c: Vec<f64> = (0..COUNTERS).map(|i| taken(i) as f64 / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;

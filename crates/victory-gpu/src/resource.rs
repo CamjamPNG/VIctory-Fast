@@ -1282,8 +1282,14 @@ fn video_memory_percent() -> u64 {
     }
     let pct = crate::host::host()
         .and_then(|h| h.video_memory())
-        .and_then(|[budget, used, ..]| {
-            (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64)
+        .and_then(|[budget, used, _shared_budget, shared_used]| {
+            (budget > 0).then(|| {
+                let local_pct = (u128::from(used) * 100) / u128::from(budget);
+                // Count shared VRAM spill above 2 GiB as pressure so over_cap
+                // steps down before WDDM migrates textures into system RAM.
+                let spill_boost = u128::from(shared_used.saturating_sub(2 << 30) >> 28);
+                local_pct.saturating_add(spill_boost).min(255) as u64
+            })
         })
         .unwrap_or(0);
     LAST.store((tenth << 8) | pct, Relaxed);
@@ -1878,7 +1884,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(84, |percent| percent.clamp(50, 97))
     })
 }
 

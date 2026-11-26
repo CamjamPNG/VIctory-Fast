@@ -2739,10 +2739,6 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let rest = rest();
     if port_guard() {
-        // (Renderer port #6: known for a view from now on.)
-        if !VIEWS.all(first, last) {
-            (first..last).for_each(|block| VIEWS.set(block));
-        }
         return Some(guard_shared(first, last, &came, rest));
     }
     let mut g = guards_timed();
@@ -2823,6 +2819,11 @@ fn guard_shared(first: usize, last: usize, came: &[(usize, bool)], rest: std::ti
     }
     port6_count(P6_GUARDS, 1);
     let g = guards_timed_shared();
+    // Set VIEWS while holding GUARDS.read() (before left_alone/is_changing)
+    // so concurrent title_memory_unmapping never misses this guard attempt.
+    if !VIEWS.all(first, last) {
+        (first..last).for_each(|block| VIEWS.set(block));
+    }
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
     let mut written = Vec::new();
@@ -3080,8 +3081,24 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         g.protected.insert_all(from..to);
         g.clean.insert_all(from..to);
     };
-    // Ahead of the protection (`PROTECTED`).
+    // Ahead of the protection (`PROTECTED`), then re-check `is_changing`
+    // (SeqCst Dekker pair with `title_memory_unmapping`) so we never call
+    // `VirtualProtect` concurrently with an active unmap/remap under GUARDS.read().
     (from..to).for_each(|block| PROTECTED.set(block));
+    if CHANGING_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+        && (from..to).any(is_changing)
+    {
+        for block in from..to {
+            if is_changing(block) {
+                PROTECTED.clear(block);
+            } else if set(block, block + 1) {
+                note(g, block, block + 1);
+            } else {
+                PROTECTED.clear(block);
+            }
+        }
+        return;
+    }
     if set(from, to) {
         note(g, from, to);
         return;
@@ -3240,23 +3257,56 @@ fn unguard(g: &Guards, blocks: &[usize]) {
             unguard_one(start);
             continue;
         }
-        let mut old = 0;
-        // SAFETY: contiguous blocks we made read-only.
-        let done = unsafe {
-            VirtualProtect((start * BLOCK) as *const _, (end - start) * BLOCK, PAGE_READWRITE, &mut old) != 0
-        };
-        if done && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
-            for block in start..end {
-                PROTECTED.clear(block);
+        // Only batch VirtualProtect across homogeneous committed RO/RW regions
+        // returned by VirtualQuery so mixed protections (e.g. PAGE_EXECUTE_READ)
+        // are never overwritten or mis-restored.
+        let mut cur = start;
+        while cur < end {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
+            };
+            // SAFETY: plain data filled in by VirtualQuery.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid out pointer of the right size.
+            let n = unsafe { VirtualQuery((cur * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+            if n != 0
+                && info.State == MEM_COMMIT
+                && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
+            {
+                let until = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).min(end);
+                if until > cur + 1 {
+                    let mut old = 0;
+                    // SAFETY: homogeneous committed RO/RW run we made read-only.
+                    let done = unsafe {
+                        VirtualProtect(
+                            (cur * BLOCK) as *const _,
+                            (until - cur) * BLOCK,
+                            PAGE_READWRITE,
+                            &mut old,
+                        ) != 0
+                    };
+                    if done && matches!(old, PAGE_READONLY | PAGE_READWRITE) {
+                        for block in cur..until {
+                            PROTECTED.clear(block);
+                        }
+                        cur = until;
+                        continue;
+                    }
+                    if done {
+                        // SAFETY: restore unexpected protection before checking block by block.
+                        unsafe {
+                            VirtualProtect((cur * BLOCK) as *const _, (until - cur) * BLOCK, old, &mut old);
+                        }
+                    }
+                    for block in cur..until {
+                        unguard_one(block);
+                    }
+                    cur = until;
+                    continue;
+                }
             }
-            continue;
-        }
-        if done {
-            // SAFETY: restore unexpected protection before checking block by block.
-            unsafe { VirtualProtect((start * BLOCK) as *const _, (end - start) * BLOCK, old, &mut old) };
-        }
-        for block in start..end {
-            unguard_one(block);
+            unguard_one(cur);
+            cur += 1;
         }
     }
     #[cfg(feature = "diagnostics")]

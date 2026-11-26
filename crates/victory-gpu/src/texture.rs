@@ -875,8 +875,16 @@ impl PreludeUpload {
     /// completed for this submission. Returns `Some(first_upload)` when the
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
     pub(crate) fn finish_refresh(&self) -> Option<bool> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let claimed = claim_upload(&self.staging.uploaded, &self.staging.dirty);
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        // Hold `last` while claiming `dirty` and reading `detiled` so a
+        // concurrent `refresh_ahead()` cannot overlap writing `self.data`
+        // with our prelude `CopyTextureRegion` claim.
+        let (claimed, detiled) = {
+            let _last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
+            let claimed = claim_upload(&self.staging.uploaded, &self.staging.dirty);
+            let detiled = self.staging.detiled.load(Acquire);
+            (claimed, detiled)
+        };
         let Some(first_upload) = claimed.or(self.force.then_some(false)) else {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
@@ -893,10 +901,7 @@ impl PreludeUpload {
         // give the held levels their memory on the queue before the prelude
         // copies into them; otherwise record what the host copy now holds.
         if let Some(on_demand) = &self.on_demand {
-            let waiting = on_demand.uploaded(
-                self.staging.detiled.load(Relaxed),
-                self.staging.memory as u64,
-            );
+            let waiting = on_demand.uploaded(detiled, self.staging.memory as u64);
             self.staging.waiting.store(
                 if waiting { crate::host::moment().max(1) } else { 0 },
                 Relaxed,
@@ -1585,17 +1590,16 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
-        self.dirty.store(true, std::sync::atomic::Ordering::Release);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
         let held = if self.on_demand {
-            use std::sync::atomic::Ordering::Relaxed;
+            use std::sync::atomic::Ordering::{Relaxed, Release};
             let judged = self.judgement();
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
             let held = self.held_levels(judged);
-            self.detiled.store(held, Relaxed);
+            self.detiled.store(held, Release);
             held
         } else {
             u32::MAX
@@ -1634,6 +1638,9 @@ impl Staging {
                 return;
             }
         }
+        // Publish dirty only after `detiled` and every texel in `self.data`
+        // have been written so a prelude upload never reads half-detiled bytes.
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 

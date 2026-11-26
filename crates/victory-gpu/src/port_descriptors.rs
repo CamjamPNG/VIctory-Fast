@@ -115,10 +115,30 @@ fn adopt_now(start: u64, count: u32) -> bool {
     }
     let count = count as usize;
     let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
-    // (Never freed: a store of the title's may be marking while the heap
-    // goes; a few MB at most.)
-    let slots = leak(count);
-    let chunks = leak(count.div_ceil(CHUNK));
+    // Keep leaked mark arrays monotonically non-shrinking across re-adoptions
+    // so concurrent readers observing a larger `MARKS.len` never write OOB.
+    static LEAKED: std::sync::Mutex<Option<(&'static [AtomicU8], &'static [AtomicU8])>> = std::sync::Mutex::new(None);
+    let (slots, chunks) = {
+        let mut kept = LEAKED.lock().unwrap_or_else(|e| e.into_inner());
+        let chunk_count = count.div_ceil(CHUNK);
+        match *kept {
+            Some((s, c)) if s.len() >= count && c.len() >= chunk_count => {
+                for a in &s[..count] {
+                    a.store(0, Relaxed);
+                }
+                for a in &c[..chunk_count] {
+                    a.store(0, Relaxed);
+                }
+                (&s[..count], &c[..chunk_count])
+            }
+            _ => {
+                let s = leak(count);
+                let c = leak(chunk_count);
+                *kept = Some((s, c));
+                (s, c)
+            }
+        }
+    };
     let writers: &'static [AtomicUsize] = Box::leak((0..(count * 32).div_ceil(1 << 16)).map(|_| AtomicUsize::new(0)).collect());
     MARKS.slots.store(slots.as_ptr().cast_mut(), Release);
     MARKS.chunks.store(chunks.as_ptr().cast_mut(), Release);

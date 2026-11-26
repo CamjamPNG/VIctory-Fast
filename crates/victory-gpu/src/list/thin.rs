@@ -242,6 +242,24 @@ impl Recording {
                     }
                     return;
                 };
+                if inner.back == 0
+                    && inner.chunks.is_empty()
+                    && chunk.len() == 3
+                    && chunk[0] == (RESET | (1 << 16))
+                    && chunk[2] == CLOSE
+                {
+                    let pipeline = chunk[1] as This;
+                    inner.closed = true;
+                    inner.scheduled = false;
+                    self.done.store(true, Release);
+                    self.moved.notify_all();
+                    drop(inner);
+                    crate::pipeline::bound(pipeline);
+                    give_back(vec![chunk]);
+                    STATS[2].fetch_add(1, Relaxed);
+                    crate::queue::line_moved();
+                    return;
+                }
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
                 }

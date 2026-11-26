@@ -157,12 +157,12 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if used < share(82) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    } else if used < share(90) {
+        (IDLE_MS, used - share(76))
     } else {
-        (SHORT_MS, used - share(85))
+        (SHORT_MS, used - share(76))
     }
 }
 
@@ -995,12 +995,15 @@ pub(crate) fn allocator_pool_caps(
     pressured: bool,
     critical: bool,
 ) -> (usize, usize) {
-    const WATCH_PRIVATE: u64 = 14 << 30;
-    const HIGH_PRIVATE: u64 = 18 << 30;
+    const WATCH_PRIVATE: u64 = 16 << 30;
+    const HIGH_PRIVATE: u64 = 22 << 30;
+    // Keep enough idle HostLists to cover a full gameplay frame (~90-120
+    // submitted lists) so we don't thrash allocator creation every frame,
+    // while trimming preludes aggressively (only ~16-24 live concurrently).
     if critical || private_bytes >= HIGH_PRIVATE {
-        ((base_lists / 4).min(32), (base_preludes / 4).min(16))
+        (base_lists.min(96), (base_preludes / 4).min(16))
     } else if pressured || private_bytes >= WATCH_PRIVATE {
-        ((base_lists / 2).min(64), (base_preludes / 2).min(32))
+        (base_lists.min(128), (base_preludes / 2).min(24))
     } else {
         (base_lists, base_preludes)
     }
@@ -12269,15 +12272,15 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
         // Calm keeps configured caps.
         assert_eq!(super::allocator_pool_caps(128, 64, 10 * GIB, false, false), (128, 64));
-        assert_eq!(super::allocator_pool_caps(256, 128, 13 * GIB, false, false), (256, 128));
-        // Watch / >=14 GiB private halves caps (capped at 64/32).
-        assert_eq!(super::allocator_pool_caps(128, 64, 14 * GIB, false, false), (64, 32));
-        assert_eq!(super::allocator_pool_caps(256, 128, 8 * GIB, true, false), (64, 32));
-        // Critical / >=18 GiB private trims aggressively (capped at 32/16).
-        assert_eq!(super::allocator_pool_caps(128, 64, 18 * GIB, false, false), (32, 16));
-        assert_eq!(super::allocator_pool_caps(256, 128, 8 * GIB, true, true), (32, 16));
+        assert_eq!(super::allocator_pool_caps(256, 128, 15 * GIB, false, false), (256, 128));
+        // Watch / >=16 GiB private keeps full-frame list reuse (<=128) while trimming preludes (<=24).
+        assert_eq!(super::allocator_pool_caps(128, 64, 16 * GIB, false, false), (128, 24));
+        assert_eq!(super::allocator_pool_caps(256, 128, 8 * GIB, true, false), (128, 24));
+        // Critical / >=22 GiB private trims lists to <=96 and preludes to <=16.
+        assert_eq!(super::allocator_pool_caps(128, 64, 22 * GIB, false, false), (96, 16));
+        assert_eq!(super::allocator_pool_caps(256, 128, 8 * GIB, true, true), (96, 16));
         // Respects smaller explicit caps.
-        assert_eq!(super::allocator_pool_caps(40, 20, 18 * GIB, false, false), (10, 5));
+        assert_eq!(super::allocator_pool_caps(40, 20, 22 * GIB, false, false), (40, 5));
 
         // Landed-flight lag shrinks to 0 under high commit so finished allocators recycle immediately.
         assert_eq!(super::land_lag(16, 10 * GIB, false, false), 16);

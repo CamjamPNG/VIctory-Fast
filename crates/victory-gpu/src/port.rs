@@ -116,11 +116,14 @@ pub(crate) fn wanted(at: u64, len: u64) -> bool {
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
 /// memory is one stretch of a section: a buffer placed in the region's
 /// heap. `None` leaves the caller to do what it did before.
-#[allow(dead_code)]
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if !wanted(start, len) {
         return None;
     }
+    // Hold a non-blocking mapping read lock so section handles and virtual
+    // stretches stay valid across `MapViewOfFile`, `OpenExistingHeapFromAddress1`,
+    // and `inplace::counted` without deadlocking against `title_memory_remapping`.
+    let _reading = crate::watch::title_memory_reading_now()?;
     let host = crate::host::host()?;
     match place_in(&host.device, start, len) {
         Ok(placed) => {

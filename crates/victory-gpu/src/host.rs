@@ -2682,6 +2682,9 @@ struct Sent {
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Native DXR pooled lists/scratch kept alive until the submission finishes.
     dxr: Option<crate::dxr::DxrSubmission>,
+    /// Ahead-of-submission texture upload lists (`crate::heap_worker`) kept
+    /// alive with the flight until recycled.
+    ahead: Vec<HostList>,
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -3722,6 +3725,7 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
+    crate::port_cbv::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -5215,7 +5219,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        let _ = self.submit(runs, &[], false);
+        let _ = self.submit(runs, &[], false, false);
     }
 
     /// Runs a closed internal upload-only host list synchronously without
@@ -5223,7 +5227,7 @@ impl Host {
     /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
     /// GPU work and waits for the upload list's fence before returning.
     pub(crate) fn execute_sync_internal(&self, list: &HostList) {
-        let _ = self.submit(&[list], &[], false);
+        let _ = self.submit(&[list], &[], false, false);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -5262,16 +5266,21 @@ impl Host {
         self.send_late(lists, order, parts);
     }
 
-    fn send_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+    fn send_late(&self, mut lists: Vec<crate::list::Detached>, mut order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true)
+            self.submit(&runs, parts, true, true)
         };
-        let Some((mut submitted, sent)) = sent else {
+        let Some((mut submitted, mut sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
             return;
         };
+        if !sent.ahead.is_empty() {
+            let first = lists.len();
+            order.splice(0..0, first..first + sent.ahead.len());
+            lists.extend(sent.ahead.drain(..).map(crate::list::Detached::ours));
+        }
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
@@ -5326,7 +5335,7 @@ impl Host {
     /// it ran and was waited for after all.
     fn execute_own(&self, list: &HostList) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true) else {
+        let Some((submitted, sent)) = self.submit(&[list], &[], true, false) else {
             return 0;
         };
         let number = sent.number;
@@ -5566,7 +5575,13 @@ impl Host {
     /// `parts`: the lists of `runs` at which another part begins
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
-    fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        parts: &[usize],
+        late: bool,
+        take_ahead: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5576,6 +5591,25 @@ impl Host {
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
+        // Textures uploaded ahead (`crate::heap_worker`): taken under the
+        // submission lock so no other submission can observe published slots
+        // before these upload lists execute, and prepended ahead of the
+        // title's lists (and ahead of `crate::dxr::record_submission`).
+        let (ahead_lists, ahead_publish) = if take_ahead {
+            crate::heap_worker::take_ready()
+        } else {
+            (Vec::new(), crate::heap_worker::PendingPublish::empty())
+        };
+        let runs_with_ahead: Vec<&HostList>;
+        let parts_with_ahead: Vec<usize>;
+        let (runs, parts) = if !ahead_lists.is_empty() {
+            let n = ahead_lists.len();
+            runs_with_ahead = ahead_lists.iter().chain(runs.iter().copied()).collect();
+            parts_with_ahead = parts.iter().map(|&p| p + n).collect();
+            (&runs_with_ahead[..], &parts_with_ahead[..])
+        } else {
+            (runs, parts)
+        };
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
@@ -5783,6 +5817,10 @@ impl Host {
         let heaps_began = std::time::Instant::now();
         drop(heaps_synced);
         crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        // Publish slots for the heap worker's texture uploads after
+        // placed-heap sync completes and before `make_waiting` /
+        // `dxr::record_submission` / `ExecuteCommandLists`.
+        ahead_publish.publish();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -5854,6 +5892,7 @@ impl Host {
                 texture_back_ranges,
                 writes,
                 dxr,
+                ahead: ahead_lists,
             };
             working(was_working);
             return Some((submitted, sent));
@@ -7423,6 +7462,21 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Detiles the textures the list uploads now, ahead of its submission
+    /// ([`crate::texture::Staging::refresh_ahead`]); how many were left.
+    pub(crate) fn refresh_textures_ahead(&self) -> u64 {
+        let textures: Vec<_> = self
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .collect();
+        textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
     }
 
     /// A copy source owned exclusively by this list until reset after its
@@ -9262,6 +9316,19 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        {
+            let [busy, detiling, lists, shown, again, left] = std::array::from_fn::<f64, 6, _>(|i| {
+                crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames
+            });
+            if busy > 0.0 {
+                tracing::info!(
+                    "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
+                     {lists:.1} lists, {shown:.0} slots shown, {again:.1} written again before, {left:.1} textures left to the submission",
+                    busy / 1e6,
+                    detiling / 1e6
+                );
+            }
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

@@ -956,6 +956,11 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+thread_local! {
+    /// This thread is inside [`HostHeap::publish`].
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -2678,6 +2683,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if PUBLISHING.get() {
+            return;
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -3228,6 +3236,56 @@ impl HostHeap {
         self.keep(index, holds.then(|| buffer.clone()));
     }
 
+    /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
+    /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
+    /// (title memory in place) with nothing copied: its raw twin a raw view
+    /// of those bytes, which translated shaders read; the slot itself a
+    /// constant buffer view of them where that can be (on 256 bytes), else a
+    /// null one. Whether the twin was made (`false`: the caller copies the
+    /// bytes as before).
+    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+        let Some(host) = host() else { return false };
+        let Some(twin) = self.twin(index) else { return false };
+        // SAFETY: a live buffer.
+        let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+            return false;
+        };
+        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+        if bytes == 0 {
+            return false;
+        }
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (bytes / 4) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
+            SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+        };
+        let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
+        // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
+        // zero location makes a null constant buffer view).
+        unsafe {
+            host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
+            self.put(index);
+            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+        }
+        self.twin_made(index, true);
+        self.write_stride(index, 0, 0);
+        self.keep(index, Some(buffer.clone()));
+        true
+    }
+
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
     /// a slot of this thread's in a heap the card does not see
     /// ([`staged`]), or the slot itself.
@@ -3337,6 +3395,23 @@ impl HostHeap {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Makes host slot `index` from the record at `handle` if it is still
+    /// the one with `key`, whose texture's upload is in the queue now
+    /// (`crate::heap_worker`). The slot's place in the queue of textures
+    /// picked by index was settled when that upload was recorded, and stays
+    /// as it is. False if the title wrote the slot again.
+    pub(crate) fn publish(&self, index: u32, handle: u64, key: u64) -> bool {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || u64::from(generation) << 32 | u64::from(i) != key {
+            return false;
+        }
+        PUBLISHING.set(true);
+        let shown = self.mirror(index, handle, true).is_some();
+        PUBLISHING.set(false);
+        shown
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -4338,6 +4413,61 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Renderer port 5 ([`crate::port_cbv`]): the constant buffer of `size` bytes
+/// at `gpu` of `buffer` as a constant buffer view at `at` where it can be (on
+/// 256 bytes; else a null one) and a raw view of its bytes at `twin`, which
+/// translated shaders read. `false` (nothing made): not on 16 bytes.
+fn constant_twinned(
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    size: u32,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+) -> bool {
+    let Some(host) = host() else { return false };
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+        return false;
+    };
+    let room = width - offset;
+    let cbv = if gpu.is_multiple_of(256) && room >= 256 {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_bytes(size).min((room & !255) as u32),
+        }
+    } else {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+    };
+    let bytes = u64::from(constant_bytes(size)).min(room) & !3;
+    // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+    unsafe {
+        host.device.CreateConstantBufferView(Some(&cbv), at);
+        if let Some(twin) = twin {
+            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: offset / 4,
+                        NumElements: (bytes / 4) as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            if bytes == 0 {
+                null_buffer_view(twin);
+            } else {
+                host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+            }
+            crate::port_cbv::twinned();
+        }
+    }
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4358,6 +4488,12 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            if crate::port_cbv::on() {
+                // Renderer port 5: shaders read constant buffers as raw bytes
+                // through the twin; a constant buffer view there would be read
+                // raw, with no end on AMD.
+                return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -6247,5 +6383,39 @@ mod bake_flip_tests {
         assert_eq!(half_inexact(&View::Placed(true, memory, placed)), Some(41));
         assert_eq!(half_inexact(&View::Shader(7, Some(words(41, 4)))), None);
         assert_eq!(half_inexact(&View::Constant(0x1000, 256)), None);
+    }
+
+    /// A slot whose texture was uploaded ahead shows it when it is
+    /// published, and does not go back into the queue of textures picked by
+    /// index for that; one the title wrote again is left alone.
+    #[test]
+    fn a_published_slot_stays_out_of_the_queue() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let title = [0u32; 8];
+        let handle = title.as_ptr() as u64;
+        crate::descriptor::record(handle, view(0x7fec_0000_0000));
+        let (first, key) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&first), false).is_empty());
+        let (index, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(index, 1);
+        // Its upload was recorded: out of the queue, the slot not made yet.
+        heap.texture_slot_done(1, write, None);
+        assert!(!heap.made(1));
+        assert!(heap.publish(1, handle, key));
+        assert!(heap.made(1));
+        assert!(heap.texture_slots_due(u64::MAX, 8).0.is_empty());
+        // Written again since the upload was recorded.
+        crate::descriptor::record(handle, view(0x7feb_0000_0000));
+        assert!(!heap.publish(1, handle, key));
+        assert_ne!(crate::descriptor::view_and_key(handle).unwrap().1, key);
     }
 }

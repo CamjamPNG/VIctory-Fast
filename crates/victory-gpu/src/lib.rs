@@ -40,11 +40,15 @@ pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port_cbv;
 #[cfg(windows)]
 mod port_journal;
 #[cfg(windows)]

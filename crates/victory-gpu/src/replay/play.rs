@@ -788,7 +788,13 @@ impl Player {
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
-            let desc = gpu::to_desc(&r.desc);
+            let mut desc = gpu::to_desc(&r.desc);
+            // Heaps are made without sharing across adapters (DROP), so a
+            // resource cannot ask for it: buffers placed in a heap the host
+            // opened from title memory (renderer port 1) have the flag, and
+            // were refused ("parameter incorrect"), and the frame's work on
+            // them read nothing, or hung the card.
+            desc.Flags &= !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
                 // SAFETY: 20 bytes that were a clear value.

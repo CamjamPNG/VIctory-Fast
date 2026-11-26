@@ -123,7 +123,17 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     // Hold a non-blocking mapping read lock so section handles and virtual
     // stretches stay valid across `MapViewOfFile`, `OpenExistingHeapFromAddress1`,
     // and `inplace::counted` without deadlocking against `title_memory_remapping`.
-    let _reading = crate::watch::title_memory_reading_now()?;
+    // Briefly yield on transient contention so boot-time remaps don't cause us
+    // to permanently fall back to a shadowed copy for the 32-bit graphics heap.
+    let mut reading = crate::watch::title_memory_reading_now();
+    if reading.is_none() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
+        while reading.is_none() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+            reading = crate::watch::title_memory_reading_now();
+        }
+    }
+    let _reading = reading?;
     let host = crate::host::host()?;
     match place_in(&host.device, start, len) {
         Ok(placed) => {

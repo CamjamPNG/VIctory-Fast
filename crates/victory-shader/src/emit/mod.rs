@@ -263,13 +263,15 @@ pub fn native_rt_two_pass() -> bool {
     })
 }
 
-/// Whether `FrontBackTrack` loops fall back to the legacy single-pass `FORCE_NON_OPAQUE`
-/// `Proceed()` loop instead of two pure-opaque zero-exit traces
-/// (`VICTORY_NATIVE_RT_FBT_LEGACY=1`; off by default).
-pub fn native_rt_fbt_legacy() -> bool {
+/// Whether `FrontBackTrack` loops opt into two pure-opaque zero-exit traces
+/// (`CULL_BACK` + `CULL_FRONT`) instead of the exact single-pass `FORCE_NON_OPAQUE`
+/// `Proceed()` loop (`VICTORY_NATIVE_RT_FBT_TWOPASS=1`; off by default because
+/// DXR hardware ignores face-cull flags on `TRIANGLE_CULL_DISABLE` instances,
+/// causing self-intersection fireflies and reflection streaks on double-sided geometry).
+pub fn native_rt_fbt_two_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("VICTORY_NATIVE_RT_FBT_LEGACY")
+        std::env::var("VICTORY_NATIVE_RT_FBT_TWOPASS")
             .ok()
             .as_deref()
             .map(str::trim)

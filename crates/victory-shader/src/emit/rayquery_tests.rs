@@ -435,7 +435,7 @@ fn emit_two_pass_anyhit_cs() -> Vec<u8> {
 fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
     use super::rayquery_lift::{
         RayInput, RayLoop, RayLoopKind, RayOutput, RayOutputBinding, RayTemplate,
-        ResolvedRayInputs, effective_const_ray_flags, emit_ray_loop, ray_flag,
+        ResolvedRayInputs, emit_ray_loop, is_front_back_two_pass_shape, ray_flag,
     };
     use crate::ir::Value;
     use std::collections::HashMap;
@@ -550,11 +550,8 @@ fn emit_front_back_track_two_pass_cs() -> Vec<u8> {
         committed_meta_loads: vec![],
     };
 
-    let alloc_flags = effective_const_ray_flags(&rl).expect("const effective flags");
-    assert_eq!(
-        alloc_flags,
-        ray_flag::FORCE_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES
-    );
+    assert!(is_front_back_two_pass_shape(&rl));
+    let alloc_flags = ray_flag::FORCE_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES;
     let rq = s.allocate_ray_query(entry, alloc_flags);
 
     let mut fallbacks = HashMap::new();

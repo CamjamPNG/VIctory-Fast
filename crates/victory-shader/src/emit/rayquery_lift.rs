@@ -349,11 +349,10 @@ pub(crate) fn is_two_pass_eligible(rl: &RayLoop) -> bool {
     )
 }
 
-/// Returns `true` when a `FrontBackTrack` loop can be lowered as two pure-opaque
-/// zero-exit traces (Pass A: front-face `minFrontFaceT`, Pass B: back-face committed hit).
-pub(crate) fn is_front_back_two_pass_eligible(rl: &RayLoop) -> bool {
+/// Returns `true` when a `FrontBackTrack` loop's static flags are structurally
+/// compatible with two pure-opaque zero-exit traces (Pass A: `CULL_BACK`, Pass B: `CULL_FRONT`).
+pub(crate) fn is_front_back_two_pass_shape(rl: &RayLoop) -> bool {
     matches!(rl.kind, RayLoopKind::FrontBackTrack { .. })
-        && !super::native_rt_fbt_legacy()
         && matches!(
             rl.ray_flags,
             RayInput::Const(f)
@@ -368,6 +367,12 @@ pub(crate) fn is_front_back_two_pass_eligible(rl: &RayLoop) -> bool {
                             | ray_flag::SKIP_TRIANGLES))
                         == 0
         )
+}
+
+/// Returns `true` when a `FrontBackTrack` loop should be lowered as two pure-opaque
+/// zero-exit traces (opt-in via `VICTORY_NATIVE_RT_FBT_TWOPASS=1`).
+pub(crate) fn is_front_back_two_pass_eligible(rl: &RayLoop) -> bool {
+    super::native_rt_fbt_two_pass() && is_front_back_two_pass_shape(rl)
 }
 
 /// Constant `constRayFlags` mask for `AllocateRayQuery`. For two-pass pure-opaque
@@ -7169,8 +7174,9 @@ fn emit_trace_body(
     let skip_proc = (inputs.group_const_flags & ray_flag::SKIP_PROCEDURAL_PRIMITIVES) != 0
         || matches!(rl.ray_flags, RayInput::Const(f) if (f & ray_flag::SKIP_PROCEDURAL_PRIMITIVES) != 0);
 
-    let fbt_two_pass = is_front_back_two_pass_eligible(rl)
-        && (inputs.group_const_flags & ray_flag::FORCE_NON_OPAQUE) == 0;
+    let fbt_two_pass = is_front_back_two_pass_shape(rl)
+        && (inputs.group_const_flags & ray_flag::FORCE_NON_OPAQUE) == 0
+        && (inputs.group_const_flags & ray_flag::FORCE_OPAQUE) != 0;
 
     // Two-pass tMax pre-shrink (AnyHit) or zero-exit two-pass pure-opaque FrontBackTrack.
     let (trace_start_blk, two_pass_q1, fbt_two_pass_min_f) = if let (
@@ -8095,17 +8101,22 @@ mod tests {
             committed_meta_loads: vec![],
         };
 
-        assert!(is_front_back_two_pass_eligible(&rl));
-        let eff_flags = effective_const_ray_flags(&rl).expect("const effective flags");
-        assert_eq!(
-            eff_flags,
-            ray_flag::FORCE_OPAQUE | ray_flag::SKIP_PROCEDURAL_PRIMITIVES
+        assert!(is_front_back_two_pass_shape(&rl));
+        assert!(
+            !is_front_back_two_pass_eligible(&rl),
+            "FrontBackTrack two-pass must be opt-in (off by default for TRIANGLE_CULL_DISABLE parity)"
         );
+        assert_eq!(
+            effective_const_ray_flags(&rl),
+            Some(flags),
+            "default FrontBackTrack preserves FORCE_NON_OPAQUE"
+        );
+        let two_pass_flags = (flags & !ray_flag::FORCE_NON_OPAQUE) | ray_flag::FORCE_OPAQUE;
 
-        // Validate both the default zero-exit two-pass pure-opaque path and the legacy fallback.
+        // Validate both the default exact Proceed() path and the opt-in two-pass pure-opaque path.
         for (label, alloc_flags) in [
-            ("two-pass pure-opaque FrontBackTrack", eff_flags),
-            ("legacy FrontBackTrack", flags),
+            ("default exact FrontBackTrack", flags),
+            ("opt-in two-pass pure-opaque FrontBackTrack", two_pass_flags),
         ] {
             let mut s = Shader::new(false);
             s.threads = Some([8, 8, 1]);

@@ -1713,11 +1713,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
     match memory {
         // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
+        // (`crate::shadow::card_room_kept`), render targets
+        // ([`targets_room_kept`]), and Native DXR AS slabs
+        // (`crate::dxr::dxr_room_kept`) counts as used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
+                + crate::dxr::dxr_room_kept()
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -2059,7 +2062,8 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept()
+                + crate::dxr::dxr_room_kept();
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),

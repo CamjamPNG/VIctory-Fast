@@ -605,10 +605,31 @@ impl<B: Clone> SlabAllocator<B> {
     }
 }
 
+static DXR_SLAB_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Local VRAM reserved by the texture queue for Native DXR AS slabs not yet
+/// allocated (`VICTORY_CARD_ROOM_FOR_DXR_MB`, default 1,536 MiB when
+/// `VICTORY_NATIVE_RT=1`, 0 otherwise), releasing automatically as slabs grow.
+pub(crate) fn dxr_room_kept() -> u64 {
+    if !enabled() {
+        return 0;
+    }
+    static MOST: OnceLock<u64> = OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_FOR_DXR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1536)
+            << 20
+    });
+    most.saturating_sub(DXR_SLAB_BYTES.load(Ordering::Relaxed))
+}
+
 impl SlabAllocator<ID3D12Resource> {
     fn alloc(&mut self, host: &Host, size: u64) -> Option<(ID3D12Resource, SlabSlice, u64)> {
         self.alloc_with(size, |slab_size, slab_idx| {
             let buffer = create_as_slab(host, slab_size, slab_idx)?;
+            DXR_SLAB_BYTES.fetch_add(slab_size, Ordering::Relaxed);
             // SAFETY: live committed buffer resource.
             let gpu_base = unsafe { buffer.GetGPUVirtualAddress() };
             Some((buffer, gpu_base))

@@ -1796,9 +1796,11 @@ const STARVED_BUDGET: u64 = 6_656 << 20;
 const MIN_TARGET: u64 = 1 << 30;
 
 /// What Windows keeps of a card's memory for everything that is not this
-/// process: an eighth of the reported budget, between 256 MiB and 1 GiB.
+/// process: an eighth of the reported budget, between 256 MiB and 1 GiB, and
+/// never more than half of it (the floor is for cards, not for arithmetic on
+/// toy budgets).
 fn vram_reservation(reported: u64) -> u64 {
-    (reported / 8).clamp(256 << 20, 1 << 30)
+    (reported / 8).clamp(256 << 20, 1 << 30).min(reported / 2)
 }
 
 /// The budget the pressure rules of this file measure their shares against:

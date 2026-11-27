@@ -14,7 +14,7 @@ A performance-focused fork of [VIctory](https://github.com/Marvisak/VIctory), a 
 
 ### 30+ FPS RDNA 4 & Native PC Performance
 - **RDNA 4 Wave32 Shader Lowering (`VICTORY_RDNA_WAVE32=2`):** Tuned DXIL emission for Radeon RX 9070 / 9070 XT occupancy without VGPR-bloat regressions, paired with `VICTORY_LDS_INIT_HOIST` for clean water/compute initialization.
-- **Lock-Free Submission & Memory Tracking:** Lock-free shadow `FOUND` cache & ranged seqlock, compact `DenseRanges` heap sweeps, O(1) clean-shard write-watch checks, deferred heap-pass waits, window heap caching, and fused list planning (`~31–33 FPS` at 1440p FSR 4.1.2 with `0.0 ms` GPU wait and `0` faults).
+- **Lock-Free Submission & Memory Tracking:** Lock-free shadow `FOUND` cache & ranged seqlock, compact `DenseRanges` heap sweeps, O(1) clean-shard write-watch checks, deferred heap-pass waits, GPU-only copyback elision (`VICTORY_GPU_ONLY_COPYBACK=2`), window heap caching, and fused list planning (**`~33.4–35.0 FPS`** at 1440p FSR 4.1.2 with `0.1 ms` GPU wait, `13.8 ms` copyback, and `0` faults).
 - **Native PC Subsystems:**
   - **GPU Compute Detiler & BCPack Decoder:** Offloads tiled texture detiling and BCPack decompression onto D3D12 compute shaders with dirty-page partial uploads.
   - **Native PC Display & FidelityFX (`FSR 4.1.2` + opt-in Frame Gen):** DXGI tearing/VRR, waitable swapchain, HDR10 output, automatic FidelityFX upscaler selection (`1080p → 1440p` FSR 4.1.2), and opt-in Frame Generation bridge (`VICTORY_FFX_FG=1`).
@@ -38,7 +38,7 @@ Measured on **AMD Ryzen 7 7800X3D · AMD Radeon RX 9070 XT (16 GB, RDNA 4) · 32
 
 | Configuration | Build | Median / Typical FPS | Peak FPS | Notes |
 |---|---|---:|---:|---|
-| **Series X (1440p, FSR 4.1.2) — RT Off** | `--release` (measured, `f26796f`) | **~30.7 fps** settled (**32.5** steady) | **32.9 fps** | `1080p → 1440p` PC FSR 4.1.2 + `VICTORY_RDNA_WAVE32=2`: `33.4 ms/f` (`30.8 ms` steady), `26.3 ms` prep, **`0.0 ms`** GPU wait, `18.7 ms` copyback, `11.4 GB` VRAM / `2.12 GB` SHR, `0` faults |
+| **Series X (1440p, FSR 4.1.2) — RT Off** | `--release` (measured, `eb09e37`) | **~33.4 fps** settled (**33.7** steady / `30.6` overall med) | **35.0 fps** | `1080p → 1440p` PC FSR 4.1.2 + `VICTORY_RDNA_WAVE32=2` + `VICTORY_GPU_ONLY_COPYBACK=2`: **`29.9 ms/f`** (`28.8 ms` steady), **`21.8 ms`** prep, **`0.1 ms`** GPU wait, **`13.8 ms`** copyback, `11.5 GB` VRAM / `2.05 GB` SHR, `0` faults |
 | **Series S (1080p) — RT Off** | `--release` (measured, `7d2f44f`) | **~30.4 fps** settled (`28.6` overall med) | **32.4 fps** | `VICTORY_RDNA_WAVE32=2`: `32.9 ms/f`, **`23.9 ms`** prep, **`0.0 ms`** GPU wait, `14.7 ms` copyback, `16.7 GB` RAM / `8.2 GB` VRAM / `2.09 GB` SHR, `0` faults |
 | **Series X (Native 1440p) — RT Off** | `--release` (measured, `7d2f44f`) | **~29.8 fps** settled (`30.7` final) | **30.8 fps** | `VICTORY_RDNA_WAVE32=2`: `33.6 ms/f`, **`20.8 ms`** prep, **`0.0 ms`** GPU wait, `13.9 ms` copyback, `19.5 GB` RAM / `9.6 GB` VRAM / `1.75 GB` SHR, `0` faults |
 | **Series S — Native DXR 1.1 RT** | `--release` (measured, `6a4ee3c`, parity default) | **~11.6 fps** settled (`10.9` med; `13.5` opt-in FBT) | **17.9 fps** (`25.1` peak `c9de853`) | Visual-parity default: `86.6 ms/f`, `36.9 ms` prep, `36.1 ms` GPU wait, `20.9 ms` copyback, **`13.4 GB`** max VRAM, `0` faults |

@@ -28,13 +28,22 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - uses: taiki-e/install-action@nextest
       # Includes xtask's repository_passes_policy, the asset-policy check.
       # This step asserts compile, clippy and every test that can run without a
-      # GPU. Two groups are `#[ignore]`d because a runner cannot satisfy them:
-      # nine victory-gpu tests, where the runner loses its virtual device
+      # GPU. Three groups are `#[ignore]`d because a runner cannot satisfy them:
+      # ten victory-gpu tests, where the runner loses its virtual device
       # mid-run (HRESULT 0x887A0005), and two victory-shader record-count tests,
       # where the WARP software adapter returns 0 and there is no SM 6.6
-      # hardware branch to fall back on. Both are run by the owner on real
-      # hardware: `cargo test -p victory-gpu -p victory-shader -- --ignored`.
+      # hardware branch to fall back on. All of them are run by the owner on
+      # real hardware: `cargo test -p victory-gpu -p victory-shader -- --ignored`.
+      #
+      # Every test runs in a process of its own (nextest), so one test's
+      # global state cannot stop or slow another, and no test can hold a lock
+      # that another test is waiting for. `.config/nextest.toml` bounds each
+      # test at two minutes and fails the run if one reaches it; a hang is
+      # then a red build naming the test rather than a 60-minute cancel.
+      # (There are no testable doc examples in the workspace: every code block
+      # in a doc comment is marked `text`.)
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo nextest run --workspace --locked

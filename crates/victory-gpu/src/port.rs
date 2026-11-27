@@ -1,7 +1,8 @@
 //! Renderer port #1: the title's 32-bit graphics heap as the card's own
 //! memory (`VICTORY_PORT_CONSTANTS`, off by default).
 //!
-//! What the title does at startup: one `XMemVirtualAlloc` of the five
+//! What the title does (the title executable, the routine at image
+//! +0x1e86440, reached at its start): one `XMemVirtualAlloc` of the five
 //! sizes it is given together (kind 0x42000: a reservation of 64 KiB
 //! pages, flags 7: graphics memory below 4 GiB, 185 MB at 0x34310000 in
 //! every run so far), split into five placeholders (`VirtualFree` with
@@ -121,7 +122,7 @@ static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 /// under `VICTORY_PORT_CONSTANTS=1`, or any valid range under `VICTORY_INPLACE_ALL=1`.
 #[allow(dead_code)]
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    if !on() || len == 0 {
+    if !on() || at == 0 || len == 0 {
         return false;
     }
     match at.checked_add(len) {
@@ -420,8 +421,9 @@ mod tests {
         if !on() {
             assert!(!wanted(0x3431_0000, 0x1000));
         }
-        let low = |at: u64, len: u64| at.checked_add(len).is_some_and(|end| end <= LOW && len > 0);
+        let low = |at: u64, len: u64| at != 0 && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0);
         assert!(low(0x34e1_0000, 0xae0_0000));
+        assert!(!low(0, 4 << 20), "null-address loose windows are never section stretches");
         assert!(!low(0xffff_0000, 0x2_0000));
         assert!(!low(0xe_1c80_0000, 0x1000));
         assert!(!low(u64::MAX, 2));

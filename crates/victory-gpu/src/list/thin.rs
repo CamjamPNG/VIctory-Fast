@@ -754,11 +754,184 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Attempts to execute a hot state/draw/dispatch opcode directly against an
+/// already-held `(&HostList, &mut draw::State)` without re-locking `list.state`
+/// or taking per-call diagnostic timestamps. Returns `true` if handled.
+#[inline]
+fn run_state_op(op: u64, host: &crate::host::HostList, state: &mut crate::draw::State, w: &[u64]) -> bool {
+    let word = |idx: usize| w.get(idx).copied().unwrap_or(0);
+    let slice = |from: usize, count: usize| -> *const u8 {
+        if count == 0 || from >= w.len() {
+            std::ptr::null()
+        } else {
+            w[from..].as_ptr().cast()
+        }
+    };
+    match op {
+        n if n == Plain::GRAPHICS_TABLE as u64 => state.set_table(false, word(0) as u32, word(1)),
+        n if n == Plain::COMPUTE_TABLE as u64 => state.set_table(true, word(0) as u32, word(1)),
+        n if n == Plain::GRAPHICS_CONSTANT as u64 => {
+            state.set_constants(false, word(0) as u32, &[word(1) as u32], word(2) as u32)
+        }
+        n if n == Plain::COMPUTE_CONSTANT as u64 => {
+            state.set_constants(true, word(0) as u32, &[word(1) as u32], word(2) as u32)
+        }
+        n if n == Plain::GRAPHICS_VIEW as u64 => state.set_view(false, word(0) as u32, word(1)),
+        n if n == Plain::COMPUTE_VIEW as u64 => state.set_view(true, word(0) as u32, word(1)),
+        n if n == Plain::SET_PIPELINE as u64 => {
+            let p = word(0) as This;
+            crate::pipeline::bound(p);
+            state.set_pipeline(p);
+        }
+        n if n == Plain::TOPOLOGY as u64 => state.set_topology(host, word(0) as u32),
+        n if n == Plain::STENCIL_REF as u64 => state.set_stencil_ref(host, word(0) as u32),
+        n if n == Plain::DEPTH_BOUNDS as u64 => {
+            state.set_depth_bounds(host, Word::unword(word(0)), Word::unword(word(1)))
+        }
+        n if n == Plain::DRAW as u64 => {
+            super::count_draw();
+            state.draw(host, word(0) as u32, word(1) as u32, word(2) as u32, word(3) as u32);
+        }
+        n if n == Plain::DRAW_INDEXED as u64 => {
+            super::count_draw();
+            state.draw_indexed(
+                host,
+                word(0) as u32,
+                word(1) as u32,
+                word(2) as u32,
+                Word::unword(word(3)),
+                word(4) as u32,
+            );
+        }
+        n if n == Plain::DISPATCH as u64 => {
+            super::count_dispatch();
+            state.dispatch(host, word(0) as u32, word(1) as u32, word(2) as u32, 0);
+        }
+        n if n == Plain::DISPATCH_MESH as u64 => {
+            super::count_draw();
+            let (x, y, z) = (word(0) as u32, word(1) as u32, word(2) as u32);
+            if y * z != 1 {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
+            }
+            state.dispatch_mesh(host, x);
+        }
+        n if n == Plain::DISPATCH_MESH_X as u64 => {
+            super::count_draw();
+            let (x, indirect) = (word(0) as u32, word(2));
+            if indirect != 0 {
+                state.dispatch_mesh_indirect(host, indirect);
+            } else {
+                state.dispatch_mesh(host, x);
+            }
+        }
+        n if n == Plain::EXECUTE_INDIRECT as u64 => {
+            super::execute_indirect_with(
+                host,
+                state,
+                word(0) as This,
+                word(1) as u32,
+                word(2) as This,
+                word(3),
+                word(4) as This,
+                word(5),
+            );
+        }
+        GRAPHICS_CONSTANTS | COMPUTE_CONSTANTS => {
+            let count = word(1) as usize;
+            let ptr = slice(2, count).cast::<u32>();
+            // SAFETY: stream holds `count` u32 values written by `put_with`.
+            let vals = if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, count) } };
+            state.set_constants(op == COMPUTE_CONSTANTS, word(0) as u32, vals, (word(0) >> 32) as u32);
+        }
+        VIEWPORTS => {
+            let n = word(0) as usize;
+            let ptr = slice(1, n).cast::<D3D12_VIEWPORT>();
+            // SAFETY: stream holds `n` viewports written by `put_with`.
+            let items = if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, n) } };
+            state.set_viewports(host, items);
+        }
+        SCISSORS => {
+            let n = word(0) as usize;
+            let ptr = slice(1, n).cast::<RECT>();
+            // SAFETY: stream holds `n` rects written by `put_with`.
+            let items = if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, n) } };
+            state.set_scissors(host, items);
+        }
+        BLEND_FACTOR => {
+            let n = word(0) as usize;
+            let ptr = slice(1, n).cast::<[f32; 4]>();
+            // SAFETY: stream holds `[f32; 4]` when `n != 0`.
+            state.set_blend_factor(host, unsafe { ptr.as_ref() });
+        }
+        HEAPS => {
+            let n = word(0) as usize;
+            let ptr = slice(1, n).cast::<This>();
+            // SAFETY: stream holds `n` heap handles written by `put_with`.
+            let items = if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, n) } };
+            state.set_heaps(items);
+        }
+        INDEX_BUFFER => {
+            let n = word(0) as usize;
+            let ptr = slice(1, n).cast::<IndexView>();
+            // SAFETY: stream holds an `IndexView` when `n != 0`.
+            state.set_index_buffer(unsafe { ptr.as_ref() });
+        }
+        VERTEX_BUFFERS => {
+            let start = word(0) as u32;
+            let count = (word(0) >> 32) as u32;
+            if word(1) != 0 {
+                let ptr = at_or::<VertexView>(w, 2);
+                // SAFETY: stream holds `count` `VertexView` entries.
+                let items = if count == 0 {
+                    &[]
+                } else {
+                    unsafe { std::slice::from_raw_parts(ptr, count as usize) }
+                };
+                state.set_vertex_buffers(start, items);
+            } else {
+                state.clear_vertex_buffers(start, count);
+            }
+        }
+        TARGETS => {
+            let n = (word(0) as usize).min(8);
+            let mut handles = [0u64; 8];
+            let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
+            for (k, h) in handles.iter_mut().enumerate().take(n) {
+                if word(1) >> k & 1 != 0 {
+                    *h = place(k);
+                }
+            }
+            let depth = if word(2) != 0 { place(n) } else { 0 };
+            state.set_targets(host, &handles[..n], depth);
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
+    let _retire_batch = crate::host::RetireBatchGuard::enter();
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    // Hold `list.state` across consecutive pure-state/draw/dispatch calls so
+    // the worker does not re-acquire the mutex and query QPC on every call.
+    let mut held_state: Option<(&crate::host::HostList, std::sync::MutexGuard<'_, crate::draw::State>)> = None;
+    #[cfg(feature = "diagnostics")]
+    let mut batch: Option<(u64, std::time::Instant)> = None;
+    let flush_held = |held: &mut Option<(&crate::host::HostList, std::sync::MutexGuard<'_, crate::draw::State>)>,
+                      #[cfg(feature = "diagnostics")] batch: &mut Option<(u64, std::time::Instant)>| {
+        if held.take().is_some() {
+            #[cfg(feature = "diagnostics")]
+            if let Some((n, started)) = batch.take()
+                && n > 0
+            {
+                crate::copystat::recorded_batch(n, started.elapsed());
+            }
+        }
+    };
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -778,6 +951,33 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
+        if held_state.is_none()
+            && let Some(host) = super::host_list(list)
+        {
+            // SAFETY: `list` is one of our backing `List`s, exclusively owned by this worker.
+            let state = unsafe { &(*list.cast::<List>()).state }
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            {
+                batch = Some((0, std::time::Instant::now()));
+            }
+            held_state = Some((host, state));
+        }
+        if let Some((host, state)) = held_state.as_mut()
+            && run_state_op(op, host, state, w)
+        {
+            #[cfg(feature = "diagnostics")]
+            if let Some((n, _)) = batch.as_mut() {
+                *n += 1;
+            }
+            continue;
+        }
+        flush_held(
+            &mut held_state,
+            #[cfg(feature = "diagnostics")]
+            &mut batch,
+        );
         if run_plain(op, list, w) {
             continue;
         }
@@ -858,6 +1058,11 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             _ => {}
         }
     }
+    flush_held(
+        &mut held_state,
+        #[cfg(feature = "diagnostics")]
+        &mut batch,
+    );
     (calls, closed)
 }
 

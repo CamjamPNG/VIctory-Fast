@@ -111,6 +111,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Adaptive GPU-only copyback state (`VICTORY_GPU_ONLY_COPYBACK`):
+    /// `0` observing, `1` promoted (skip `gpu_writes`), `2` demoted (sticky).
+    gpu_only_state: AtomicU8,
 }
 
 /// Demand-paged, 64 KiB-aligned private CPU memory backing `Card::staging`
@@ -201,8 +204,253 @@ struct Card {
     /// `before` was last updated (or `before` was just created). Empty until
     /// `before` exists.
     hash_stale: Mutex<Vec<u64>>,
+    /// Adaptive GPU-only copyback tracker (`VICTORY_GPU_ONLY_COPYBACK`).
+    gpu_only: Mutex<GpuOnlyTracker>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+const GPU_ONLY_OBSERVING: u8 = 0;
+const GPU_ONLY_PROMOTED: u8 = 1;
+const GPU_ONLY_DEMOTED: u8 = 2;
+
+/// Minimum warmup span (in frames) and fetched pieces before promoting a card
+/// buffer to GPU-only copyback elision.
+const GPU_ONLY_WARMUP_FRAMES: u64 = 60;
+const GPU_ONLY_MIN_FETCHED_PIECES: u64 = 16;
+const GPU_ONLY_MAX_RESETS: u32 = 4;
+
+/// `VICTORY_GPU_ONLY_COPYBACK`: `0` (default/off); `1` promote `>= min_mb`
+/// card buffers with 0 CPU uploads during warmup; `2` also promote `>= min_mb`
+/// card buffers whose CPU-uploaded and GPU-fetched 64 KiB pieces are disjoint.
+pub(crate) fn gpu_only_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        if crate::host::upcheck::on() {
+            return 0;
+        }
+        match std::env::var("VICTORY_GPU_ONLY_COPYBACK").as_deref().map(str::trim) {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => 0,
+        }
+    })
+}
+
+/// Minimum card buffer size in bytes eligible for `VICTORY_GPU_ONLY_COPYBACK`
+/// (`VICTORY_GPU_ONLY_MIN_MB`, default `4` MiB so small CPU-readback/query
+/// buffers are never skipped).
+fn gpu_only_min_bytes() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_GPU_ONLY_MIN_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+            << 20
+    })
+}
+
+/// Min start and max end of eligible card buffers for fast-path CPU read
+/// demotion (`[0, 0]` when none).
+static GPU_ONLY_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `[0]` promoted buffers currently active, `[1]` promoted bytes,
+/// `[2]` total demotions, `[3]` skipped `gpu_writes` calls since last log,
+/// `[4]` skipped `gpu_writes` bytes since last log.
+static GPU_ONLY_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+fn gpu_only_note_bounds(start: u64, len: u64) {
+    if gpu_only_mode() == 0 || len < gpu_only_min_bytes() {
+        return;
+    }
+    let end = start.saturating_add(len);
+    let _ = GPU_ONLY_BOUNDS[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(if cur == 0 { start } else { cur.min(start) })
+    });
+    GPU_ONLY_BOUNDS[1].fetch_max(end, Ordering::Relaxed);
+}
+
+#[derive(Default)]
+struct GpuOnlyTracker {
+    window_start_frame: u64,
+    fetched_pieces: u64,
+    up_bits: Vec<u64>,
+    fetched_bits: Vec<u64>,
+    resets: u32,
+}
+
+impl GpuOnlyTracker {
+    fn set_bit(bits: &mut Vec<u64>, piece: usize) {
+        let w = piece / 64;
+        if w >= bits.len() {
+            bits.resize(w + 1, 0);
+        }
+        bits[w] |= 1u64 << (piece % 64);
+    }
+
+    fn has_bit(bits: &[u64], piece: usize) -> bool {
+        bits.get(piece / 64).is_some_and(|&w| (w >> (piece % 64)) & 1 != 0)
+    }
+
+    fn reset_window(&mut self) -> bool {
+        self.resets += 1;
+        // Start the next warmup window on the first GPU fetch after the reset.
+        self.window_start_frame = 0;
+        self.fetched_pieces = 0;
+        self.up_bits.iter_mut().for_each(|w| *w = 0);
+        self.fetched_bits.iter_mut().for_each(|w| *w = 0);
+        self.resets > GPU_ONLY_MAX_RESETS
+    }
+
+    /// Records CPU-uploaded piece indices `[first_piece, last_piece)` at `frame`.
+    /// Returns `true` if the buffer should be sticky-demoted.
+    fn note_upload(&mut self, mode: u8, promoted: bool, first_piece: usize, last_piece: usize) -> bool {
+        if first_piece >= last_piece {
+            return false;
+        }
+        if mode == 1 {
+            if promoted {
+                return true;
+            }
+            return self.reset_window();
+        }
+        // Mode 2 (disjoint): demote/reset only if any uploaded piece overlaps a GPU-fetched piece.
+        let mut overlaps = false;
+        for p in first_piece..last_piece {
+            if Self::has_bit(&self.fetched_bits, p) {
+                overlaps = true;
+                break;
+            }
+            if !promoted {
+                Self::set_bit(&mut self.up_bits, p);
+            }
+        }
+        if overlaps {
+            if promoted {
+                return true;
+            }
+            return self.reset_window();
+        }
+        false
+    }
+
+    /// Records GPU-fetched piece indices at `frame`. Returns `(promote, demote)`.
+    fn note_fetched(&mut self, mode: u8, frame: u64, pieces: &[usize]) -> (bool, bool) {
+        if pieces.is_empty() {
+            return (false, false);
+        }
+        if self.window_start_frame == 0 {
+            self.window_start_frame = frame;
+        }
+        for &p in pieces {
+            if mode == 2 && Self::has_bit(&self.up_bits, p) {
+                return (false, self.reset_window());
+            }
+            Self::set_bit(&mut self.fetched_bits, p);
+        }
+        self.fetched_pieces += pieces.len() as u64;
+        let ready = self.fetched_pieces >= GPU_ONLY_MIN_FETCHED_PIECES
+            && frame.saturating_sub(self.window_start_frame) >= GPU_ONLY_WARMUP_FRAMES;
+        (ready, false)
+    }
+}
+
+/// Checks whether any other live `Shadow` (buffer, loose window, or exact view)
+/// overlaps `[start, start + len)`.
+fn has_overlapping_shadow(start: u64, len: u64, self_id: u64) -> bool {
+    let Some(end) = start.checked_add(len) else {
+        return true;
+    };
+    {
+        let map = buffers_read();
+        for (_, entry) in map.range(..=(start, usize::MAX)).rev().take(64) {
+            if entry.end > start
+                && let Some(s) = &entry.shadow
+                && s.id != self_id
+            {
+                return true;
+            }
+        }
+        for (_, entry) in map.range((start.saturating_add(1), 0)..(end, 0)) {
+            if let Some(s) = &entry.shadow
+                && s.id != self_id
+            {
+                return true;
+            }
+        }
+    }
+    {
+        let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        if !exact.1.is_empty() {
+            const EXACT_MOST: u64 = 64 << 20;
+            for (&(ex_start, ex_len), (s, _)) in exact.1.range((start.saturating_sub(EXACT_MOST), 0)..(end, 0)) {
+                if ex_start.saturating_add(ex_len) > start && s.id != self_id {
+                    return true;
+                }
+            }
+        }
+    }
+    {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if !loose.is_empty() {
+            for (&(w_start, w_len), s) in loose.range((start.saturating_sub(WINDOW), 0)..(end, 0)) {
+                if w_start.saturating_add(w_len) > start && s.id != self_id {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Demotes any card buffer overlapping `[at, at + len)` (other than `skip_id`)
+/// when a CPU step or another host copy reads/aliases its title memory.
+pub(crate) fn note_cpu_read(at: usize, len: usize) {
+    if gpu_only_mode() == 0 || len == 0 {
+        return;
+    }
+    demote_overlapping_gpu_only(at as u64, len as u64, 0, "cpu read");
+}
+
+fn demote_overlapping_gpu_only(start: u64, len: u64, skip_id: u64, reason: &'static str) {
+    if gpu_only_mode() == 0 || len == 0 {
+        return;
+    }
+    let hi = GPU_ONLY_BOUNDS[1].load(Ordering::Relaxed);
+    let end = start.saturating_add(len);
+    if hi == 0 || start >= hi || end <= GPU_ONLY_BOUNDS[0].load(Ordering::Relaxed) {
+        return;
+    }
+    let copies: Vec<Arc<Shadow>> = {
+        let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|s| s.id != skip_id && s.start < end && s.start.saturating_add(s.len) > start)
+            .collect()
+    };
+    for shadow in copies {
+        shadow.demote_gpu_only(reason);
+    }
+}
+
+/// Periodic diagnostic summary for `VICTORY_GPU_ONLY_COPYBACK`.
+pub(crate) fn gpu_only_log(frames: f64) {
+    let mode = gpu_only_mode();
+    if mode == 0 {
+        return;
+    }
+    let promoted = GPU_ONLY_STATS[0].load(Ordering::Relaxed);
+    let promoted_mb = GPU_ONLY_STATS[1].load(Ordering::Relaxed) >> 20;
+    let demoted = GPU_ONLY_STATS[2].load(Ordering::Relaxed);
+    let skipped = GPU_ONLY_STATS[3].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0);
+    let skipped_mb = GPU_ONLY_STATS[4].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames.max(1.0);
+    tracing::info!(
+        "gpu-only card copyback (VICTORY_GPU_ONLY_COPYBACK={mode}, min={} MB): {promoted} buffers promoted ({promoted_mb} MB), \
+         {demoted} demoted; skipped {skipped:.1} gpu_writes/f ({skipped_mb:.1} MB/f)",
+        gpu_only_min_bytes() >> 20,
+    );
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -874,6 +1122,9 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
+            if gpu_only_mode() > 0 {
+                shadow.gpu_only_note_upload(&ranges);
+            }
             out.push((shadow, ranges));
         }
         true
@@ -1002,12 +1253,13 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
-    runs.sort_unstable_by_key(|r| r.first);
+    runs.sort_unstable_by_key(|r| (r.first, r.from));
     let mut out: Vec<CardSpan> = Vec::new();
     for run in runs {
         match out.last_mut() {
             Some(last) if run.first <= last.first + last.pieces => {
                 last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+                last.from = last.from.min(run.from);
                 last.to = last.to.max(run.to);
             }
             _ => out.push(run),
@@ -1081,6 +1333,51 @@ mod card_tests {
         assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
         assert!(joined.iter().all(|r| r.skew == 7));
         assert!(joined_piece_runs(Vec::new()).is_empty());
+        // Same-piece sub-ranges in reverse order keep minimum `from` and maximum `to`.
+        let rev = vec![card_span_of(0, 0x2000, 0x3000), card_span_of(0, 0x0400, 0x1000)];
+        assert_eq!(
+            joined_piece_runs(rev),
+            [CardSpan { from: 0x0400, to: 0x3000, first: 0, pieces: 1, skew: 0 }]
+        );
+    }
+
+    #[test]
+    fn gpu_only_tracker_mode1_promotes_after_warmup_and_demotes_on_upload() {
+        use super::{GPU_ONLY_MAX_RESETS, GPU_ONLY_MIN_FETCHED_PIECES, GPU_ONLY_WARMUP_FRAMES, GpuOnlyTracker};
+        let mut t = GpuOnlyTracker::default();
+        // Initial boot upload resets warmup so the 60-frame window begins on the first post-boot fetch.
+        assert!(!t.note_upload(1, false, 0, 16));
+        assert_eq!(t.note_fetched(1, 2, &(0..8).collect::<Vec<_>>()), (false, false));
+        assert_eq!(
+            t.note_fetched(1, 2 + GPU_ONLY_WARMUP_FRAMES - 1, &(8..GPU_ONLY_MIN_FETCHED_PIECES as usize).collect::<Vec<_>>()),
+            (false, false)
+        );
+        // Once warmup frames and piece threshold are met with 0 uploads: promote.
+        assert_eq!(t.note_fetched(1, 2 + GPU_ONLY_WARMUP_FRAMES, &[0]), (true, false));
+        // Any post-promotion CPU upload triggers immediate demotion.
+        assert!(t.note_upload(1, true, 5, 6));
+        // Repeated disqualifying uploads during observation eventually sticky-demote.
+        let mut noisy = GpuOnlyTracker::default();
+        for _ in 0..GPU_ONLY_MAX_RESETS {
+            assert!(!noisy.note_upload(1, false, 0, 1));
+        }
+        assert!(noisy.note_upload(1, false, 0, 1));
+    }
+
+    #[test]
+    fn gpu_only_tracker_mode2_allows_disjoint_uploads_and_demotes_on_overlap() {
+        use super::{GPU_ONLY_MIN_FETCHED_PIECES, GPU_ONLY_WARMUP_FRAMES, GpuOnlyTracker};
+        let mut t = GpuOnlyTracker::default();
+        // CPU writes pieces 0..4; GPU writes disjoint pieces 10..(10+N).
+        assert!(!t.note_upload(2, false, 0, 4));
+        let gpu_pieces: Vec<usize> = (10..10 + GPU_ONLY_MIN_FETCHED_PIECES as usize).collect();
+        assert_eq!(t.note_fetched(2, 1, &gpu_pieces), (false, false));
+        assert!(!t.note_upload(2, false, 0, 4));
+        assert_eq!(t.note_fetched(2, 1 + GPU_ONLY_WARMUP_FRAMES, &[10]), (true, false));
+        // Post-promotion upload on disjoint CPU pieces does NOT demote.
+        assert!(!t.note_upload(2, true, 0, 4));
+        // Post-promotion upload overlapping a GPU-fetched piece demotes immediately.
+        assert!(t.note_upload(2, true, 10, 11));
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
@@ -2918,6 +3215,10 @@ impl Drop for Shadow {
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        if self.gpu_only_state.load(Ordering::Relaxed) == GPU_ONLY_PROMOTED {
+            GPU_ONLY_STATS[0].fetch_sub(1, Ordering::Relaxed);
+            GPU_ONLY_STATS[1].fetch_sub(self.len, Ordering::Relaxed);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -2964,6 +3265,20 @@ fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+    })
+}
+
+/// Minimum buffer size (bytes) eligible for `VICTORY_KEEP_SNAPSHOTS=1`
+/// (`VICTORY_KEEP_SNAPSHOTS_MIN_KB`, default `0` so `< 1 MiB` CPU-compared UAV
+/// buffers like the 160 KiB buffers are kept within `VICTORY_KEEP_SNAPSHOTS_MB`).
+fn kept_min_bytes() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_KEEP_SNAPSHOTS_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            << 10
     })
 }
 
@@ -3418,6 +3733,13 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the memory behind the copy is confirmed `MEM_PRIVATE` with
+    /// kernel write-watching (never a section view, never guarded).
+    #[inline]
+    pub(crate) fn is_private_watched(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == 1
+    }
+
     /// Whether a submission asks the kernel about the copy's ranges ahead:
     /// not of memory that is not watched, nor of view memory, which the
     /// kernel would refuse (and with it the ranges asked about together).
@@ -3514,6 +3836,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            gpu_only_state: AtomicU8::new(GPU_ONLY_OBSERVING),
         }
     }
 
@@ -3550,6 +3873,11 @@ impl Shadow {
         }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
+        if self.gpu_only_skip() {
+            GPU_ONLY_STATS[3].fetch_add(1, Ordering::Relaxed);
+            GPU_ONLY_STATS[4].fetch_add(len, Ordering::Relaxed);
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -3901,10 +4229,10 @@ impl Shadow {
             return;
         }
         if keeps() {
-            // Kept for the next submission, if it is worth it (a megabyte
-            // or more) and there is room.
+            // Kept for the next submission if it meets the size threshold and
+            // fits in `VICTORY_KEEP_SNAPSHOTS_MB`.
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            if !kept.1 && self.len >= 1 << 20 {
+            if !kept.1 && self.len >= kept_min_bytes() {
                 if KEPT_BYTES.fetch_add(self.len, Ordering::Relaxed) + self.len <= kept_most() {
                     kept.1 = true;
                 } else {
@@ -4866,6 +5194,130 @@ impl Shadow {
         before.is_some()
     }
 
+    /// Marks all pieces in `Card::hash_stale` stale (e.g. after demoting a
+    /// `VICTORY_GPU_ONLY_COPYBACK` buffer so the next compare re-hashes it).
+    pub(crate) fn card_mark_all_hash_stale(&self) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let mut stale = card.hash_stale.lock().unwrap_or_else(|e| e.into_inner());
+        if stale.is_empty() {
+            return;
+        }
+        let pieces = card_hash_pieces(card.size);
+        mark_stale_bits(&mut stale, 0, pieces);
+    }
+
+    /// Whether this card buffer is promoted to GPU-only copyback elision.
+    #[inline]
+    pub(crate) fn gpu_only_skip(&self) -> bool {
+        gpu_only_mode() > 0 && self.gpu_only_state.load(Ordering::Acquire) == GPU_ONLY_PROMOTED
+    }
+
+    /// Permanently demotes this buffer out of GPU-only copyback elision and
+    /// marks its `Card::before` hashes stale so the next compare is exact.
+    pub(crate) fn demote_gpu_only(&self, reason: &'static str) {
+        let prev = self.gpu_only_state.swap(GPU_ONLY_DEMOTED, Ordering::AcqRel);
+        if prev == GPU_ONLY_PROMOTED {
+            GPU_ONLY_STATS[0].fetch_sub(1, Ordering::Relaxed);
+            GPU_ONLY_STATS[1].fetch_sub(self.len, Ordering::Relaxed);
+            GPU_ONLY_STATS[2].fetch_add(1, Ordering::Relaxed);
+            self.card_mark_all_hash_stale();
+            tracing::info!(
+                start = format_args!("{:#x}", self.start),
+                len = self.len,
+                reason,
+                "gpu-only card buffer demoted back to normal copyback (VICTORY_GPU_ONLY_COPYBACK)"
+            );
+        }
+    }
+
+    /// Records CPU upload ranges (copy offsets) for `VICTORY_GPU_ONLY_COPYBACK`.
+    fn gpu_only_note_upload(&self, ranges: &[(usize, usize)]) {
+        let mode = gpu_only_mode();
+        if mode == 0 || self.window || self.len < gpu_only_min_bytes() {
+            return;
+        }
+        let state = self.gpu_only_state.load(Ordering::Acquire);
+        if state == GPU_ONLY_DEMOTED {
+            return;
+        }
+        let Some(card) = &self.card else {
+            return;
+        };
+        let promoted = state == GPU_ONLY_PROMOTED;
+        let demote = {
+            let mut tracker = card.gpu_only.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hit = false;
+            for &(a, b) in ranges {
+                if a >= b {
+                    continue;
+                }
+                let pieces = self.pieces(a, b);
+                if tracker.note_upload(mode, promoted, pieces.start, pieces.end) {
+                    hit = true;
+                    break;
+                }
+            }
+            hit
+        };
+        if demote {
+            self.demote_gpu_only(if mode == 1 { "cpu upload" } else { "overlapping cpu upload" });
+        }
+    }
+
+    /// Records GPU-fetched ranges `(lo, hi)` (copy offsets) for
+    /// `VICTORY_GPU_ONLY_COPYBACK` and promotes eligible buffers after warmup.
+    pub(crate) fn gpu_only_note_fetched(&self, ranges: &[(usize, usize)]) {
+        let mode = gpu_only_mode();
+        if mode == 0 || self.window || self.len < gpu_only_min_bytes() || ranges.is_empty() {
+            return;
+        }
+        if self.gpu_only_state.load(Ordering::Acquire) != GPU_ONLY_OBSERVING {
+            return;
+        }
+        let Some(card) = &self.card else {
+            return;
+        };
+        let frame = crate::frame::current();
+        let mut pieces: Vec<usize> = Vec::with_capacity(ranges.len());
+        for &(lo, hi) in ranges {
+            if lo < hi {
+                pieces.extend(self.pieces(lo, hi));
+            }
+        }
+        let (promote, demote) = {
+            let mut tracker = card.gpu_only.lock().unwrap_or_else(|e| e.into_inner());
+            tracker.note_fetched(mode, frame, &pieces)
+        };
+        if demote {
+            self.demote_gpu_only("overlapping cpu/gpu warmup");
+            return;
+        }
+        if promote {
+            if has_overlapping_shadow(self.start, self.len, self.id) {
+                self.demote_gpu_only("overlapping host copy");
+                return;
+            }
+            if self
+                .gpu_only_state
+                .compare_exchange(GPU_ONLY_OBSERVING, GPU_ONLY_PROMOTED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Preserve GPU-written bytes if the CPU ever writes another dword in the same page.
+                self.keep_stores();
+                GPU_ONLY_STATS[0].fetch_add(1, Ordering::Relaxed);
+                GPU_ONLY_STATS[1].fetch_add(self.len, Ordering::Relaxed);
+                tracing::info!(
+                    start = format_args!("{:#x}", self.start),
+                    len = self.len,
+                    mode,
+                    "gpu-only card buffer promoted: skipping compare/fetch/merge copyback (VICTORY_GPU_ONLY_COPYBACK)"
+                );
+            }
+        }
+    }
+
     /// Marks the 64 KiB pieces touched by `ranges` (copy offsets) as having
     /// stale hashes in `Card::before` so they are lazily re-hashed before a
     /// submission next compares them.
@@ -5122,6 +5574,7 @@ impl Shadow {
                 sent: Mutex::default(),
                 touched: Default::default(),
                 hash_stale: Mutex::default(),
+                gpu_only: Mutex::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -5279,6 +5732,7 @@ mod land_tests {
             sent: Mutex::default(),
             touched: Default::default(),
             hash_stale: Mutex::default(),
+            gpu_only: Mutex::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5784,6 +6238,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     touched: Default::default(),
                     hash_stale: Mutex::default(),
+                    gpu_only: Mutex::default(),
                     size,
                 };
                 (on_card, data, Some(card))
@@ -5812,10 +6267,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
         let shadow = Arc::new(shadow);
+        let new_id = shadow.id;
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            gpu_only_note_bounds(key.0, len);
         }
-        entry.shadow = Some(shadow);
+        entry.shadow = Some(shadow.clone());
+        drop(map);
+        demote_overlapping_gpu_only(key.0, len, new_id, "overlapping buffer shadow");
+        return Some(shadow);
     }
     entry.shadow.clone()
 }
@@ -6016,10 +6476,12 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         sent: Mutex::default(),
         touched: Default::default(),
         hash_stale: Mutex::default(),
+        gpu_only: Mutex::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    demote_overlapping_gpu_only(start, len, shadow.id, "overlapping address shadow");
     Some(shadow)
 }
 
@@ -6111,6 +6573,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 touched: Default::default(),
                 hash_stale: Mutex::default(),
+                gpu_only: Mutex::default(),
                 size: len,
             };
             (on_card, data, Some(card))
@@ -6135,8 +6598,11 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
+    let new_id = shadow.id;
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    drop(map);
+    demote_overlapping_gpu_only(start, len, new_id, "overlapping loose window");
     Some(shadow)
 }
 
@@ -6196,7 +6662,10 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let new_id = shadow.id;
     map.insert((address, len), (shadow.clone(), now));
+    drop(guard);
+    demote_overlapping_gpu_only(address, len, new_id, "overlapping exact view");
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)

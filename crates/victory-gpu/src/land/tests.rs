@@ -457,7 +457,7 @@ fn what_landing_costs() {
                             let mut notes = Notes::default();
                             for &(at, now, held) in &landing[jobs[j].clone()] {
                                 // SAFETY: each its own bytes.
-                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside, std::ptr::null()) };
+                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside, false, std::ptr::null()) };
                             }
                             notes.flush();
                         });
@@ -467,4 +467,56 @@ fn what_landing_costs() {
         }
         busy.store(false, Ordering::Relaxed);
     });
+}
+
+/// Write-watched `MEM_PRIVATE` pieces merge directly in one pass without
+/// `beside()` lookups or guard opening, producing byte-identical title/held
+/// memory and recording only modified 4 KiB pages in `watch::landed_lately`.
+#[test]
+fn private_watched_piece_merges_directly_and_notes_only_changed_pages() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    assert!(crate::safecopy::on());
+    // SAFETY: private write-watched buffer of our own, freed at end.
+    let base = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+    assert_ne!(base, 0);
+    let mut base_bytes = vec![0x33u8; BLOCK];
+    for (i, b) in base_bytes.iter_mut().enumerate() {
+        *b = (i.wrapping_mul(17) ^ 0x5a) as u8;
+    }
+    let mut now = base_bytes.clone();
+    // Mutate pages 2 and 11 only.
+    for p in [2usize, 11] {
+        for off in (0..PAGE).step_by(64) {
+            now[p * PAGE + off..p * PAGE + off + 4].copy_from_slice(&(0xdead_0000u32 + p as u32).to_le_bytes());
+        }
+    }
+    let mut title_a = base_bytes.clone();
+    let mut held_a = base_bytes.clone();
+    let mut held_b = base_bytes.clone();
+    // SAFETY: committed allocation of `BLOCK` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(base_bytes.as_ptr(), base as *mut u8, BLOCK) };
+
+    let mut notes_a = Notes::default();
+    let mut notes_b = Notes::default();
+    // SAFETY: both slices and `base` are `BLOCK` bytes.
+    let put_direct = unsafe {
+        piece_at(title_a.as_mut_ptr() as usize, now.as_ptr(), held_a.as_mut_ptr(), &[(0, BLOCK)], true, &mut notes_a, false, false, std::ptr::null())
+    };
+    let put_private = unsafe {
+        piece_at(base, now.as_ptr(), held_b.as_mut_ptr(), &[(0, BLOCK)], true, &mut notes_b, true, true, std::ptr::null())
+    };
+    notes_a.flush();
+    notes_b.flush();
+
+    assert_eq!(put_private, put_direct);
+    assert_eq!(held_b, held_a);
+    // SAFETY: committed allocation of `BLOCK` bytes.
+    let landed_bytes = unsafe { std::slice::from_raw_parts(base as *const u8, BLOCK) };
+    assert_eq!(landed_bytes, title_a.as_slice());
+    assert!(crate::watch::landed_lately(base + 2 * PAGE, PAGE, 1));
+    assert!(crate::watch::landed_lately(base + 11 * PAGE, PAGE, 1));
+    assert!(!crate::watch::landed_lately(base + 5 * PAGE, PAGE, 1), "unchanged interior page not falsely stamped");
+    // SAFETY: our own allocation.
+    unsafe { VirtualFree(base as _, 0, MEM_RELEASE) };
 }

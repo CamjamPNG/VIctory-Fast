@@ -1026,29 +1026,36 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
-    let took = started.elapsed();
+    recorded_batch(1, started.elapsed());
+}
+
+/// `calls` list calls on this thread have returned in `took` elapsed time.
+pub(crate) fn recorded_batch(calls: u64, took: std::time::Duration) {
+    if calls == 0 {
+        return;
+    }
     let ns = took.as_nanos() as u64;
     crate::timeline::called(took);
-    add(C::RecordCalls, 1);
+    add(C::RecordCalls, calls);
     add(C::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
     }
     OURS.with(|o| o.set(o.get() + ns));
-    let (unsent, calls) = UNSENT.with(|u| u.get());
-    let (unsent, calls) = (unsent + ns, calls + 1);
+    let (unsent, prev_calls) = UNSENT.with(|u| u.get());
+    let (unsent, total_calls) = (unsent + ns, prev_calls + calls);
     // By thread, a couple of milliseconds at a time.
     if unsent < 2_000_000 {
-        UNSENT.with(|u| u.set((unsent, calls)));
+        UNSENT.with(|u| u.set((unsent, total_calls)));
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
-        Some(r) => (r.1, r.2) = (r.1 + unsent, r.2 + calls),
-        None => all.push((id, unsent, calls)),
+        Some(r) => (r.1, r.2) = (r.1 + unsent, r.2 + total_calls),
+        None => all.push((id, unsent, total_calls)),
     }
 }
 

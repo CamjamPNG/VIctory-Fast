@@ -930,6 +930,36 @@ pub(crate) fn release_dynamic(heap: usize, id: u64, first: u32, n: u32) {
     }
 }
 
+/// Gives back a batch of dynamic slot ranges `(heap, id, first, n)` with one
+/// `SHADER_HEAPS` read lock and one `HostHeap` dynamic-pool lock per heap.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(ranges: &[(usize, u64, u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    if ranges.len() == 1 {
+        let (heap, id, first, n) = ranges[0];
+        release_dynamic(heap, id, first, n);
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut i = 0;
+    while i < ranges.len() {
+        let (heap, id, _, _) = ranges[i];
+        let mut end = i + 1;
+        while end < ranges.len() && ranges[end].0 == heap && ranges[end].1 == id {
+            end += 1;
+        }
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_batch(id, &ranges[i..end]);
+        }
+        i = end;
+    }
+}
+
 /// Runs `f` with the host heap of the title's largest view heap, if there is
 /// one (nothing is waited for).
 #[cfg(windows)]
@@ -1613,6 +1643,29 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     (words[0] == VIEW_TAG).then_some(words)
+}
+
+/// If `words` is an inline constant-buffer record, returns `(address, size)`
+/// directly without locking `VIEWS` or entering `LIST_VIEWS`.
+#[inline]
+pub(crate) fn inline_constant(words: [u32; 3]) -> Option<(u64, u32)> {
+    if words[0] == VIEW_TAG && (words[2] >> KIND_SHIFT) == CONSTANT {
+        match constant_of(words[1], words[2]) {
+            View::Constant(address, size) => Some((address, size)),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// Decodes a view from already-read `[tag, i, generation]` record words.
+#[inline]
+pub(crate) fn view_from_words(words: [u32; 3]) -> Option<View> {
+    if words[0] != VIEW_TAG {
+        return None;
+    }
+    view_at(words[1], words[2])
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

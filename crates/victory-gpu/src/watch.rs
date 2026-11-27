@@ -2639,6 +2639,18 @@ pub(crate) fn landing(at: usize, len: usize) {
     writing(at, len);
 }
 
+/// Records 4 KiB pages landed directly into write-watched `MEM_PRIVATE` title
+/// memory (no section views or guards exist there).
+pub(crate) fn note_landed_pages(pages: &[usize]) {
+    if pages.is_empty() {
+        return;
+    }
+    let frame = crate::frame::current();
+    for &page in pages {
+        LANDED.note(page, frame);
+    }
+}
+
 
 /// What shaders wrote went into title memory through another view of the
 /// same pages (`crate::inplace::beside`): `pages` (of 4 KiB, by number)

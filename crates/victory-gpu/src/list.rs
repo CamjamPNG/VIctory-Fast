@@ -200,14 +200,14 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 pub(crate) struct Detached {
     host: crate::host::HostList,
     _uploads: Vec<Upload>,
-    _state: crate::draw::State,
+    tables: crate::draw::DynamicLease,
 }
 
 #[cfg(windows)]
 impl Detached {
     /// A closed list of ours, to run among a title's.
     pub(crate) fn ours(host: crate::host::HostList) -> Self {
-        Detached { host, _uploads: Vec::new(), _state: Default::default() }
+        Detached { host, _uploads: Vec::new(), tables: Default::default() }
     }
 
     pub(crate) fn host(&self) -> &crate::host::HostList {
@@ -217,7 +217,7 @@ impl Detached {
     /// Releases this list's dynamic descriptor slots once its GPU submission
     /// has completed, without waiting for the full `bury_lag` allocator delay.
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        self.tables.release();
     }
 }
 
@@ -310,9 +310,9 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         return;
     }
     let cap = crate::host::current_allocator_caps().0;
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, Detached { host, _uploads, tables }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
-        drop(_state);
+        drop(tables);
         drop(_uploads);
         if !ran.contains(&i)
             || cap == 0
@@ -462,7 +462,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
-        let state = std::mem::take(&mut *list.state.lock().unwrap_or_else(|e| e.into_inner()));
+        let tables = list.state.lock().unwrap_or_else(|e| e.into_inner()).take_dynamic();
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
@@ -472,7 +472,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
                     Detached {
                         host: part.host,
                         _uploads: Vec::new(),
-                        _state: Default::default(),
+                        tables: Default::default(),
                     },
                 )
             })
@@ -482,7 +482,7 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             Detached {
                 host,
                 _uploads: uploads,
-                _state: state,
+                tables,
             },
         ));
         let mut last = None;
@@ -522,15 +522,18 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it (which lazily takes a fresh list).
-        let (host, uploads, state) = unsafe {
+        let (host, uploads, tables) = unsafe {
             let Some(host) = (*list).host.take() else {
                 continue;
             };
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
-            let state =
-                std::mem::take(&mut *(*list).state.lock().unwrap_or_else(|e| e.into_inner()));
-            (host, uploads, state)
+            let tables = (*list)
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_dynamic();
+            (host, uploads, tables)
         };
         order.push(taken.len());
         taken.push((
@@ -538,7 +541,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             Detached {
                 host,
                 _uploads: uploads,
-                _state: state,
+                tables,
             },
         ));
     }
@@ -691,6 +694,13 @@ extern "system" fn close(this: This) -> HRESULT {
     let _called = crate::timeline::span("the title's Close");
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        // Return any unused tail of this list's dynamic descriptor bump slab
+        // immediately so closed/in-flight lists hold zero wasted slots.
+        // SAFETY: `this` is one of our lists (checked non-null by `host_list`).
+        unsafe { &(*this.cast::<List>()).state }
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim_dynamic_slab();
         host.close();
     }
     S_OK
@@ -701,10 +711,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     let _called = crate::timeline::span("the title's list Reset");
     // A wait recorded and never submitted goes with the recording.
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|&(list, _)| list != this as usize);
+    if VALUE_WAITS_COUNT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+        waits.retain(|&(list, _)| list != this as usize);
+        VALUE_WAITS_COUNT.store(waits.len(), std::sync::atomic::Ordering::Release);
+    }
     // Every submission of the list has run (submissions are waited for).
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
@@ -1962,16 +1973,20 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
+        let mut buf = [0u64; 8];
+        let n = if handles.is_null() { 0 } else { (count as usize).min(8) };
+        if one_range != 0 && n > 0 {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
+            for (i, h) in buf[..n].iter_mut().enumerate() {
+                *h = first + 128 * i as u64;
+            }
+        } else if n > 0 {
+            buf[..n].copy_from_slice(items(handles, n as u32));
+        }
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
-        with_state(this, |list, s| s.set_targets(list, &handles, depth));
+        with_state(this, |list, s| s.set_targets(list, &buf[..n], depth));
     }
     pub(super) extern "system" fn draw(
         this: This,
@@ -2071,6 +2086,68 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn execute_indirect_with(
+    list: &crate::host::HostList,
+    state: &mut crate::draw::State,
+    signature: This,
+    max: u32,
+    arguments: This,
+    offset: u64,
+    count: This,
+    count_offset: u64,
+) {
+    count_draw();
+    let Some((stride, args)) = crate::signature::layout(signature) else {
+        return;
+    };
+    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
+    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let ran = if let Some(address) = address
+        && !args.is_empty()
+        && (count.is_null() || counter.is_some())
+    {
+        state.execute_indirect_signature(list, stride, args, max, address, counter)
+    } else {
+        #[cfg(feature = "diagnostics")]
+        crate::pipeline::note_why(format!(
+            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
+            address.is_some(),
+            count.is_null() || counter.is_some()
+        ));
+        false
+    };
+    if ran {
+        return;
+    }
+    record_dropped_indirect(signature, stride, args, max, address, !count.is_null());
+}
+
+fn record_dropped_indirect(
+    signature: This,
+    stride: u32,
+    args: &[[u32; 4]],
+    max: u32,
+    address: Option<u64>,
+    counted: bool,
+) {
+    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(signature as usize)) {
+        seen.push(signature as usize);
+        tracing::info!(
+            stride,
+            ?args,
+            max,
+            address = ?address.map(|a| format!("{a:#x}")),
+            counted,
+            "indirect execution dropped (first time for this signature)"
+        );
+    }
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. Supports both single-argument signatures (draw, indexed draw,
 /// dispatch, single-pass dispatch type 105, mesh dispatch) and multi-argument
@@ -2085,46 +2162,21 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    #[cfg(windows)]
+    {
+        if host_list(this).is_some() {
+            with_state(this, |list, s| {
+                execute_indirect_with(list, s, signature, max, arguments, offset, count, count_offset);
+            });
+            return;
+        }
+    }
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
-    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
-    let mut ran = false;
-    #[cfg(windows)]
-    if let Some(address) = address
-        && !args.is_empty()
-        && (count.is_null() || counter.is_some())
-    {
-        with_state(this, |list, s| {
-            ran = s.execute_indirect_signature(list, stride, args, max, address, counter);
-        });
-    } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        crate::pipeline::note_why(format!(
-            "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
-            address.is_some(),
-            count.is_null() || counter.is_some()
-        ));
-    }
-    if ran {
-        return;
-    }
-    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&(signature as usize)) {
-        seen.push(signature as usize);
-        tracing::info!(
-            stride,
-            ?args,
-            max,
-            address = ?address.map(|a| format!("{a:#x}")),
-            counted = !count.is_null(),
-            "indirect execution dropped (first time for this signature)"
-        );
-    }
+    record_dropped_indirect(signature, stride, args, max, address, !count.is_null());
 }
 
 /// Indirect executions dropped since the last call.
@@ -2238,6 +2290,7 @@ impl ValueWait {
 
 /// The waits lists recorded since their last reset, by list.
 static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
+static VALUE_WAITS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The waits of the submitted `lists` that are not met yet (taken from
 /// them): what the console's GPU would stop at. The title orders work
@@ -2248,6 +2301,9 @@ static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex
 /// shortcut: a wait holds its whole list (and submission) back, not only
 /// the commands after it.
 pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
+    if VALUE_WAITS_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut unmet = Vec::new();
     waits.retain(|&(list, wait)| {
@@ -2259,6 +2315,7 @@ pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
         }
         false
     });
+    VALUE_WAITS_COUNT.store(waits.len(), std::sync::atomic::Ordering::Release);
     unmet
 }
 
@@ -2266,6 +2323,9 @@ pub(crate) fn unmet_waits(lists: &[This]) -> Vec<ValueWait> {
 /// met or not, at the list's first place in the submission.
 #[cfg(windows)]
 pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
+    if VALUE_WAITS_COUNT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return vec![Vec::new(); lists.len()];
+    }
     let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
     let mut by = vec![Vec::new(); lists.len()];
     waits.retain(|&(list, wait)| {
@@ -2277,6 +2337,7 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
             None => true,
         }
     });
+    VALUE_WAITS_COUNT.store(waits.len(), std::sync::atomic::Ordering::Release);
     by
 }
 
@@ -2313,10 +2374,9 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
         cut(this, wait);
         return;
     }
-    VALUE_WAITS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((this as usize, wait));
+    let mut waits = VALUE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+    waits.push((this as usize, wait));
+    VALUE_WAITS_COUNT.store(waits.len(), std::sync::atomic::Ordering::Release);
 }
 extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
     wait_for(this, address, comparison, reference, false);

@@ -637,7 +637,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    if role == Role::Reflect && (reflect_cap() <= 0.0 || rays_run()) {
+    if role == Role::Reflect && (reflect_cap() <= 0.0 || (rays_run() && rt_band().is_none())) {
         return false;
     }
     static SAID: [std::sync::atomic::AtomicBool; 4] = [const { std::sync::atomic::AtomicBool::new(false) }; 4];

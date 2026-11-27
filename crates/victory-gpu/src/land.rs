@@ -503,16 +503,19 @@ fn anytime() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
 }
 
-/// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
+/// What a job wrote beside the guards (or into write-watched private memory),
+/// to be noted ([`Notes::flush`]).
 #[derive(Default)]
 pub(crate) struct Notes {
-    /// Pages of 4 KiB, by number.
+    /// Pages of 4 KiB written through `beside`, by number.
     pages: Vec<usize>,
     /// Per piece, from the first such page to the last: address, bytes.
     spans: Vec<(usize, usize)>,
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    /// Pages of 4 KiB written directly into write-watched `MEM_PRIVATE` memory.
+    private_pages: Vec<usize>,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -546,6 +549,10 @@ static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 impl Notes {
     /// At the end of a job: what it wrote beside the guards is noted.
     pub(crate) fn flush(&mut self) {
+        if !self.private_pages.is_empty() {
+            crate::watch::note_landed_pages(&self.private_pages);
+            self.private_pages.clear();
+        }
         if self.pages.is_empty() {
             return;
         }
@@ -589,14 +596,19 @@ pub(crate) unsafe fn piece(
     notes: &mut Notes,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
+    // Write-watched `MEM_PRIVATE` copies have neither section views nor guards,
+    // so skip `beside()` lookups, the redundant `differ()` pre-pass, and guard
+    // opening and merge directly into title memory in one pass.
+    let private_watched = !copy.is_null() && unsafe { (&*copy).is_private_watched() };
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
+    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), private_watched, copy) }
 }
 
 /// [`piece`], and whether a view of ours is looked for.
 ///
 /// # Safety
 /// [`piece`]'s.
+#[allow(clippy::too_many_arguments)]
 unsafe fn piece_at(
     title: usize,
     now: *const u8,
@@ -605,6 +617,7 @@ unsafe fn piece_at(
     take: bool,
     notes: &mut Notes,
     beside: bool,
+    private_watched: bool,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     let Some(end) = parts.last().map(|p| p.1) else {
@@ -614,15 +627,19 @@ unsafe fn piece_at(
     // view's address stays where the title sees `title`. Not waited for: if
     // a change is under way, what the record of the views says now does
     // ([`anytime`]), or the title's own address.
-    let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
-    let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
+    let reading = (beside && !private_watched).then(crate::watch::title_memory_reading_now).flatten();
+    let beside = if !private_watched && (reading.is_some() || beside && anytime()) {
+        crate::inplace::beside(title, end)
+    } else {
+        None
+    };
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
-    if beside.is_none() {
+    if beside.is_none() && !private_watched {
         drop(reading);
         differing.fill(false);
         for_pages(title, parts, |from, n| {
@@ -685,6 +702,11 @@ unsafe fn piece_at(
                 }
                 let s = span.get_or_insert((title + from, title + from + n));
                 s.1 = title + from + n;
+            } else if private_watched {
+                let page = (title + from) / PAGE;
+                if notes.private_pages.last() != Some(&page) {
+                    notes.private_pages.push(page);
+                }
             }
         }
     });

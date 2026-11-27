@@ -105,6 +105,7 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
 
 /// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
 pub(crate) fn refresh() {
+    refresh_vram();
     let Some(status) = memory_status() else { return };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
@@ -135,8 +136,60 @@ pub(crate) fn headroom() -> Option<u64> {
     (bytes != u64::MAX).then_some(bytes)
 }
 
+/// Samples the card's local memory against the budget this layer holds
+/// itself to (`crate::resource::vram_target`) and says when it goes over and
+/// when it comes back. A card the layer holds no target for is never over
+/// one, so nothing here fires on it.
+fn refresh_vram() {
+    let Some([reported, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return;
+    };
+    let target = crate::resource::vram_target(reported);
+    let was = vram_pressured();
+    let pressure = target != reported && next_vram_pressure(was, used, target);
+    if pressure != was {
+        VRAM_PRESSURED.store(pressure, Ordering::Relaxed);
+        if pressure {
+            tracing::info!(
+                frame = crate::frame::current(),
+                local_used_mib = used >> 20,
+                vram_target_mib = target >> 20,
+                "the card is over the VRAM target: limiting what is prefetched and kept ahead"
+            );
+        } else {
+            tracing::info!(
+                frame = crate::frame::current(),
+                local_used_mib = used >> 20,
+                vram_target_mib = target >> 20,
+                "the card is back under its VRAM target"
+            );
+        }
+    }
+}
+
 pub(crate) fn pressured() -> bool {
     PRESSURED.load(Ordering::Relaxed)
+}
+
+static VRAM_PRESSURED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the card's local memory is over the budget this layer holds
+/// itself to, with the same kind of hysteresis as the host's: over at 92 %
+/// of it, under again at or below 85 %. A single threshold would oscillate
+/// between starving the texture queue and thrashing the card, which is worse
+/// than either.
+fn next_vram_pressure(was: bool, used: u64, target: u64) -> bool {
+    if target == 0 {
+        return false;
+    }
+    let percent = (u128::from(used) * 100 / u128::from(target)).min(255) as u64;
+    if was { percent > 85 } else { percent >= 92 }
+}
+
+/// Whether the card is over its target ([`next_vram_pressure`]). False on
+/// every card whose reported budget the layer is not holding itself under.
+pub(crate) fn vram_pressured() -> bool {
+    VRAM_PRESSURED.load(Ordering::Relaxed)
 }
 
 /// True when OS commit headroom is critically low (< 1.5 GiB) or an allocation
@@ -197,5 +250,25 @@ mod tests {
         assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
         assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
         assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+    }
+
+    /// Over at 92 % of the target and back at or under 85 % of it: a single
+    /// threshold would flip between a starved queue and a thrashing card
+    /// every frame.
+    #[test]
+    fn the_card_is_over_its_target_with_hysteresis() {
+        let target = 5_200 << 20;
+        assert!(!next_vram_pressure(false, 4_700 << 20, target));
+        assert!(next_vram_pressure(false, 4_800 << 20, target));
+        assert!(next_vram_pressure(true, 4_500 << 20, target));
+        assert!(!next_vram_pressure(true, 4_400 << 20, target));
+        // No target (a card held to what the system reports): never over.
+        assert!(!next_vram_pressure(false, 6 * GIB, 0));
+        // 4 GiB and 8 GiB cards: 3,400 MB is over a 4 GiB card's target and
+        // far under an 8 GiB one's, which is that card's reported budget.
+        let small = crate::resource::vram_target_for(4 * GIB, None);
+        assert!(next_vram_pressure(false, 3_400 << 20, small));
+        let large = crate::resource::vram_target_for(8 * GIB, None);
+        assert!(!next_vram_pressure(false, 3_400 << 20, large));
     }
 }

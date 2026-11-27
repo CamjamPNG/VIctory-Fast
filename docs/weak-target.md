@@ -54,6 +54,7 @@ it set, so your own overrides win.
 | `VICTORY_WIDE_THREADS` | `4` | The copyback workers in `shadow.rs` (snapshots of shader-written ranges and the compares that find them, 6 by default under `VICTORY_WIDE_BACK=1`). They run inside the frame, so 4 leaves the submitting thread a core; a longer compare wall is the cost. |
 | `VICTORY_PIPELINE_WORKERS` | `4` | First-run stalls for frame time: pipeline making happens below the title's own threads, 8 workers by default on this machine's 12 logical processors. Four means a cold cache takes longer to fill; it also means fewer threads stealing frames while it fills. |
 | `VICTORY_JOIN_PARTS` | `4` | How many parts of a submission are prepared as one (8 in `pareto-residency`): fewer parts joined is less work stolen from the frame, and a little more per-submission latency. |
+| `VICTORY_VRAM_TARGET_MB` | (not set) | How much of the card this layer lets itself hold. Unset, the code computes 5,200 MB here (`resource.rs`, `VRAM_CEILING`) and measures admission, the mip caps, eviction and the empty blocks it keeps against that figure instead of the 5.4-6.1 GiB the driver reports. Set it to move the line: it is clamped to between 1 GiB and the reported budget less the desktop's share, so it cannot oversubscribe the card. Turn it down if the log shows the card full and frames waiting; turn it up if textures are refused while the card has room. |
 
 ### The 2/3 clamp, and `weak-540`
 
@@ -115,15 +116,43 @@ later, moving the cache back is one line — set `VICTORY_CACHE_DIR` before the 
   full, which on 6 GB is most of a session; forcing `0` would only add the
   re-upload churn the comment there counts.
 - **`VICTORY_TEXTURE_ROOM_PERCENT`** (default 90). `VICTORY_TEXTURE_BUDGET_MB`
-  replaces that branch of the same decision outright.
+  caps those copies' bytes, but the card's own line is still read under it
+  once `VICTORY_VRAM_TARGET_MB` or the computed target applies, so this
+  percentage is no longer bypassed: 90 holds the queue a tenth of the target
+  below the line, which is where the thrash in runs 20 and 24 began.
 - **`VICTORY_FAST_CORES`** (default 2). It moves threads onto the fastest
   efficiency class where a CPU has two; a 3600 has one, and the code returns
   without asking.
 - **`VICTORY_CARD_ROOM_FOR_TARGETS_MB`** (default 3072). It only feeds the
-  room test that `VICTORY_TEXTURE_BUDGET_MB` pre-empts, so on this preset it is
-  unread.
+  room test, which is now read under `VICTORY_TEXTURE_BUDGET_MB` as well, so
+  on this preset it is read: it is the room the queue leaves for render
+  targets and the card copies of title buffers, and 3,072 MB is the default.
 - **`VICTORY_FRAME_INTERVAL_MS`**, **`VICTORY_WINDOW_MAX`**: they change what a
   frame *is* rather than how fast it is made, and this preset is the baseline.
+
+### The VRAM hold, and the line to keep
+
+On this card the layer does not budget against the 5.4-6.1 GiB the driver
+reports, because Windows keeps a slice of that for the desktop and the rest is
+where the system starts moving the card's memory into the PC's over PCIe 3.0.
+It computes a target instead — 5,200 MB here (`resource.rs`, `VRAM_CEILING`),
+what is left of the reported budget after the desktop's eighth, whichever is
+lower — and every VRAM share is measured against that figure: admission to the
+texture queue, the mip caps, the idle-keep bands and the empty blocks the pool
+retains. `VICTORY_VRAM_TARGET_MB` replaces the computed figure.
+
+Once a second the memory summary line carries it, and a second line follows
+with what it cost:
+
+```
+memory summary: RAM private <n> MB, working set <n> MB; VRAM local <used>/<reported> MB, SHR <used>/<budget> MB (holding to <target> MB, peak <peak> MB); buffers: ...
+vram target: <target> MB of the <reported> MB the system reports (computed: ceiling 5200 MB less the desktop's share), local in use <used> MB, peak <peak> MB; texture admissions refused <n> times, host copies of textures the title fills let go <n> (<n> MB) since the start; the card is over its target
+```
+
+`peak` is the highest local figure the driver reported all session; refusals are
+textures the queue deferred rather than made; the let-go counts are the sweep's.
+If `peak` sits above the target for long stretches, or refusals grow while the
+card is under it, raise `VICTORY_VRAM_TARGET_MB` by 200 and run the same scene.
 
 ## How to measure
 

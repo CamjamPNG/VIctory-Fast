@@ -1276,11 +1276,15 @@ fn memory_summary_line(frames: f64) {
     };
     let [local_budget, local_used, shared_budget, shared_used] =
         host().and_then(|h| h.video_memory()).unwrap_or_default();
+    // The budget this layer holds itself to ([`crate::resource::vram_target`]):
+    // the reported one on a card with room, less on a card that cannot keep
+    // the working set, so a measurement run records which it ran under.
+    let target = crate::resource::vram_target(local_budget);
     let (lists_live, lists_pooled, preludes_live, preludes_pooled) = allocator_counts();
     let frames = frames.max(1.0);
     tracing::info!(
         "memory summary: RAM private {:.0} MB, working set {:.0} MB; \
-         VRAM local {:.0}/{:.0} MB, SHR {:.0}/{:.0} MB; \
+         VRAM local {:.0}/{:.0} MB, SHR {:.0}/{:.0} MB (holding to {} MB, peak {} MB); \
          buffers: shadows {:.0} MB (bar {:.0} MB, card {:.0} MB), tex_stage {:.0} MB, scratch {:.0} MB; \
          allocators: lists {lists_live} live ({lists_pooled} pooled), \
          preludes {preludes_live} live ({preludes_pooled} pooled); \
@@ -1291,6 +1295,8 @@ fn memory_summary_line(frames: f64) {
         mb(local_budget),
         mb(shared_used),
         mb(shared_budget),
+        target >> 20,
+        crate::resource::PEAK_LOCAL.load(Ordering::Relaxed) >> 20,
         mb(crate::shadow::live_span_bytes()),
         mb(crate::shadow::window_mapped_bytes()),
         mb(crate::shadow::card_live_bytes()),
@@ -1298,6 +1304,7 @@ fn memory_summary_line(frames: f64) {
         mb(ALIVE[2].load(Ordering::Relaxed)),
         faults_delta as f64 / frames,
     );
+    crate::resource::log_vram_target();
     #[cfg(feature = "diagnostics")]
     {
         let p_frames = PREP_PHASE_FRAMES.swap(0, Ordering::Relaxed).max(1) as f64;
@@ -13631,6 +13638,33 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    /// The sweep measures its shares against the budget this layer holds
+    /// itself to (`crate::resource::vram_target`), so the same use of a
+    /// 6 GiB card crosses a band earlier than the reported budget would put
+    /// it, and an 8 GiB or 16 GiB card keeps the numbers it had.
+    #[test]
+    fn a_starved_card_evicts_against_its_target() {
+        let gib = 1 << 30;
+        let used = 4_900 << 20;
+        let target = crate::resource::vram_target_for(6 * gib, None);
+        assert_eq!(target, 5_200 << 20);
+        // 4,900 MB is 79 % of the 6 GiB the system reports: nothing goes.
+        assert_eq!(super::vram_keep(6 * gib, used), (600_000, u64::MAX));
+        // …and 94 % of the target: enough goes to come down to 85 % of it.
+        let (ms, bytes) = super::vram_keep(target, used);
+        assert_eq!((ms, bytes), (1_500, used - target / 100 * 85));
+        assert_eq!(super::vram_idle_for(Some([6 * gib, used, 0, 0]), true), 2_500);
+        assert_eq!(super::vram_idle_for(Some([target, used, 0, 0]), true), 1_000);
+        // 4 GiB: the target is the reported budget less the system's share.
+        let small = crate::resource::vram_target_for(4 * gib, None);
+        assert_eq!(small, 3_584 << 20);
+        assert_eq!(super::vram_keep(4 * gib, 3_400 << 20), (600_000, u64::MAX));
+        assert!(super::vram_keep(small, 3_400 << 20).1 < u64::MAX);
+        // 8 GiB and 16 GiB report all they have and are held to all of it.
+        assert_eq!(crate::resource::vram_target_for(8 * gib, None), 8 * gib);
+        assert_eq!(crate::resource::vram_target_for(16 * gib, None), 16 * gib);
     }
 
     #[test]

@@ -71,10 +71,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
-        _ => SPARE,
-    }
+    // Against the budget this layer holds itself to, not the one the system
+    // reports: up to 4 GiB of empty blocks are kept only while the card is
+    // under 85 % of that budget, so a starved card keeps 128 MiB of them.
+    let Some([reported, used, ..]) = memory.filter(|_| keep) else {
+        return SPARE;
+    };
+    let target = crate::resource::vram_target(reported);
+    if u128::from(used) * 100 < u128::from(target) * 85 { SPARE_KEPT } else { SPARE }
 }
 
 /// Milliseconds until a piece given back is used again. (It was three

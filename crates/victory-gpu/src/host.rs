@@ -1761,7 +1761,7 @@ fn prelude_worker() -> &'static PreludeWorker {
             work_cv: std::sync::Condvar::new(),
             done_cv: std::sync::Condvar::new(),
         };
-        for i in 0..3 {
+        for i in 0..2 {
             let _ = std::thread::Builder::new()
                 .name(format!("victory-prelude-{i}"))
                 .spawn(|| {

@@ -164,6 +164,9 @@ const STACK_MODE: usize = 32;
 
 /// NUL-terminated UTF-16 path buffer: stack-backed for common lengths, heap
 /// fallback for long paths.
+// A stack buffer of 320 units is the point of this type: boxing it would put every
+// path on the heap, which is what the `Heap` arm is for and the common case avoids.
+#[allow(clippy::large_enum_variant)]
 enum WideBuf {
     Stack { buf: [u16; STACK_WIDE], len: usize },
     Heap(Vec<u16>),

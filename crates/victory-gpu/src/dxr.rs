@@ -536,12 +536,10 @@ impl<B: Clone> SlabAllocator<B> {
         let mut best: Option<(usize, usize, u64)> = None;
         'search: for (slab_idx, slab) in self.slabs.iter().enumerate() {
             for (free_idx, &(_, range_size)) in slab.free.iter().enumerate() {
-                if range_size >= need {
-                    if best.is_none_or(|(_, _, best_sz)| range_size < best_sz) {
-                        best = Some((slab_idx, free_idx, range_size));
-                        if range_size == need {
-                            break 'search;
-                        }
+                if range_size >= need && best.is_none_or(|(_, _, best_sz)| range_size < best_sz) {
+                    best = Some((slab_idx, free_idx, range_size));
+                    if range_size == need {
+                        break 'search;
                     }
                 }
             }
@@ -1368,7 +1366,7 @@ pub(crate) fn log_stats(frames: f64) {
 
 /// Sentinel guest key for the shared valid 0-instance empty TLAS used whenever
 /// a shader binds a null (`Location = 0`) RTAS SRV.
-const EMPTY_TLAS_KEY: u64 = u64::MAX & !0xFF;
+const EMPTY_TLAS_KEY: u64 = !0xFF;
 
 /// Ensures `guest_va` has a stable host TLAS slot of at least `min_bytes`.
 pub(crate) fn ensure_tlas_slot(guest_va: u64, min_bytes: u64) -> Option<(u64, ID3D12Resource)> {
@@ -1602,6 +1600,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 /// - `dw[14]`: `tri1` `PrimitiveIndex`
 /// - `dw[15]`: per-triangle permutation bytes matching `bvh.rs::TRIANGLE_VERTICES`
 ///   (`tri0: [0,1,2]`, `tri1: [1,3,2]`, winding `[first, i, j]` where `first = (3-i-j)&3`).
+///
 /// Unused or out-of-range slots emit degenerate NaN triangles (`0x7FC00000`) which
 /// DXR treats as inactive primitives.
 const EXTRACT_BVH4_HLSL: &str = r#"
@@ -1867,6 +1866,7 @@ pub fn prebuild_info(inputs: &GuestBuildAsInputs) -> Option<GuestPrebuildInfo> {
 }
 
 /// Queues a batch of dynamic BLAS/TLAS builds from `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn enqueue_build_batched(cmd_list: *const c_void, num_descs: u32, descs: *const GuestBatchedDesc2) {
     if !enabled() || cmd_list.is_null() || descs.is_null() || num_descs == 0 {
         return;
@@ -1934,6 +1934,7 @@ pub fn enqueue_copy(cmd_list: *const c_void, dest_va: u64, source_va: u64, mode:
 
 /// Queues static BLAS extraction + DXR build for a batch of rehydrated console BVH4s from
 /// `XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn enqueue_rehydrate_batched(
     cmd_list: *const c_void,
     num_descs: u32,
@@ -2023,7 +2024,7 @@ fn probe_bvh_bounds(va: u64, hint_bytes: u64) -> Option<(u64, u64)> {
             bytes = unpacked;
         }
     }
-    if bytes < 128 || bytes > MAX_PACKED_BVH_BYTES {
+    if !(128..=MAX_PACKED_BVH_BYTES).contains(&bytes) {
         return None;
     }
     // Use exact `num_elements` when header looks unpacked; otherwise conservative upper bound
@@ -4736,7 +4737,7 @@ mod tests {
             [4.0, 0.0, 0.0],
         ];
         // id_byte: canonical [0,1,2] is i=1, j=2 -> (2<<2)|1 = 0x09; rotated [1,2,0] is i=2, j=0 -> (0<<2)|2 = 0x02.
-        let n0 = make_node(v, (0 << 8) | 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
+        let n0 = make_node(v, 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
         // Geometry 2 (non-opaque, leaving geometry 1 empty), sparse prim0=5 (rotated), prim1=2 (canonical).
         let n1 = make_node(v, (2 << 8) | 0x80, 5, 2, 0x02 | (0x09 << 8));
         let dump = pack_dump(2, 128, 2, &[n0, n1]);
@@ -4771,7 +4772,7 @@ mod tests {
     #[test]
     fn decode_mixed_opacity_in_same_geom_is_non_opaque() {
         let v = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
-        let n0 = make_node(v, (0 << 8) | 1, 0, 0, 0x09);
+        let n0 = make_node(v, 1, 0, 0, 0x09);
         let n1 = make_node(v, 0 << 8, 1, 0, 0x09);
         let dump = pack_dump(2, 64, 2, &[n0, n1]);
 
@@ -4784,11 +4785,11 @@ mod tests {
     #[test]
     fn decode_skips_when_frame0_already_exact_and_upgrades_on_reorder() {
         let v = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
-        let exact = make_node(v, (0 << 8) | 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
+        let exact = make_node(v, 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
         assert!(decode_static_bvh4_nodes(0x3000, 1, &pack_dump(1, 64, 1, &[exact])).is_none());
 
         // Same single opaque geometry, but PrimitiveIndex swapped -> must upgrade.
-        let swapped = make_node(v, (0 << 8) | 0x80 | 1, 1, 0, 0x09 | (0x09 << 8));
+        let swapped = make_node(v, 0x80 | 1, 1, 0, 0x09 | (0x09 << 8));
         let upg = decode_static_bvh4_nodes(0x3000, 1, &pack_dump(1, 64, 1, &[swapped]))
             .expect("reordered prims must upgrade");
         assert_eq!(&upg.vertices[0..3], &[v[1], v[3], v[2]]);

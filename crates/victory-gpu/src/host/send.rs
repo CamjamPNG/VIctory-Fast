@@ -39,7 +39,7 @@ const SHORT: usize = 256;
 
 /// Whether a run of `len` bytes at offset `at` of a copy goes as pairs.
 fn short(at: usize, len: usize) -> bool {
-    len <= SHORT && at % 4 == 0 && len % 4 == 0
+    len <= SHORT && at.is_multiple_of(4) && len.is_multiple_of(4)
 }
 
 /// Whether a run of `len` bytes at offset `at` of a copy in the card's memory
@@ -127,9 +127,7 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() {
-        192 << 20
-    } else if crate::residency::limited_host_ram() {
+    if on_card() || crate::residency::limited_host_ram() {
         192 << 20
     } else {
         256 << 20

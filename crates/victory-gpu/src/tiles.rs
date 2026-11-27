@@ -358,13 +358,14 @@ fn return_runs(runs: &[(usize, u32, u32)]) {
                 continue;
             };
             h.coalesce();
-            if h.free_count == HEAP_TILES && live_heaps > 1 {
-                if let Some(removed) = pool[index].take() {
-                    live_heaps -= 1;
-                    STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-                    STATS[8].fetch_add(1, Ordering::Relaxed);
-                    dropped_heaps.push(removed.heap);
-                }
+            if h.free_count == HEAP_TILES
+                && live_heaps > 1
+                && let Some(removed) = pool[index].take()
+            {
+                live_heaps -= 1;
+                STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+                STATS[8].fetch_add(1, Ordering::Relaxed);
+                dropped_heaps.push(removed.heap);
             }
         }
     }
@@ -791,6 +792,7 @@ impl Tiled {
         changed
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn give_locked(
         &self,
         given: &mut Given,
@@ -2233,6 +2235,7 @@ void look() {
     }
 
     #[test]
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn card_wrote_failure_does_not_poison_card_mask() {
         let Some(host) = host() else {
             return;

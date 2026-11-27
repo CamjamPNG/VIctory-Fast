@@ -29,5 +29,12 @@ jobs:
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
+      # This step asserts compile, clippy and every test that can run without a
+      # GPU. Two groups are `#[ignore]`d because a runner cannot satisfy them:
+      # nine victory-gpu tests, where the runner loses its virtual device
+      # mid-run (HRESULT 0x887A0005), and two victory-shader record-count tests,
+      # where the WARP software adapter returns 0 and there is no SM 6.6
+      # hardware branch to fall back on. Both are run by the owner on real
+      # hardware: `cargo test -p victory-gpu -p victory-shader -- --ignored`.
       - name: Tests
         run: cargo test --workspace --locked

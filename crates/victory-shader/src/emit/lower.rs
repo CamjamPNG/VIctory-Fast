@@ -15529,9 +15529,9 @@ mod tests {
         // src0_sel=WORD_0 (4) << 16, src1_sel=WORD_0 (4) << 24.
         // Read v2 via v_readfirstlane_b32 + s_cmp + s_cbranch so v2 is live.
         let run = |dst_sel: u32, dst_unused: u32| {
-            let w0 = (0x32u32 << 25) | (2u32 << 17) | (0u32 << 9) | 0xF9;
+            let w0 = (0x32u32 << 25) | (2u32 << 17) | 0xF9;
             let w1 = (4u32 << 24) | (4u32 << 16) | (dst_unused << 11) | (dst_sel << 8);
-            let read_v2 = (0x3Fu32 << 25) | (0u32 << 17) | (0x02u32 << 9) | (256 + 2); // v_readfirstlane_b32 s0, v2
+            let read_v2 = (0x3Fu32 << 25) | (0x02u32 << 9) | (256 + 2); // v_readfirstlane_b32 s0, v2
             let cmp_s0 = 0xBF00_8000u32; // s_cmp_eq_u32 s0, 0
             let br = 0xBF84_0001u32; // s_cbranch_scc0 +1 (over first s_endpgm)
             let words = [w0, w1, read_v2, cmp_s0, br, S_ENDPGM, S_ENDPGM];

@@ -2097,9 +2097,8 @@ impl HostHeap {
             && want_n < too_long;
         let mut granted = min_n;
         let mut found = if try_want {
-            pool.find(want_n).map(|first| {
+            pool.find(want_n).inspect(|_| {
                 granted = want_n;
-                first
             })
         } else {
             None
@@ -3422,11 +3421,10 @@ impl HostHeap {
     fn clear_twin(&self, index: u32) {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && !self.copy_cached_null(self.raw + index, 1)
         {
-            if !self.copy_cached_null(self.raw + index, 1) {
-                null_buffer_view(self.at(self.raw + index));
-                self.put(self.raw + index);
-            }
+            null_buffer_view(self.at(self.raw + index));
+            self.put(self.raw + index);
         }
     }
 
@@ -5140,9 +5138,7 @@ fn make_twinned(
                 && crate::dxr::enabled()
             {
                 let guest_tlas_va = u64::from(desc[4]) | (u64::from(desc[5]) << 32);
-                let Some((host_tlas_gpu_va, slab_buf)) = crate::dxr::tlas_srv(guest_tlas_va) else {
-                    return None;
-                };
+                let (host_tlas_gpu_va, slab_buf) = crate::dxr::tlas_srv(guest_tlas_va)?;
                 let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: DXGI_FORMAT_UNKNOWN,
                     ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,

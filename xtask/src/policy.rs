@@ -10,8 +10,9 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-// (The translator's one file is 570 KiB of source.)
-const MAX_FILE_SIZE: usize = 640 * 1024;
+// (The translator's one file is 682 KiB of source; the cap is headroom, and the
+// asset policy proper is the extension allowlist plus the magic/NUL/run checks.)
+const MAX_FILE_SIZE: usize = 1024 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[

@@ -618,6 +618,7 @@ mod tests {
     /// a heap holds a reference to it (the heap lives while the texture does,
     /// whatever the pool drops).
     #[test]
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn a_placed_texture_holds_its_heap() {
         let Some(host) = crate::host::host() else { return };
         let desc = D3D12_HEAP_DESC {

@@ -30,6 +30,9 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// One variant carries a whole run's arguments; it is parsed once and dropped, so
+// the size of the largest variant costs nothing to hold.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {

@@ -40,7 +40,7 @@ Measured on **AMD Ryzen 7 7800X3D · AMD Radeon RX 9070 XT (16 GB, RDNA 4) · 32
 
 | Configuration | Build | Median / Typical FPS | Peak FPS | Notes |
 |---|---|---:|---:|---|
-| **Series S — RT Off** | `--release` (measured, warm) | **~18.8 fps** | **29.3 fps** | CPU `preparing`-bound (`~45.5 ms` prep, `0.5 ms` GPU wait) |
+| **Series S (1080p) — RT Off** | `--release` (measured, `7d2f44f`) | **~30.4 fps** settled (`28.6` overall med) | **32.4 fps** | `VICTORY_RDNA_WAVE32=2`: `32.9 ms/f`, **`23.9 ms`** prep, **`0.0 ms`** GPU wait, `14.7 ms` copyback, `16.7 GB` RAM / `8.2 GB` VRAM / `2.09 GB` SHR, `0` faults |
 | **Series X (Native 1440p) — RT Off** | `--release` (measured, `7d2f44f`) | **~29.8 fps** settled (`30.7` final) | **30.8 fps** | `VICTORY_RDNA_WAVE32=2`: `33.6 ms/f`, **`20.8 ms`** prep, **`0.0 ms`** GPU wait, `13.9 ms` copyback, `19.5 GB` RAM / `9.6 GB` VRAM / `1.75 GB` SHR, `0` faults |
 | **Series X (1440p, FSR 4.1.2) — RT Off** | `--release` (measured, `de485f8` / `7d2f44f`) | **~29.0–29.8 fps** steady | **31.1 fps** | `1080p → 1440p` PC FSR 4.1.2 + `VICTORY_RDNA_WAVE32=2`: `33.5–34.6 ms/f`, **`23.6 ms`** prep, **`0.15 ms`** GPU wait, `16.0 ms` copyback, `19.5 GB` RAM / `9.7 GB` VRAM / `1.62 GB` SHR, `0` faults |
 | **Series S — Software RT** | `--release` (measured, `d1686f1`, 165s) | **~11.7 fps** settled (`12.0 fps` overall med) | **18.8 fps** | `1.4 ms` med / `4.7 ms` settled GPU wait, `54.4 ms` prep, `11.3 GB` max VRAM (`128.6 ms` timed `diag`) |

@@ -255,20 +255,29 @@ fn gpu_only_min_bytes() -> u64 {
 /// demotion (`[0, 0]` when none).
 static GPU_ONLY_BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Active eligible (`>= min_bytes`, non-demoted) card buffers `(start, end, id, weak)`
+/// scanned without `Weak::upgrade` or heap allocation in `note_cpu_read`.
+static GPU_ONLY_WATCHED: std::sync::RwLock<Vec<(u64, u64, u64, std::sync::Weak<Shadow>)>> =
+    std::sync::RwLock::new(Vec::new());
+
 /// `[0]` promoted buffers currently active, `[1]` promoted bytes,
 /// `[2]` total demotions, `[3]` skipped `gpu_writes` calls since last log,
 /// `[4]` skipped `gpu_writes` bytes since last log.
 static GPU_ONLY_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-fn gpu_only_note_bounds(start: u64, len: u64) {
-    if gpu_only_mode() == 0 || len < gpu_only_min_bytes() {
+fn gpu_only_register(shadow: &Arc<Shadow>) {
+    if gpu_only_mode() == 0 || shadow.len < gpu_only_min_bytes() {
         return;
     }
-    let end = start.saturating_add(len);
+    let start = shadow.start;
+    let end = start.saturating_add(shadow.len);
     let _ = GPU_ONLY_BOUNDS[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
         Some(if cur == 0 { start } else { cur.min(start) })
     });
     GPU_ONLY_BOUNDS[1].fetch_max(end, Ordering::Relaxed);
+    let mut watched = GPU_ONLY_WATCHED.write().unwrap_or_else(|e| e.into_inner());
+    watched.retain(|(_, _, _, w)| w.strong_count() > 0);
+    watched.push((start, end, shadow.id, Arc::downgrade(shadow)));
 }
 
 #[derive(Default)]
@@ -422,17 +431,28 @@ fn demote_overlapping_gpu_only(start: u64, len: u64, skip_id: u64, reason: &'sta
     if hi == 0 || start >= hi || end <= GPU_ONLY_BOUNDS[0].load(Ordering::Relaxed) {
         return;
     }
-    let copies: Vec<Arc<Shadow>> = {
-        let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
-        carded
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .filter(|s| s.id != skip_id && s.start < end && s.start.saturating_add(s.len) > start)
-            .collect()
-    };
-    for shadow in copies {
+    let mut hits: Vec<Arc<Shadow>> = Vec::new();
+    {
+        let watched = GPU_ONLY_WATCHED.read().unwrap_or_else(|e| e.into_inner());
+        for &(s_start, s_end, s_id, ref weak) in watched.iter() {
+            if s_id != skip_id && s_start < end && s_end > start {
+                if let Some(shadow) = weak.upgrade() {
+                    hits.push(shadow);
+                }
+            }
+        }
+    }
+    if hits.is_empty() {
+        return;
+    }
+    for shadow in &hits {
         shadow.demote_gpu_only(reason);
     }
+    let mut watched = GPU_ONLY_WATCHED.write().unwrap_or_else(|e| e.into_inner());
+    watched.retain(|(_, _, _, w)| {
+        w.upgrade()
+            .is_some_and(|s| s.gpu_only_state.load(Ordering::Relaxed) != GPU_ONLY_DEMOTED)
+    });
 }
 
 /// Periodic diagnostic summary for `VICTORY_GPU_ONLY_COPYBACK`.
@@ -6270,7 +6290,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let new_id = shadow.id;
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-            gpu_only_note_bounds(key.0, len);
+            gpu_only_register(&shadow);
         }
         entry.shadow = Some(shadow.clone());
         drop(map);

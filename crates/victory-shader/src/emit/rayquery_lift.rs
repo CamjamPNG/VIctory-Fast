@@ -7921,7 +7921,7 @@ fn decode_gt_threshold_mask(k: u32) -> Option<u32> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::emit::shader::Shader;

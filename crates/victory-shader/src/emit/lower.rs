@@ -7487,9 +7487,29 @@ impl<'a> Lower<'a> {
         } else if image.is_none()
             && let Some(n) = self.slot_count(&src)?
         {
-            // A heap/table buffer's element count comes from the host's table
-            // by slot: AMD RDNA 4's driver compiler crashes on `getDimensions`
+            // A heap/table buffer's count comes from the host's table by
+            // slot: AMD RDNA 4's driver compiler crashes on `getDimensions`
             // of a buffer (`0xc0000005` in `amdxc64.dll`).
+            //
+            // The console's dword 2 counts records. The host's word counts
+            // the elements of a structured view and the bytes of a raw one,
+            // and the table says which by its stride (1: raw): a raw view of
+            // a structured buffer (`buffer_srv`'s window) divides the bytes
+            // down by the stride `sized_view` let through, as the
+            // `getDimensions` form below does.
+            let stride = used.map_or(0, |u| u.stride);
+            let n = match self.slot_word(&src, true)? {
+                Some(word) if stride > 1 => {
+                    let one = self.s.m.i32(1);
+                    let mask = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
+                    let raw = self.s.m.bin(c, Bin::And, word, mask);
+                    let raw = self.s.m.cmp(c, pred::EQ, raw, one);
+                    let k = self.s.m.i32(stride);
+                    let records = self.s.m.bin(c, Bin::UDiv, n, k);
+                    self.s.m.select(c, raw, records, n)
+                }
+                _ => n,
+            };
             let mut words = vec![(2, n)];
             let computed = (0..2u8).any(|k| {
                 inst.write(Reg::S(code + first + k))
@@ -10386,69 +10406,6 @@ impl<'a> Lower<'a> {
         let shift = self.s.m.int_const(ty, 32);
         let hi = self.s.m.bin(c, Bin::Shl, hi, shift);
         self.s.m.bin(c, Bin::Or, lo, hi)
-    }
-
-    /// The bits of the float nearest the double whose dwords are `lo` and
-    /// `hi`, on 32-bit integers: round to nearest even, infinities and NaN
-    /// kept (a NaN stays quiet), a result below the smallest normal float
-    /// signed zero (flushed, as the console's default float mode does).
-    // The flush-to-zero form of v_cvt_f32_f64: kept beside the IEEE form in use until the console's
-    // float mode for this instruction is checked.
-    #[allow(dead_code)]
-    fn f64_bits_to_f32_bits(&mut self, lo: V, hi: V) -> V {
-        let c = self.cur;
-        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let (k20, k29, k3, k23) = (k(self, 20), k(self, 29), k(self, 3), k(self, 23));
-        let sign_mask = k(self, 0x8000_0000);
-        let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
-        let e = self.s.m.bin(c, Bin::LShr, hi, k20);
-        let e_mask = k(self, 0x7ff);
-        let e = self.s.m.bin(c, Bin::And, e, e_mask);
-        // The top 23 bits of the 52-bit mantissa, and the 29 below them.
-        let m_mask = k(self, 0x000f_ffff);
-        let mh = self.s.m.bin(c, Bin::And, hi, m_mask);
-        let mh = self.s.m.bin(c, Bin::Shl, mh, k3);
-        let ml = self.s.m.bin(c, Bin::LShr, lo, k29);
-        let m = self.s.m.bin(c, Bin::Or, mh, ml);
-        let rest_mask = k(self, 0x1fff_ffff);
-        let rest = self.s.m.bin(c, Bin::And, lo, rest_mask);
-        // Round to nearest even: up past half, or at half when odd.
-        let half = k(self, 0x1000_0000);
-        let one = k(self, 1);
-        let above = self.s.m.cmp(c, pred::IUGT, rest, half);
-        let at = self.s.m.cmp(c, pred::EQ, rest, half);
-        let odd = self.s.m.bin(c, Bin::And, m, one);
-        let zero = k(self, 0);
-        let odd = self.s.m.cmp(c, pred::NE, odd, zero);
-        let tie = self.s.m.bin(c, Bin::And, at, odd);
-        let up = self.s.m.bin(c, Bin::Or, above, tie);
-        let up = self.s.m.select(c, up, one, zero);
-        // Rebias the exponent (1023 → 127); a carry out of the mantissa
-        // steps the exponent, up to infinity.
-        let bias = k(self, 1023 - 127);
-        let e32 = self.s.m.bin(c, Bin::Sub, e, bias);
-        let ex = self.s.m.bin(c, Bin::Shl, e32, k23);
-        let normal = self.s.m.bin(c, Bin::Add, ex, m);
-        let normal = self.s.m.bin(c, Bin::Add, normal, up);
-        let normal = self.s.m.bin(c, Bin::Or, normal, sign);
-        // Exponents out of the float's range (signed, after rebiasing).
-        let inf = k(self, 0x7f80_0000);
-        let inf = self.s.m.bin(c, Bin::Or, inf, sign);
-        let k255 = k(self, 255);
-        let big = self.s.m.cmp(c, pred::SGE, e32, k255);
-        let small = self.s.m.cmp(c, pred::SLE, e32, zero);
-        let r = self.s.m.select(c, big, inf, normal);
-        let r = self.s.m.select(c, small, sign, r);
-        // Infinity and NaN (a NaN with any mantissa bit set stays a NaN).
-        let all = k(self, 0x7ff);
-        let special = self.s.m.cmp(c, pred::EQ, e, all);
-        let any = self.s.m.bin(c, Bin::Or, mh, ml);
-        let any = self.s.m.bin(c, Bin::Or, any, rest);
-        let nan = self.s.m.cmp(c, pred::NE, any, zero);
-        let quiet = k(self, 0x0040_0000);
-        let quiet = self.s.m.select(c, nan, quiet, zero);
-        let special_bits = self.s.m.bin(c, Bin::Or, inf, quiet);
-        self.s.m.select(c, special, special_bits, r)
     }
 
     /// The low and high dwords of an i64.

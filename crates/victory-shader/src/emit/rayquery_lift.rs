@@ -556,14 +556,14 @@ impl<'a> Analyzer<'a> {
             not_taken,
         } = self.st.exits[pred]
         {
-            if taken == succ && not_taken != succ {
-                if when != Bool::TRUE && !nf.contains(&(when, true)) {
-                    nf.push((when, true));
-                }
-            } else if not_taken == succ && taken != succ {
-                if when != Bool::FALSE && !nf.contains(&(when, false)) {
-                    nf.push((when, false));
-                }
+            if taken == succ && not_taken != succ && when != Bool::TRUE && !nf.contains(&(when, true)) {
+                nf.push((when, true));
+            } else if not_taken == succ
+                && taken != succ
+                && when != Bool::FALSE
+                && !nf.contains(&(when, false))
+            {
+                nf.push((when, false));
             }
         }
         nf
@@ -1387,23 +1387,22 @@ impl<'a> Analyzer<'a> {
                     | "s_lshl_b32"
                     | "v_readlane_b32"
                     | "v_readfirstlane_b32" => {
-                        if let Some(&(_, w)) = inst.writes.first() {
-                            if derived.get(&w).copied() != Some(has48) {
-                                derived.insert(w, has48);
-                                work.push((w, has48, depth + 1));
-                            }
+                        if let Some(&(_, w)) = inst.writes.first()
+                            && derived.get(&w).copied() != Some(has48)
+                        {
+                            derived.insert(w, has48);
+                            work.push((w, has48, depth + 1));
                         }
                     }
                     "s_or_b32" | "s_add_u32" | "s_add_i32" | "v_or_b32" | "v_add_nc_u32"
                     | "v_add_co_u32" => {
                         let adds_48 = other_const_arg(inst, v) == Some(48);
-                        if adds_48 {
-                            if let Some(&(_, w)) = inst.writes.first() {
-                                if derived.get(&w).copied() != Some(true) {
-                                    derived.insert(w, true);
-                                    work.push((w, true, depth + 1));
-                                }
-                            }
+                        if adds_48
+                            && let Some(&(_, w)) = inst.writes.first()
+                            && derived.get(&w).copied() != Some(true)
+                        {
+                            derived.insert(w, true);
+                            work.push((w, true, depth + 1));
                         }
                     }
                     _ => {}
@@ -1749,14 +1748,13 @@ impl<'a> Analyzer<'a> {
         if matches!(inst.name(), "s_and_b32" | "s_and_b64")
             && let Fields::Sop { src, .. } = &inst.fields
             && src.len() == 2
+            && let (Some(a), Some(b)) = (operand_val(inst, &src[0]), operand_val(inst, &src[1]))
         {
-            if let (Some(a), Some(b)) = (operand_val(inst, &src[0]), operand_val(inst, &src[1])) {
-                if self.is_root_cselect(a, rv) {
-                    return b;
-                }
-                if self.is_root_cselect(b, rv) {
-                    return a;
-                }
+            if self.is_root_cselect(a, rv) {
+                return b;
+            }
+            if self.is_root_cselect(b, rv) {
+                return a;
             }
         }
         v
@@ -1850,11 +1848,11 @@ impl<'a> Analyzer<'a> {
                 }
                 let Some(i) = idx_opt else { continue };
                 let inst = &self.p.blocks[b].insts[i];
-                if inst.name() == "v_rcp_f32" {
-                    if let Some(&(_, w)) = inst.writes.first() {
-                        rcp_det_site = Some(((b, i), w));
-                        break 'find_rcp;
-                    }
+                if inst.name() == "v_rcp_f32"
+                    && let Some(&(_, w)) = inst.writes.first()
+                {
+                    rcp_det_site = Some(((b, i), w));
+                    break 'find_rcp;
                 }
             }
         }
@@ -2397,13 +2395,12 @@ impl<'a> Analyzer<'a> {
     ) -> HashSet<Reg> {
         let mut regs = HashSet::new();
         let bvh_inst = &self.p.blocks[tri_bvh.0].insts[tri_bvh.1];
-        if let Some(addrs) = image_addr_values(bvh_inst) {
-            if template == RayTemplate::Bvh32SharedTlas
-                && let Some(&node_v) = addrs.first()
-                && let Some(r) = self.value_reg(node_v)
-            {
-                regs.insert(r);
-            }
+        if let Some(addrs) = image_addr_values(bvh_inst)
+            && template == RayTemplate::Bvh32SharedTlas
+            && let Some(&node_v) = addrs.first()
+            && let Some(r) = self.value_reg(node_v)
+        {
+            regs.insert(r);
         }
         // Only collect registers directly copied from `cur_node` in a block containing
         // `v_cmpx_gt_u32 exec, 4, cur_node` (triangle-node test), NOT general box/inst copies.
@@ -2640,9 +2637,10 @@ impl<'a> Analyzer<'a> {
                         continue;
                     };
                     // `minFrontFaceT = select(is_front, min_v, min_old)`
-                    if ff_mask_is_front && s0 == min_old && s1 == min_v && min_v.is_some() {
-                        min_front_t_reg = Some(dst_reg);
-                    } else if !ff_mask_is_front && s0 == min_v && s1 == min_old && min_v.is_some() {
+                    if min_v.is_some()
+                        && ((ff_mask_is_front && s0 == min_old && s1 == min_v)
+                            || (!ff_mask_is_front && s0 == min_v && s1 == min_old))
+                    {
                         min_front_t_reg = Some(dst_reg);
                     } else if ff_mask_is_front && s0 == Some(t_hit) && s1 == Some(committed_t_old) {
                         // Back-face commits `t_hit`!
@@ -3246,7 +3244,7 @@ impl<'a> Analyzer<'a> {
                 // Check this BEFORE `is_unchanged_copy` so dead guarded reads don't create
                 // spurious cross-loop dependencies on earlier loops' dead scratch VGPRs!
                 inputs.push((v, CandidateInput::Zero));
-            } else if let Some(pre) = self.is_unchanged_copy(v, nodes, entry_block, 0)
+            } else if let Some(pre) = self.is_unchanged_copy(v, nodes, 0)
                 && self
                     .def_block(pre)
                     .is_some_and(|db| !nodes.contains(&db) && self.dominates(db, entry_block))
@@ -3469,9 +3467,7 @@ impl<'a> Analyzer<'a> {
     ) -> Option<BvhTag> {
         let mut cur = v;
         for _ in 0..6 {
-            let Some(def) = self.defs.get(cur.0 as usize).copied().flatten() else {
-                return None;
-            };
+            let def = self.defs.get(cur.0 as usize).copied().flatten()?;
             match def {
                 Def::Phi(b, pi) if nodes.contains(&b) => {
                     let phi = &self.p.blocks[b].phis[pi];
@@ -3704,9 +3700,7 @@ impl<'a> Analyzer<'a> {
                 if resolved.contains_key(&av) {
                     continue;
                 }
-                let Some(&atom_bool) = self.st.masks.get(&av) else {
-                    return None;
-                };
+                let &atom_bool = self.st.masks.get(&av)?;
                 let can_be_false = self.bools_meet(&[(entry_reach, true), (atom_bool, false)]);
                 let can_be_true = self.bools_meet(&[(entry_reach, true), (atom_bool, true)]);
                 match (can_be_true, can_be_false) {
@@ -3825,9 +3819,7 @@ impl<'a> Analyzer<'a> {
                 {
                     continue;
                 }
-                let Some(&(_, bfe_val)) = inst.writes.first() else {
-                    return None;
-                };
+                let &(_, bfe_val) = inst.writes.first()?;
                 if Some(b) == tri_hit.opacity_block {
                     let op_flag = self.decode_instance_opacity_flag(nodes, &anyhit_set)?;
                     if let Some(prev) = opacity_flag_override
@@ -4746,7 +4738,7 @@ impl<'a> Analyzer<'a> {
         lifted_blocks: &HashSet<usize>,
     ) -> Option<RayOutputBinding> {
         // 1. Copy of an unmodified pre-loop value?
-        if let Some(pre) = self.is_unchanged_copy(v, nodes, entry_block, 0) {
+        if let Some(pre) = self.is_unchanged_copy(v, nodes, 0) {
             return Some(RayOutputBinding {
                 value: v,
                 output: RayOutput::CopyOf(pre),
@@ -5032,10 +5024,10 @@ impl<'a> Analyzer<'a> {
         // (after `s_and_saveexec`). Dead local scratch temps written inside `ah.body_blocks` (that
         // are NOT `state_vars`, NOT committed, and have zero direct post-loop operand reads) are safe.
         let mut forbidden_blocks: HashSet<usize> = HashSet::new();
-        if let HitMode::AnyHit(ref ah) = tri_hit.mode {
-            if let Exit::Jump(commit_b) = self.p.blocks[ah.tail_block].exit {
-                forbidden_blocks.insert(commit_b);
-            }
+        if let HitMode::AnyHit(ref ah) = tri_hit.mode
+            && let Exit::Jump(commit_b) = self.p.blocks[ah.tail_block].exit
+        {
+            forbidden_blocks.insert(commit_b);
         }
         for &b in &forbidden_blocks {
             if self.p.blocks[b]
@@ -5062,13 +5054,11 @@ impl<'a> Analyzer<'a> {
             .insts
             .iter()
             .position(|i| matches!(i.name(), "s_and_saveexec_b32" | "s_and_saveexec_b64"))
-        {
-            if self.p.blocks[hb].insts[se_idx + 1..]
+            && self.p.blocks[hb].insts[se_idx + 1..]
                 .iter()
                 .any(|inst| inst.writes.iter().any(|&(r, _)| r == reg))
-            {
-                return false;
-            }
+        {
+            return false;
         }
         // Must actually be written by BVH scaffolding inside `nodes`.
         let written_in_scaff = nodes.iter().any(|&b| {
@@ -5126,7 +5116,6 @@ impl<'a> Analyzer<'a> {
         &self,
         v: Value,
         nodes: &HashSet<usize>,
-        entry_block: usize,
         depth: u32,
     ) -> Option<Value> {
         if depth > 8 {
@@ -5141,7 +5130,7 @@ impl<'a> Analyzer<'a> {
                 let inst = &self.p.blocks[b].insts[i];
                 if matches!(inst.name(), "v_mov_b32" | "s_mov_b32") {
                     let src = single_reg_src(inst)?;
-                    return self.is_unchanged_copy(src, nodes, entry_block, depth + 1);
+                    return self.is_unchanged_copy(src, nodes, depth + 1);
                 }
                 None
             }
@@ -5155,7 +5144,7 @@ impl<'a> Analyzer<'a> {
                     if arg == v {
                         continue;
                     }
-                    let c = self.is_unchanged_copy(arg, nodes, entry_block, depth + 1)?;
+                    let c = self.is_unchanged_copy(arg, nodes, depth + 1)?;
                     if let Some(prev) = pre {
                         if prev != c {
                             return None;
@@ -5283,10 +5272,10 @@ impl<'a> Analyzer<'a> {
                     {
                         return None;
                     }
-                    if out.output == RayOutput::CopyOf(v) {
-                        if !set_tag(&mut tags, &mut tag_facts, &mut work, out.value, tag, v_facts.clone()) {
-                            return None;
-                        }
+                    if out.output == RayOutput::CopyOf(v)
+                        && !set_tag(&mut tags, &mut tag_facts, &mut work, out.value, tag, v_facts.clone())
+                    {
+                        return None;
                     }
                 }
             }
@@ -5430,14 +5419,14 @@ impl<'a> Analyzer<'a> {
                 let n = inst.name();
                 // Simple copies preserve every tag.
                 if matches!(n, "v_mov_b32" | "s_mov_b32") {
-                    if let Some(&(_, w)) = inst.writes.first() {
-                        if !set_tag(&mut tags, &mut tag_facts, &mut work, w, tag, v_facts.clone()) {
-                            meta_fail!(
-                                "mov clash at B{b}:{i}@{:#x} w={w:?} tag={tag:?} prev={:?}",
-                                inst.machine.offset,
-                                tags.get(&w)
-                            );
-                        }
+                    if let Some(&(_, w)) = inst.writes.first()
+                        && !set_tag(&mut tags, &mut tag_facts, &mut work, w, tag, v_facts.clone())
+                    {
+                        meta_fail!(
+                            "mov clash at B{b}:{i}@{:#x} w={w:?} tag={tag:?} prev={:?}",
+                            inst.machine.offset,
+                            tags.get(&w)
+                        );
                     }
                     continue;
                 }
@@ -5527,7 +5516,8 @@ impl<'a> Analyzer<'a> {
                                 if !set_tag(&mut tags, &mut tag_facts, &mut work, w, BvhTag::InstByteOff(off + k), v_facts.clone()) {
                                     meta_fail!("InstByteOff addk clash at B{b}:{i}");
                                 }
-                            } else if let Some(base_v) = other_val_arg(inst, v) {
+                            } else {
+                                let base_v = other_val_arg(inst, v)?;
                                 let base_off = self.extract_base_low_offset(base_v, 0)?;
                                 let lo = inst.writes.first()?.1;
                                 if !set_tag(&mut tags, &mut tag_facts, &mut work, lo, BvhTag::InstAddrLo(off + base_off), v_facts.clone()) {
@@ -5541,8 +5531,6 @@ impl<'a> Analyzer<'a> {
                                         meta_fail!("AddrCarry clash at B{b}:{i}");
                                     }
                                 }
-                            } else {
-                                meta_fail!("InstByteOff({off}) add no other_val at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
                             }
                         } else {
                             meta_fail!("InstByteOff({off}) used by {n} at B{b}:{i}@{:#x}", self.p.blocks[b].insts[i].machine.offset);
@@ -5998,11 +5986,7 @@ impl<'a> Analyzer<'a> {
                 .map_or(Some(0), |s| self.extract_base_low_offset(s, depth + 1)),
             "s_and_b32" | "v_and_b32" => {
                 // `tlas_lo & 0xffffff00` -> 256-byte aligned, offset 0!
-                if has_const_operand(inst, 0xFFFF_FF00) {
-                    Some(0)
-                } else {
-                    Some(0)
-                }
+                Some(0)
             }
             "s_or_b32" | "v_or_b32" => {
                 if let Some(k) = other_const_arg_any(inst)
@@ -6393,10 +6377,9 @@ impl<'a> Analyzer<'a> {
                         | "v_add_nc_u32"
                         | "s_add_u32"
                         | "s_addc_u32"
-                ) {
-                    if let Some(&(_, w)) = inst.writes.first() {
-                        work.push((w, depth + 1));
-                    }
+                ) && let Some(&(_, w)) = inst.writes.first()
+                {
+                    work.push((w, depth + 1));
                 }
             }
         }
@@ -6688,9 +6671,9 @@ impl<'a> Analyzer<'a> {
                         } else {
                             return false;
                         }
-                    } else if self.is_increment_of(arg, v, nodes, &mut HashSet::new(), 0) {
-                        saw_inc = true;
-                    } else if self.is_iter_counter_or_timeout(arg, nodes, entry_block, depth + 1) {
+                    } else if self.is_increment_of(arg, v, nodes, &mut HashSet::new(), 0)
+                        || self.is_iter_counter_or_timeout(arg, nodes, entry_block, depth + 1)
+                    {
                         saw_inc = true;
                     } else {
                         return false;

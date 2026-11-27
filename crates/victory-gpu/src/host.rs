@@ -1260,6 +1260,29 @@ pub(crate) fn process_private_bytes() -> u64 {
 /// summary emitted in both release and diagnostics builds.
 #[cfg(feature = "diagnostics")]
 static PREP_PHASE_NS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+// The eleven phases of [`PREP_PHASE_NS`], by index, as the frame line names
+// them (`prep phases/f`, one line a second, `VICTORY_LOG=info` and a build
+// with `--features diagnostics`):
+//
+// | index | field | what it is |
+// |---|---|---|
+// | 9 | `pre` | the steps done on the card planned ([`Host::card_steps`]) |
+// | 0 | `watch` | planning what to ask, and the write-watch asking |
+// | 1 | `stale` | the title's bytes put under flights' shader writes (a settle) |
+// | 2 | `front` | the refreshes of host copies ahead of the lists' steps |
+// | 3 | `deferred` | the lists' steps ([`HostList::run_deferred`]) |
+// | 4 | `prel_wait` | the lists' preludes finished |
+// | 5 | `flush` | the fills and the last refreshes of host copies |
+// | 6 | `snap_card` | the snapshots and the copies in the card's memory, and [`PREP_EXTRA_NS`] its two apart |
+// | 7 | `wait_heaps` | waiting for the heaps' records |
+// | 8 | `exec` | `ExecuteCommandLists` and the signal |
+// | 10 | `post` | what is noted as in the air once it is sent |
+//
+// Of `sum`, `present` is not one of them ([`PRESENT_NS`]).
+/// Two of [`PREP_PHASE_NS`] apart: the snapshots of what shaders may write,
+/// and the copies in the card's memory (its index 6 is both together).
+#[cfg(feature = "diagnostics")]
+static PREP_EXTRA_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 static PREP_PHASE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1312,12 +1335,37 @@ fn memory_summary_line(frames: f64) {
             .iter()
             .map(|a| a.swap(0, Ordering::Relaxed) as f64 / 1e6 / p_frames)
             .collect();
+        let x: Vec<f64> = PREP_EXTRA_NS
+            .iter()
+            .map(|a| a.swap(0, Ordering::Relaxed) as f64 / 1e6 / p_frames)
+            .collect();
+        let beside: Vec<f64> = prep_split::STATS
+            .iter()
+            .map(|a| a.swap(0, Ordering::Relaxed) as f64)
+            .collect();
+        let slots = crate::draw::heap_slots();
         let present_ms = PRESENT_NS.swap(0, Ordering::Relaxed) as f64 / 1e6 / p_frames;
         if p.iter().sum::<f64>() > 0.1 {
+            // The fields before "(sum)" are as they were, in their order, and
+            // `scripts/measure.ps1` reads the line by its prefix: this one is
+            // only ever added to, after it.
             tracing::info!(
                 "prep phases/f: pre {:.1}, watch {:.1}, stale {:.1}, front {:.1}, deferred {:.1}, \
-                 prel_wait {:.1}, flush {:.1}, snap_card {:.1}, wait_heaps {:.1}, exec {:.1}, post {:.1}, present {:.1} (sum {:.1} ms)",
-                p[9], p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[10], present_ms, p.iter().sum::<f64>()
+                 prel_wait {:.1}, flush {:.1}, snap_card {:.1}, wait_heaps {:.1}, exec {:.1}, post {:.1}, present {:.1} (sum {:.1} ms); \
+                 of snap_card {:.1} the snapshots and {:.1} the copies in the card's memory; \
+                 {:.0} list calls a frame; heap slots looked at {:.0} a frame, mirrored {:.0}; \
+                 title copies beside the submitting thread {:.0} a frame in {:.0} runs, {:.1} ms of them \
+                 (VICTORY_PREP_SPLIT: {}, {} thread(s) beside this one, VICTORY_PREP_SPLIT_THREADS)",
+                p[9], p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[10], present_ms, p.iter().sum::<f64>(),
+                x[0], x[1],
+                crate::copystat::peek(crate::copystat::C::RecordCalls) as f64 / p_frames,
+                slots[0] as f64 / p_frames,
+                slots[3] as f64 / p_frames,
+                beside[0] / p_frames,
+                beside[1] / p_frames,
+                beside[2] / 1e6 / p_frames,
+                if prep_split::on() { "on" } else { "off" },
+                prep_split::beside_threads().saturating_sub(1),
             );
         }
     }
@@ -4974,6 +5022,7 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+mod prep_split;
 pub(crate) mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -7367,12 +7416,15 @@ impl Host {
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
+        #[cfg(feature = "diagnostics")]
+        let snapshots = std::time::Instant::now();
+        crate::shadow::take_snapshots();
+        #[cfg(feature = "diagnostics")]
+        let snapped = snapshots.elapsed();
+        #[cfg(feature = "diagnostics")]
         {
-            #[cfg(feature = "diagnostics")]
-            let snapshots = std::time::Instant::now();
-            crate::shadow::take_snapshots();
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+            crate::copystat::add(crate::copystat::C::SnapshotUs, snapped.as_micros() as u64);
+            PREP_EXTRA_NS[0].fetch_add(snapped.as_nanos() as u64, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
         split.part(3);
@@ -7404,7 +7456,11 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         {
-            PREP_PHASE_NS[6].fetch_add(p_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            // Index 6 is both, as it always was: the snapshots and the copies
+            // in the card's memory, each counted apart in `PREP_EXTRA_NS`.
+            let both = p_t.elapsed();
+            PREP_EXTRA_NS[1].fetch_add(both.saturating_sub(snapped).as_nanos() as u64, Ordering::Relaxed);
+            PREP_PHASE_NS[6].fetch_add(both.as_nanos() as u64, Ordering::Relaxed);
             p_t = std::time::Instant::now();
         }
         #[cfg(feature = "diagnostics")]
@@ -9440,34 +9496,35 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
+        // With [`prep_split`]: the title's copies waiting to be done beside
+        // this thread, and whether any may be ([`beside_flush`]).
+        let split = prep_split::on();
+        let mut beside = prep_split::Beside::default();
         for (i, step) in self.deferred().copies.iter().enumerate() {
+            if split && !matches!(step, Step::Copy(..)) {
+                // Every step but a copy reads title memory or writes it:
+                // what the copies beside have done must be in it by now.
+                beside_flush(&mut beside, &mut us, &mut bytes);
+            }
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
             let (started, copied) = match step {
                 &Step::Copy(dst, src, len) => {
-                    let started = std::time::Instant::now();
                     #[cfg(feature = "diagnostics")]
                     {
                         copies += 1;
                     }
+                    let started = std::time::Instant::now();
                     batch.fill();
                     batch.title_written();
-                    crate::port::copied(dst, src, len);
-                    crate::shadow::note_cpu_read(src, len);
-                    // Renderer port #7: into a heap's records, the rounds
-                    // asked earlier did not see it.
-                    if crate::descriptor::in_shader_heap(dst, len) {
-                        crate::port_journal::prep_wrote();
+                    let job = prep_split::Job { dst, src, len };
+                    if prep_split::may_defer(split, batch.idle(), &beside, job) {
+                        beside.push(job);
+                        continue;
                     }
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    // With the submission's one asking: the journal learns it.
-                    crate::watch::wrote(dst, len);
-                    // What the card holds there may be another value although
-                    // ours did not change.
-                    if send::own() {
-                        crate::shadow::send_copied(dst, len);
-                    }
+                    beside_flush(&mut beside, &mut us, &mut bytes);
+                    copy_title(dst, src, len);
                     (started, len)
                 }
                 &Step::Fill(dst, src, len, _) => {
@@ -9585,6 +9642,7 @@ impl HostList {
             us += started.elapsed();
             bytes += copied as u64;
         }
+        beside_flush(&mut beside, &mut us, &mut bytes);
         PREPARING[0].fetch_add(us.as_micros() as u64, Ordering::Relaxed);
         PREPARING[1].fetch_add(bytes, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -9822,6 +9880,28 @@ fn wide_refresh_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> b
         Some("1") => true,
         Some("0") => false,
         _ => logical_cpus.is_some_and(|n| n >= 4),
+    }
+}
+
+#[cfg(test)]
+mod prep_split_batch_tests {
+    use super::Batch;
+
+    /// A copy is only done beside the submitting thread while the batch has
+    /// nothing left to do, which is what makes its barrier a no-op
+    /// (`crate::host::prep_split`, `Batch::idle`).
+    #[test]
+    fn a_copy_waits_while_the_batch_has_work() {
+        let mut batch = Batch::default();
+        assert!(batch.idle());
+        batch.fills.push((0x1000, 0x2000, 16));
+        assert!(!batch.idle());
+        batch.fills.clear();
+        assert!(batch.idle());
+        batch.ahead.insert(0x3000, (0x3000, 0x3010));
+        assert!(!batch.idle());
+        batch.ahead.clear();
+        assert!(batch.idle());
     }
 }
 
@@ -10863,6 +10943,23 @@ impl Batch {
         }
     }
 
+    /// Whether the batch has nothing left to do: no refresh to make, no fill
+    /// to copy, no texture due. A copy's barrier ([`Batch::fill`],
+    /// [`Batch::title_written`]) would then do nothing, and the copy may be
+    /// done beside this thread ([`prep_split`]).
+    ///
+    /// What is placed in a heap is not in here: those bytes are put into
+    /// title memory at the end of the submission, whichever step asked for
+    /// them, and every step but a copy is done with the copies beside it
+    /// first ([`beside_flush`]).
+    fn idle(&self) -> bool {
+        self.refreshes.is_empty()
+            && self.fills.is_empty()
+            && self.due.is_empty()
+            && self.due_textures.is_empty()
+            && self.ahead.is_empty()
+    }
+
     /// The fills noted are done.
     fn fill(&mut self) {
         // Below this many the threads cost more than they save.
@@ -11114,6 +11211,73 @@ static PARALLEL_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::
 /// reports an unmapped page instead of faulting. Asking `VirtualQuery` first
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
+/// A title buffer copy of a list's steps, as `Step::Copy` does it: the bytes
+/// into title memory, the journal told, and what the card holds there.
+///
+/// Everything it touches is per range, so two of these whose ranges hold no
+/// 64 KiB block in common do the same as one after the other
+/// ([`prep_split`]).
+fn copy_title(dst: usize, src: usize, len: usize) {
+    crate::port::copied(dst, src, len);
+    crate::shadow::note_cpu_read(src, len);
+    // Renderer port #7: into a heap's records, the rounds asked earlier did
+    // not see it.
+    if crate::descriptor::in_shader_heap(dst, len) {
+        crate::port_journal::prep_wrote();
+    }
+    copy_mapped(dst as *mut u8, src as *const u8, len, true);
+    // With the submission's one asking: the journal learns it.
+    crate::watch::wrote(dst, len);
+    // What the card holds there may be another value although ours did not
+    // change.
+    if send::own() {
+        crate::shadow::send_copied(dst, len);
+    }
+}
+
+/// Does the title's copies waiting beside this thread ([`prep_split`]), and
+/// counts what they took into the list's own time and bytes.
+///
+/// One thread each for up to [`prep_split::beside_threads`] of them, and the
+/// whole run returns when the last is done: the step after them sees title
+/// memory as it would have with them done one after the other.
+fn beside_flush(beside: &mut prep_split::Beside, us: &mut std::time::Duration, bytes: &mut u64) {
+    if beside.is_empty() {
+        return;
+    }
+    let jobs = beside.take();
+    let began = std::time::Instant::now();
+    *bytes += jobs.iter().map(|j| j.len as u64).sum::<u64>();
+    let n = jobs.len();
+    if n == 1 {
+        copy_title(jobs[0].dst, jobs[0].src, jobs[0].len);
+    } else {
+        // Each thread takes every kth copy; the copies hold no block in
+        // common, so which one is beside which does not matter.
+        let k = prep_split::beside_threads().min(n);
+        let jobs = std::sync::Arc::new(jobs);
+        let runs = (0..k)
+            .map(|part| {
+                let jobs = jobs.clone();
+                Box::new(move || {
+                    for job in jobs.iter().skip(part).step_by(k) {
+                        copy_title(job.dst, job.src, job.len);
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(runs);
+    }
+    // (The time it took, not the threads' sum, as the refreshes count.)
+    *us += began.elapsed();
+    #[cfg(feature = "diagnostics")]
+    {
+        prep_split::STATS[0].fetch_add(n as u64, Ordering::Relaxed);
+        prep_split::STATS[1].fetch_add(1, Ordering::Relaxed);
+        prep_split::STATS[2].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {

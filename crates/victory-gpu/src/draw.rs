@@ -828,6 +828,20 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// the spans and refreshes of their copies, the texture side.
 #[cfg(feature = "diagnostics")]
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the last frame line: slots of the view heap looked at for shaders
+/// that pick them by index, those a draw's table had already brought up to
+/// date, those found as they were, and those mirrored (the descriptor
+/// records read again). Of the frame line's "heap buffers N passes", these
+/// are what a pass costs in slots: 400,000 looked at and 40,000 mirrored a
+/// frame on the XTX, most of them empty (`docs/findings.md`).
+#[cfg(feature = "diagnostics")]
+static HEAP_SLOTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`HEAP_SLOTS`], from now on 0: looked at, tabled, hits, mirrored.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_slots() -> [u64; 4] {
+    std::array::from_fn(|i| HEAP_SLOTS[i].swap(0, Ordering::Relaxed))
+}
 
 /// Passes after which every buffer slot of the heap was looked at again.
 const HEAP_ROUND: u64 = 16;
@@ -1339,6 +1353,10 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     {
         static DIAG_PASS: AtomicU64 = AtomicU64::new(0);
         let p = DIAG_PASS.fetch_add(1, Ordering::Relaxed);
+        HEAP_SLOTS[0].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        HEAP_SLOTS[1].fetch_add(diag_tabled.load(Ordering::Relaxed), Ordering::Relaxed);
+        HEAP_SLOTS[2].fetch_add(diag_hits.load(Ordering::Relaxed), Ordering::Relaxed);
+        HEAP_SLOTS[3].fetch_add(diag_mirrors.load(Ordering::Relaxed), Ordering::Relaxed);
         if p % 120 == 119 {
             tracing::info!(
                 slots = slots.len(),

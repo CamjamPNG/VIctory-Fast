@@ -145,11 +145,9 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
 /// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 87 % of its budget, else enough to come
-/// down to 84 %. Keeping local VRAM under ~86 % avoids WDDM evicting BAR
-/// shadow buffers into shared system memory (`SHR`). `VICTORY_TEXTURE_KEEP=0`:
-/// [`vram_idle_ms`]' older rule, all that are idle; `=1`: that rule with its
-/// two longer times.
+/// kept free for others) is under 91 % of its budget, else enough to come
+/// down to 88 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// all that are idle; `=1`: that rule with its two longer times.
 pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     const KEPT_MS: u64 = 600_000;
     const IDLE_MS: u64 = 5_000;
@@ -158,12 +156,12 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(87) {
+    if used < share(91) {
         (KEPT_MS, u64::MAX)
-    } else if used < share(91) {
-        (IDLE_MS, used - share(84))
+    } else if used < share(95) {
+        (IDLE_MS, used - share(88))
     } else {
-        (SHORT_MS, used - share(84))
+        (SHORT_MS, used - share(88))
     }
 }
 
@@ -14105,12 +14103,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn textures_are_kept_while_the_card_has_room() {
         use super::vram_keep;
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 86 * gib).0, 600_000);
-        // Past 87%: the longest idle ones, enough to come down to 84 %.
-        let (ms, bytes) = vram_keep(100 * gib, 89 * gib);
+        assert_eq!(vram_keep(100 * gib, 90 * gib).0, 600_000);
+        // Past 91%: the longest idle ones, enough to come down to 88 %.
+        let (ms, bytes) = vram_keep(100 * gib, 93 * gib);
         assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 91 * gib), (1_500, 7 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 36 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib), (1_500, 7 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 32 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
     }
 

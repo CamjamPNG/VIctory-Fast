@@ -22,11 +22,6 @@ use windows_sys::Win32::System::Memory as mem;
 use crate::inplace::{From, Placed, committed_run, open, place};
 
 const K64: u64 = 64 << 10;
-/// Maximum `SEC_COMMIT` section size opened whole via `OpenExistingHeapFromFileMapping`.
-/// Larger sections (e.g. a 710 MiB 64-bit pool holding ~155 MiB of placed buffers)
-/// fall back to sub-range `MapViewOfFile` regions so DXGI shared memory (`SHR`)
-/// only counts the buffers actually placed.
-const MAX_WHOLE_SECTION_BYTES: u64 = 256 << 20;
 
 /// Monotonic generation counter bumped whenever title memory views, sections,
 /// or allocations change.
@@ -159,9 +154,6 @@ pub(crate) fn place_section(device: &ID3D12Device, start: u64, len: u64) -> Resu
         return Err(SectionPlaceError::NotCommittedRun);
     };
     if !sec_offset.is_multiple_of(K64) || sec_offset.checked_add(bytes).is_none_or(|e| e > sec_bytes) {
-        return Err(SectionPlaceError::NotCommittedRun);
-    }
-    if sec_bytes > MAX_WHOLE_SECTION_BYTES && bytes.saturating_mul(2) < sec_bytes {
         return Err(SectionPlaceError::NotCommittedRun);
     }
     let heap = open_or_get(device, section, sec_bytes, generation)?;

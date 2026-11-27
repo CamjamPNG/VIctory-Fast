@@ -306,7 +306,7 @@ mod tests {
     /// `VICTORY_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement, not a check: wants a D3D12 adapter, prints what 1,000 small buffers cost"]
     fn small_buffers_cost() {
         let Some(host) = super::host() else {
             return;

@@ -2134,7 +2134,7 @@ void look() {
 
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
-    #[ignore = "on the card: run it by name with --ignored --nocapture"]
+    #[ignore = "wants VICTORY_TILES_TEST_CARD=1 for the run on the card, and its debug layer; on the software adapter without it"]
     fn levels_on_demand_on_the_card() {
         let _pool_guard = TestPoolGuard::acquire();
         let Some(mut rig) = Rig::new() else {

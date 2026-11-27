@@ -13444,7 +13444,7 @@ mod refresh_tests {
     /// pages written since. Run with `--ignored --nocapture`, and with
     /// `VICTORY_LIGHT_REFRESH=0` for the way it was.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement, not a check: 174 MB, prints what a merge under 40 overlapping ranges costs"]
     fn bytes_under_overlapping_ranges() {
         const BIG: usize = 174 << 20;
         let big = title(BIG, true);
@@ -13563,7 +13563,7 @@ mod refresh_tests {
     /// thread lands what shaders wrote. Run with `--ignored --nocapture`,
     /// and with `VICTORY_LIGHT_REFRESH=0` for the way it was.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement, not a check: 174 MB, prints what a frame's refreshes cost"]
     fn frame_of_refreshes() {
         let mut random = Random(0x9876_5432_1234_5671);
         const EACH: usize = 224 << 10;

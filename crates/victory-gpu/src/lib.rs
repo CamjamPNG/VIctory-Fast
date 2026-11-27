@@ -155,3 +155,9 @@ pub use watch::{
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// The device suite: the configuration each `#[ignore]`d test of this crate
+/// needs, and one entry point per test that runs it in a process of its own
+/// with that configuration. `docs/device-suite.md` lists the commands.
+#[cfg(test)]
+mod device_suite;

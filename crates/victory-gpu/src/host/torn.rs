@@ -311,7 +311,7 @@ mod tests {
     /// down, hashed alone, compared with what the CPU's side holds (as the
     /// merge begins), and both.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement, not a check: prints what hashing 96 MB costs"]
     fn hash_costs() {
         let (bytes, held) = (vec![0x5Au8; 96 << 20], vec![0x5Au8; 96 << 20]);
         let pieces = || bytes.chunks(64 << 10).zip(held.chunks(64 << 10));

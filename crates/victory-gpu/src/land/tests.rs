@@ -359,7 +359,7 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
 /// with new bytes, every dword of them. As before, and here on one thread
 /// and more, through the title's address and through a view of ours.
 #[test]
-#[ignore]
+#[ignore = "a measurement, not a check: prints what landing costs, with other threads at work"]
 fn what_landing_costs() {
     assert!(crate::safecopy::on());
     const HEAP: usize = 2784 * BLOCK;

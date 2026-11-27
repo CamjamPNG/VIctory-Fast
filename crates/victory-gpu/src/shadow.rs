@@ -3110,7 +3110,7 @@ mod merge_tests {
     /// eight bytes at a time that it was (a frame has some 250 of them, on
     /// the submitting thread). Run with `--ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement, not a check: prints what scanning 64 KiB for runs costs"]
     fn runs_of_equal_pages() {
         let (a, b) = (vec![7u8; 64 << 10], vec![7u8; 64 << 10]);
         let eights = || {

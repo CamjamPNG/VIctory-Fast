@@ -667,10 +667,10 @@ mod tests {
         assert_eq!((t.at, &t.was[..], &t.new[..]), (8, &was[3..11], &new[3..11]));
     }
 
-    /// The tests below want processes of their own with the relay on: each
-    /// `VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_UPCOPY_CHECK=1 cargo
-    /// test -p victory-gpu --lib upcheck -- --ignored --test-threads=1
-    /// <name>`.
+    /// The tests below want processes of their own with the relay on. They
+    /// are in the device suite's `relay`, `relay_fetch`, `upcopy` and `picked`
+    /// groups, which start each one with the switches it wants: see
+    /// `crates/victory-gpu/src/device_suite.rs` and `docs/device-suite.md`.
     const LEN: usize = 4 << 20;
 
     /// Title memory of our own (write-watched, or a view of a section, which
@@ -699,7 +699,10 @@ mod tests {
         assert!(!base.is_null());
         crate::shadow::register(resource, base as u64, len as u64);
         let shadow = crate::shadow::find(base as u64, 64).expect("a copy");
-        assert!(super::super::relay_exact() && super::super::relay_copy(), "set VICTORY_RELAY=2 VICTORY_RELAY_COPY=1");
+        crate::device_suite::require(
+            &crate::device_suite::check::relay::GROUP,
+            super::super::relay_exact() && super::super::relay_copy(),
+        );
         // SAFETY: `len` bytes just committed.
         (unsafe { std::slice::from_raw_parts_mut(base, len) }, base as usize, shadow)
     }
@@ -752,11 +755,12 @@ mod tests {
     /// what it found. Without `VICTORY_FETCH_CHECK` title memory keeps what
     /// was in between, and the next refresh of the 64 KiB sends it up.
     #[test]
-    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_FETCH_CHECK=1 and a process of its own"]
     fn a_result_caught_in_between_is_put_right() {
         let Some(host) = host() else {
             return;
         };
+        crate::device_suite::require(&crate::device_suite::check::relay_fetch::GROUP, super::super::torn::on());
         let (title, start, shadow) = title(0x3333, false);
         let slow = Slow::new(host);
         let (mut wrong, mut undone) = (0, 0);
@@ -809,7 +813,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        assert!(on(), "set VICTORY_UPCOPY_CHECK=1");
+        crate::device_suite::require(&crate::device_suite::check::upcopy::GROUP, on());
         let (title, start, shadow) = title(0x4444, false);
         let a = host.new_list().unwrap();
         shadow.refresh(&a, start as u64, LEN as u64);
@@ -842,7 +846,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        assert!(crate::picked::on(), "set VICTORY_PICKED_WRITES=1");
+        crate::device_suite::require(&crate::device_suite::check::picked::GROUP, crate::picked::on());
         let (title, start, shadow) = title(0x6666, true);
         crate::picked::shown(vec![(shadow.clone(), start as u64, (start + LEN) as u64)], true);
         let at = (37 << 16) + 512;

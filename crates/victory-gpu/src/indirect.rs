@@ -4936,8 +4936,8 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     /// with `D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT` + `DISPATCH`:
     /// repacks console records containing unused constants + remapped constants
     /// + dispatch counts (plus a garbage record), executes them on WARP, and
-    /// verifies the compute shader receives the exact indirect root constants
-    /// while preserving statically bound root constants!
+    ///   verifies the compute shader receives the exact indirect root constants
+    ///   while preserving statically bound root constants!
     #[test]
     fn warp_repack_root_constants_and_execute_indirect() {
         use victory_shader::RootType;
@@ -5155,7 +5155,7 @@ void main(uint3 gid : SV_GroupID) {
         // 1: CBV not 256B aligned (+16) -> invalid, draw zeroed
         // 2: UAV pointing to read-only outer -> invalid, draw zeroed
         // 3: unmapped guest VA -> invalid, draw zeroed
-        let mut src_bytes = vec![0u8; 4 * 40];
+        let mut src_bytes = [0u8; 4 * 40];
         let mut put_rec = |idx: usize, cbv: u64, srv: u64, uav: u64, draw: [u32; 4]| {
             let b = idx * 40;
             src_bytes[b..b + 8].copy_from_slice(&cbv.to_le_bytes());
@@ -5419,6 +5419,7 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
+        #[allow(dead_code)]
         depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,

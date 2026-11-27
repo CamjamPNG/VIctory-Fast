@@ -4737,7 +4737,7 @@ mod tests {
             [4.0, 0.0, 0.0],
         ];
         // id_byte: canonical [0,1,2] is i=1, j=2 -> (2<<2)|1 = 0x09; rotated [1,2,0] is i=2, j=0 -> (0<<2)|2 = 0x02.
-        let n0 = make_node(v, (0 << 8) | 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
+        let n0 = make_node(v, 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
         // Geometry 2 (non-opaque, leaving geometry 1 empty), sparse prim0=5 (rotated), prim1=2 (canonical).
         let n1 = make_node(v, (2 << 8) | 0x80, 5, 2, 0x02 | (0x09 << 8));
         let dump = pack_dump(2, 128, 2, &[n0, n1]);
@@ -4772,7 +4772,7 @@ mod tests {
     #[test]
     fn decode_mixed_opacity_in_same_geom_is_non_opaque() {
         let v = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
-        let n0 = make_node(v, (0 << 8) | 1, 0, 0, 0x09);
+        let n0 = make_node(v, 1, 0, 0, 0x09);
         let n1 = make_node(v, 0 << 8, 1, 0, 0x09);
         let dump = pack_dump(2, 64, 2, &[n0, n1]);
 
@@ -4785,11 +4785,11 @@ mod tests {
     #[test]
     fn decode_skips_when_frame0_already_exact_and_upgrades_on_reorder() {
         let v = [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]];
-        let exact = make_node(v, (0 << 8) | 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
+        let exact = make_node(v, 0x80 | 1, 0, 1, 0x09 | (0x09 << 8));
         assert!(decode_static_bvh4_nodes(0x3000, 1, &pack_dump(1, 64, 1, &[exact])).is_none());
 
         // Same single opaque geometry, but PrimitiveIndex swapped -> must upgrade.
-        let swapped = make_node(v, (0 << 8) | 0x80 | 1, 1, 0, 0x09 | (0x09 << 8));
+        let swapped = make_node(v, 0x80 | 1, 1, 0, 0x09 | (0x09 << 8));
         let upg = decode_static_bvh4_nodes(0x3000, 1, &pack_dump(1, 64, 1, &[swapped]))
             .expect("reordered prims must upgrade");
         assert_eq!(&upg.vertices[0..3], &[v[1], v[3], v[2]]);

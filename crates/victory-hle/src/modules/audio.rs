@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -61,6 +62,58 @@ static HEAP: Mutex<Heap> = Mutex::new(Heap {
     free: BTreeMap::new(),
     created: false,
 });
+
+/// Lock-free seqlock cache for the largest live APU heap slab (the title keeps
+/// one big slab for XMA inputs/outputs) so `heap_bytes`/`heap_unmap` avoid
+/// locking `HEAP` per 256-byte block.
+struct SlabCache {
+    seq: AtomicU64,
+    apu: AtomicU32,
+    size: AtomicUsize,
+    host: AtomicUsize,
+}
+
+impl SlabCache {
+    // A template each static or lock starts from, copied by value (`*EMPTY`),
+    // never touched through the constant itself.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: SlabCache = SlabCache {
+        seq: AtomicU64::new(0),
+        apu: AtomicU32::new(0),
+        size: AtomicUsize::new(0),
+        host: AtomicUsize::new(0),
+    };
+
+    /// Called only while holding `HEAP`.
+    fn store(&self, apu: u32, size: usize, host: usize) {
+        let s = self.seq.load(Ordering::Relaxed);
+        self.seq.store(s + 1, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
+        self.apu.store(apu, Ordering::Relaxed);
+        self.size.store(size, Ordering::Relaxed);
+        self.host.store(host, Ordering::Relaxed);
+        self.seq.store(s + 2, Ordering::Release);
+    }
+
+    #[inline]
+    fn lookup(&self, apu: u32, len: usize) -> Option<usize> {
+        let s1 = self.seq.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            return None;
+        }
+        let start = self.apu.load(Ordering::Relaxed);
+        let size = self.size.load(Ordering::Relaxed);
+        let host = self.host.load(Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Acquire);
+        if self.seq.load(Ordering::Relaxed) != s1 || size == 0 {
+            return None;
+        }
+        let offset = apu.checked_sub(start)? as usize;
+        (offset.checked_add(len)? <= size).then_some(host + offset)
+    }
+}
+
+static SLAB_CACHE: SlabCache = SlabCache::EMPTY;
 
 /// Device addresses start above 0, which means "none" to titles.
 const APU_BASE: u32 = 0x0001_0000;
@@ -114,6 +167,9 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
+    if size >= SLAB_CACHE.size.load(Ordering::Relaxed) {
+        SLAB_CACHE.store(apu, size, ptr as usize);
+    }
     // The big ones are named in the log: they are the title's audio memory
     // given out of our allocator, which the memory line counts as ours.
     if size >= 32 << 20 {
@@ -128,6 +184,13 @@ fn heap_free(ptr: *mut u8) {
         return;
     };
     heap.by_apu.remove(&block.apu);
+    if block.apu == SLAB_CACHE.apu.load(Ordering::Relaxed) {
+        if let Some((&host, largest)) = heap.blocks.iter().max_by_key(|(_, b)| b.size) {
+            SLAB_CACHE.store(largest.apu, largest.size, host);
+        } else {
+            SLAB_CACHE.store(0, 0, 0);
+        }
+    }
     heap.give_back(block.apu, block.apu + block.layout.size() as u32);
     drop(heap);
     // SAFETY: allocated by `heap_alloc` with this layout.
@@ -171,6 +234,9 @@ fn heap_map(ptr: usize) -> u32 {
 
 /// The host address of a device address, if a heap block holds it.
 fn heap_unmap(apu: u32) -> Option<*mut u8> {
+    if let Some(host) = SLAB_CACHE.lookup(apu, 1) {
+        return Some(host as *mut u8);
+    }
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let block = &heap.blocks[&host];
@@ -181,6 +247,11 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
 /// `len` bytes of title memory at a device address, if one heap block holds
 /// them all.
 fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
+    if let Some(host) = SLAB_CACHE.lookup(apu, len) {
+        // SAFETY: inside a live heap block, which the title and the audio
+        // hardware share like on the console.
+        return Some(unsafe { std::slice::from_raw_parts_mut(host as *mut u8, len) });
+    }
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
@@ -274,6 +345,9 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
     xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    for w in &xma.active {
+        w.store(0, Ordering::Relaxed);
+    }
     S_OK
 }
 
@@ -468,13 +542,33 @@ struct Xma {
     /// so a command for one voice never waits for others to decode (the
     /// title sends them from its time-critical mixer thread).
     voices: Vec<Mutex<Option<Voice>>>,
+    /// Active voice bitset for voices `0..512` so `pump()` skips idle voices
+    /// with zero mutex locks.
+    active: [AtomicU64; 8],
 }
 
 impl Xma {
+    // As [`SlabCache::EMPTY`]: the atomics are per instance, not shared.
+    #[allow(clippy::declare_interior_mutable_const)]
     const EMPTY: Xma = Xma {
         array: 0,
         voices: Vec::new(),
+        active: [const { AtomicU64::new(0) }; 8],
     };
+
+    #[inline]
+    fn set_active(&self, index: usize) {
+        if let Some(word) = self.active.get(index / 64) {
+            word.fetch_or(1u64 << (index % 64), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn clear_active(&self, index: usize) {
+        if let Some(word) = self.active.get(index / 64) {
+            word.fetch_and(!(1u64 << (index % 64)), Ordering::Release);
+        }
+    }
 }
 
 /// Written only when the context arrays are allocated or released.
@@ -560,6 +654,7 @@ impl Xma {
                 ended_ms: None,
             },
         });
+        self.set_active(index as usize);
         drop(slot);
         wake_decoder();
     }
@@ -568,10 +663,17 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(mut voice) = lock(&self.voices[index as usize]).take() else {
+        let voice = {
+            let mut slot = lock(&self.voices[index as usize]);
+            let voice = slot.take();
+            self.clear_active(index as usize);
+            voice
+        };
+        let Some(mut voice) = voice else {
             return;
         };
         if !voice.ended
+            && context.get(8) & !0x7f != 0
             && let Some(decoder) = &voice.decoder
         {
             let overlap = decoder.export_overlap();
@@ -623,9 +725,27 @@ impl Xma {
     fn pump(&self) {
         let start = Instant::now();
         let mut active = 0;
-        for index in 0..self.voices.len() as u32 {
+        let bitset_limit = self.voices.len().min(self.active.len() * 64);
+        for (word_idx, word) in self.active.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let index = word_idx * 64 + bit;
+                if index >= bitset_limit {
+                    break;
+                }
+                if let (Some(context), Some(voice)) =
+                    (self.context(index as u32), &mut *lock(&self.voices[index]))
+                {
+                    pump(context, voice);
+                    active += 1;
+                }
+            }
+        }
+        for index in bitset_limit..self.voices.len() {
             if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
+                (self.context(index as u32), &mut *lock(&self.voices[index]))
             {
                 pump(context, voice);
                 active += 1;
@@ -663,11 +783,50 @@ fn pump(context: Context, voice: &mut Voice) {
         let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
             return;
         };
-        for pair in out.as_chunks_mut::<2>().0 {
-            let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
-            pair.copy_from_slice(&sample.to_le_bytes());
+        let avail = voice.pcm.len().min(SAMPLES_PER_BLOCK);
+        let (s1, s2) = voice.pcm.as_slices();
+        let n1 = avail.min(s1.len());
+        let n2 = avail - n1;
+        #[cfg(target_endian = "little")]
+        {
+            let b1 = n1 * 2;
+            let b2 = n2 * 2;
+            // SAFETY: `s1[..n1]` and `s2[..n2]` are valid `i16` slices; on little-endian
+            // targets their bytes match `i16::to_le_bytes()`, and `b1 + b2 <= BLOCK_BYTES`.
+            unsafe {
+                if b1 > 0 {
+                    std::ptr::copy_nonoverlapping(s1.as_ptr().cast::<u8>(), out.as_mut_ptr(), b1);
+                }
+                if b2 > 0 {
+                    std::ptr::copy_nonoverlapping(
+                        s2.as_ptr().cast::<u8>(),
+                        out.as_mut_ptr().add(b1),
+                        b2,
+                    );
+                }
+            }
+            if b1 + b2 < BLOCK_BYTES {
+                out[b1 + b2..].fill(0);
+            }
         }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let mut chunks = out.as_chunks_mut::<2>().0.iter_mut();
+            for &sample in s1[..n1].iter().chain(&s2[..n2]) {
+                if let Some(pair) = chunks.next() {
+                    pair.copy_from_slice(&sample.to_le_bytes());
+                }
+            }
+            for pair in chunks {
+                *pair = [0, 0];
+            }
+        }
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for &sample in s1[..n1].iter().chain(&s2[..n2]) {
+                voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
+            }
+        }
+        voice.pcm.drain(..avail);
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
@@ -758,8 +917,6 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             );
         }
     }
-    let overlap = decoder.export_overlap();
-    save_overlap(context, voice, overlap);
     let mut next = frame.next.unwrap_or(0);
     let loops = context.field(0, 12, 8);
     let loop_end = context.field(4, 0, 26) as usize;
@@ -986,22 +1143,25 @@ extern "system" fn submit(
     data: *const c_void,
     notification: u32,
 ) -> HRESULT {
-    static SEEN: Mutex<u64> = Mutex::new(0);
-    if command < 64 && *lock(&SEEN) & 1 << command == 0 {
-        *lock(&SEEN) |= 1 << command;
-        tracing::info!(command, "first coprocessor command of this kind");
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if command < 64 {
+        let bit = 1u64 << command;
+        if SEEN.load(Ordering::Relaxed) & bit == 0
+            && SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0
+        {
+            tracing::info!(command, "first coprocessor command of this kind");
+        }
     }
-    let mut state = state(this);
     let word = |at: usize| -> Option<u32> {
         // SAFETY: the command's data starts with these u32 fields.
         (!data.is_null()).then(|| unsafe { data.cast::<u32>().add(at).read_unaligned() })
     };
     match command {
-        REGISTER_MESSAGES => state.mask |= word(0).unwrap_or(0),
-        UNREGISTER_MESSAGES => state.mask &= !word(0).unwrap_or(0),
+        REGISTER_MESSAGES => state(this).mask |= word(0).unwrap_or(0),
+        UNREGISTER_MESSAGES => state(this).mask &= !word(0).unwrap_or(0),
         LOAD_FLOWGRAPH => {
             let flowgraph = word(1).unwrap_or(0);
-            state.post(FLOWGRAPH_COMPLETED, &flowgraph.to_le_bytes());
+            state(this).post(FLOWGRAPH_COMPLETED, &flowgraph.to_le_bytes());
         }
         _ if xma_command(command, word) => {}
         // shortcut: context updates and the other SHAPE units' commands are
@@ -1010,6 +1170,7 @@ extern "system" fn submit(
         _ => {}
     }
     if id != 0 {
+        let mut state = state(this);
         let mut done = [0u8; 16];
         done[..4].copy_from_slice(&command.to_le_bytes());
         done[4..12].copy_from_slice(&id.to_le_bytes());

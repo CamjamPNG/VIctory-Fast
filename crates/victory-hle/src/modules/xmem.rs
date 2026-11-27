@@ -490,10 +490,17 @@ pub extern "system" fn XMemVirtualAlloc(
     // (The title asks for its 32-bit heap with kind 0x42000,
     // without the 64 KiB page bits: not `placeholder` above, though the host
     // makes a placeholder of it all the same.)
-    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
-        LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 {
+        if flags & ADDRESS_32BIT != 0 {
+            LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+        } else if kind & MEM_RESERVE_PLACEHOLDER != 0 {
+            HIGH_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+        }
     }
+    #[cfg(feature = "diagnostics")]
     note_protection(asked, kind, flags, at as usize, size);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = asked;
     at
 }
 
@@ -502,6 +509,7 @@ pub extern "system" fn XMemVirtualAlloc(
 /// write-combined, 0x800 and on the GPU's): said for the 1st, 2nd, 4th.. time of
 /// each, with how much so far. (For placing it: memory the CPU reaches
 /// uncached or write-combined is memory it does not read.)
+#[cfg(feature = "diagnostics")]
 fn note_protection(protect: u32, kind: u32, flags: u64, at: usize, size: usize) {
     type Seen = std::collections::HashMap<(u32, u32, u64), (u64, usize)>;
     static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
@@ -701,8 +709,6 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     pages: usize,
-    /// First page number assigned to this section in [`PAGES`].
-    first_page: usize,
     /// Whether the section was created with `SEC_COMMIT` (all pages committed).
     sec_committed: bool,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
@@ -711,6 +717,11 @@ struct Section {
     /// A bit per page: committed, as far as [`Section::window`] asked (also
     /// marks pages touched for [`arrange`]).
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// Monotonic word cursor skipping leading `u64::MAX` words in [`find_fresh_run`].
+    fresh_word: std::sync::atomic::AtomicUsize,
+    /// Reverse map `slice_index -> page_number` (`0` when freed), maintained
+    /// under [`PAGES`] write lock so `arrange`/`arrange_fresh_run` swap in O(1).
+    owners: Box<[std::sync::atomic::AtomicUsize]>,
 }
 
 impl Section {
@@ -718,11 +729,20 @@ impl Section {
         Section {
             handle,
             pages,
-            first_page,
             sec_committed,
             window: std::sync::OnceLock::new(),
             committed: (0..pages.div_ceil(64))
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            fresh_word: std::sync::atomic::AtomicUsize::new(0),
+            owners: (0..pages)
+                .map(|k| {
+                    std::sync::atomic::AtomicUsize::new(if first_page == 0 {
+                        0
+                    } else {
+                        first_page + k * FRAMES
+                    })
+                })
                 .collect(),
         }
     }
@@ -1129,6 +1149,7 @@ fn commit_sections() -> bool {
             return false;
         }
         explicit.as_deref() == Some("1")
+            || port_expand_on()
             || std::env::var("VICTORY_INPLACE_ALL").is_ok_and(|v| v.trim() == "1")
             || std::env::var("VICTORY_INPLACE")
                 .ok()
@@ -1274,7 +1295,14 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
-    let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
+    let gone: Vec<Slice> = numbers
+        .iter()
+        .filter_map(|number| {
+            let slice = table.pages.remove(number)?;
+            slice.section.owners[slice.index].store(0, Ordering::Relaxed);
+            Some(slice)
+        })
+        .collect();
     drop(table);
     drop(gone);
     1
@@ -1310,6 +1338,13 @@ impl View {
         if !slice.section.sec_committed && !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
+        }
+        // Mark touched so `arrange` / `arrange_fresh_run` never swaps written slices.
+        for p in slice.index..(slice.index + n).min(slice.section.pages) {
+            let bit = 1u64 << (p % 64);
+            if slice.section.committed[p / 64].load(Ordering::Relaxed) & bit == 0 {
+                slice.section.committed[p / 64].fetch_or(bit, Ordering::AcqRel);
+            }
         }
         Some(view)
     }
@@ -1615,6 +1650,7 @@ fn lean() -> bool {
 /// thread that is below normal to above it (`VICTORY_STREAM_PRIORITY=0`:
 /// left as the title set it).
 pub(crate) fn lift_thread() {
+    use std::cell::Cell;
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
     };
@@ -1623,6 +1659,13 @@ pub(crate) fn lift_thread() {
     if !*ON {
         return;
     }
+    thread_local! {
+        static CHECKED: Cell<bool> = const { Cell::new(false) };
+    }
+    if CHECKED.with(Cell::get) {
+        return;
+    }
+    CHECKED.with(|c| c.set(true));
     // SAFETY: plain calls on this thread.
     unsafe {
         let thread = GetCurrentThread();
@@ -1632,27 +1675,198 @@ pub(crate) fn lift_thread() {
     }
 }
 
-/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`; the GPU side's half is
-/// `victory_gpu`'s `port`): read here for xmem's part, [`arrange`].
+/// Expanded in-place placement (`VICTORY_PORT_EXPAND` non-zero, or
+/// `VICTORY_INPLACE_ALL=1`): enables `SEC_COMMIT` backing and 64-bit fresh-slice
+/// arrangement so 64-bit placeholder pools become contiguous section stretches.
+fn port_expand_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("VICTORY_PORT_EXPAND")
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "2" | "3" | "safe" | "sections" | "all"))
+            || std::env::var("VICTORY_INPLACE_ALL").is_ok_and(|v| v.trim() == "1")
+    });
+    *ON
+}
+
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`, or expanded in-place mode):
+/// read here for xmem's part, [`arrange`].
 fn port_on() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1") || port_expand_on()
+    });
     *ON
 }
 
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
-/// base and bytes (one, of 185 MB, in the target title).
+/// base and bytes (one, of 185 MB, in the title).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// The title's 64-bit placeholder reservations (`MEM_RESERVE_PLACEHOLDER`), used
+/// when [`port_expand_on`] is active.
+static HIGH_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// Pages given another place in their section so far by [`arrange`], and
 /// the times it found a page that was not fresh.
 static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// Before `pages` are mapped at `base`: if `base` lies in a 32-bit graphics
-/// reservation ([`LOW_RESERVATIONS`]) whose pages are all one section of
-/// the same size, the page numbers are given the slices of that section in
-/// the reservation's address order (each page at its offset in the
-/// reservation), so that the reservation becomes one stretch of the section
-/// and the GPU side can open it as one heap.
+/// Finds the first contiguous run of `need` fresh (never mapped, never written)
+/// slice indices in `section` using word-level skipping.
+fn find_fresh_run(section: &Section, need: usize) -> Option<usize> {
+    if need == 0 || need > section.pages {
+        return None;
+    }
+    let words = section.committed.len();
+    let start_word = section.fresh_word.load(Ordering::Relaxed).min(words);
+    let mut run_start = 0usize;
+    let mut run_len = 0usize;
+    let mut all_full_so_far = true;
+    for w in start_word..words {
+        let word_start = w * 64;
+        let valid_bits = (section.pages - word_start).min(64);
+        let raw = section.committed[w].load(Ordering::Acquire);
+        let occupied = if valid_bits < 64 {
+            raw | (!0u64 << valid_bits)
+        } else {
+            raw
+        };
+        if occupied == u64::MAX {
+            run_len = 0;
+            if all_full_so_far {
+                section.fresh_word.fetch_max(w + 1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        all_full_so_far = false;
+        if occupied == 0 {
+            if run_len == 0 {
+                run_start = word_start;
+            }
+            run_len += 64;
+            if run_len >= need {
+                return Some(run_start);
+            }
+            continue;
+        }
+        let mut bits = occupied;
+        let mut bit = 0usize;
+        while bit < valid_bits {
+            if bits & 1 == 0 {
+                let zeros = (bits.trailing_zeros() as usize).min(valid_bits - bit);
+                if run_len == 0 {
+                    run_start = word_start + bit;
+                }
+                run_len += zeros;
+                if run_len >= need {
+                    return Some(run_start);
+                }
+                bit += zeros;
+                bits = if zeros == 64 { 0 } else { bits >> zeros };
+            } else {
+                let ones = (bits.trailing_ones() as usize).min(valid_bits - bit);
+                run_len = 0;
+                bit += ones;
+                bits = if ones == 64 { 0 } else { bits >> ones };
+            }
+        }
+    }
+    None
+}
+
+/// Reorders `pages` (when `pages.len() > 1`, distinct, all fresh, all from one
+/// section, and not already ascending consecutive slices) into a single contiguous
+/// run of fresh slices in that section so `XMemMapPhysicalPages` maps them as
+/// one contiguous view (`Cover::Run`).
+fn arrange_fresh_run(pages: &[usize]) -> u64 {
+    if pages.len() < 2 {
+        return 0;
+    }
+    // Fast path under read lock: verify single section, all fresh, and not already consecutive.
+    {
+        let table = page_table();
+        let Some(first) = table.pages.get(&pages[0]) else {
+            return 0;
+        };
+        let section = &first.section;
+        if section.pages < pages.len() {
+            return 0;
+        }
+        let mut already_consecutive = true;
+        for (i, p) in pages.iter().enumerate() {
+            let Some(s) = table.pages.get(p) else {
+                return 0;
+            };
+            if !Arc::ptr_eq(&s.section, section) {
+                return 0;
+            }
+            if section.committed[s.index / 64].load(Ordering::Acquire) >> (s.index % 64) & 1 != 0 {
+                return 0;
+            }
+            if s.index != first.index + i {
+                already_consecutive = false;
+            }
+        }
+        if already_consecutive || find_fresh_run(section, pages.len()).is_none() {
+            return 0;
+        }
+    }
+    // Reject duplicate page numbers within the same mapping call before mutating.
+    let mut seen = std::collections::HashSet::with_capacity(pages.len());
+    if !pages.iter().all(|&p| seen.insert(p)) {
+        return 0;
+    }
+    let mut table = page_table_mut();
+    let Some(section) = pages.first().and_then(|p| table.pages.get(p)).map(|s| s.section.clone()) else {
+        return 0;
+    };
+    let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
+    if !pages.iter().all(|p| {
+        table
+            .pages
+            .get(p)
+            .is_some_and(|s| Arc::ptr_eq(&s.section, &section) && fresh(s.index))
+    }) {
+        return 0;
+    }
+    let Some(run_start) = find_fresh_run(&section, pages.len()) else {
+        return 0;
+    };
+    let mut moved = 0u64;
+    for (i, &number) in pages.iter().enumerate() {
+        let want = run_start + i;
+        let Some(have) = table.pages.get(&number).map(|s| s.index) else {
+            continue;
+        };
+        if have == want {
+            continue;
+        }
+        let other = section.owners[want].load(Ordering::Relaxed);
+        if other != 0 {
+            if let Some(slice) = table.pages.get_mut(&other) {
+                slice.index = have;
+            }
+            section.owners[have].store(other, Ordering::Relaxed);
+        } else {
+            section.owners[have].store(0, Ordering::Relaxed);
+        }
+        if let Some(slice) = table.pages.get_mut(&number) {
+            slice.index = want;
+        }
+        section.owners[want].store(number, Ordering::Relaxed);
+        moved += 1;
+    }
+    if moved > 0 {
+        ARRANGED[0].fetch_add(moved, Ordering::Relaxed);
+    }
+    moved
+}
+
+/// Before `pages` are mapped at `base`: if `base` lies in a tracked reservation
+/// ([`LOW_RESERVATIONS`], or [`HIGH_RESERVATIONS`] when expanded) whose pages
+/// are all one section of at least the reservation size, the page numbers are
+/// given the slices of that section in the reservation's address order so the
+/// reservation becomes one stretch of the section. Under [`port_expand_on`],
+/// also coalesces multi-page mappings of fresh single-section pages into a
+/// contiguous fresh run even when a reservation is backed by multiple sections.
 ///
 /// The title takes all the pages of its 185 MB heap in one call
 /// and maps its five pieces in another order than their addresses (run
@@ -1660,13 +1874,26 @@ static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// never written (no commit bit), so every page still reads as zeros and
 /// which slice a number names is not observable by the title.
 fn arrange(base: usize, pages: &[usize]) {
-    let Some((first, bytes)) = LOW_RESERVATIONS
+    let reservation = LOW_RESERVATIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .copied()
         .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
-    else {
+        .or_else(|| {
+            port_expand_on().then(|| {
+                HIGH_RESERVATIONS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .copied()
+                    .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
+            })?
+        });
+    let Some((first, bytes)) = reservation else {
+        if port_expand_on() {
+            arrange_fresh_run(pages);
+        }
         return;
     };
     let start_index = (base - first) / PAGE;
@@ -1683,12 +1910,16 @@ fn arrange(base: usize, pages: &[usize]) {
                 .iter()
                 .all(|p| table.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, section)))
         {
+            drop(table);
+            if port_expand_on() {
+                arrange_fresh_run(pages);
+                return;
+            }
             static SAID: AtomicU64 = AtomicU64::new(0);
             if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
                 tracing::warn!(
                     at = format_args!("{base:#x}"),
                     pages = pages.len(),
-                    section_pages = section.pages,
                     reservation = bytes / PAGE,
                     "renderer port 1: pages mapped into the 32-bit heap are not of one section as big as it: left where they are"
                 );
@@ -1713,21 +1944,10 @@ fn arrange(base: usize, pages: &[usize]) {
         return;
     }
     let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
-    // Which number has which slice of the section (only this section's page
-    // numbers, O(section.pages) instead of scanning the entire page table).
-    let mut owner: HashMap<usize, usize> = HashMap::with_capacity(section.pages);
-    for k in 0..section.pages {
-        let number = section.first_page + k * FRAMES;
-        if let Some(s) = table.pages.get(&number)
-            && Arc::ptr_eq(&s.section, &section)
-        {
-            owner.insert(s.index, number);
-        }
-    }
     let mut moved = 0u64;
-    for (i, number) in pages.iter().enumerate() {
+    for (i, &number) in pages.iter().enumerate() {
         let want = start_index + i;
-        let Some(have) = table.pages.get(number).map(|s| s.index) else {
+        let Some(have) = table.pages.get(&number).map(|s| s.index) else {
             continue;
         };
         if have == want {
@@ -1737,16 +1957,19 @@ fn arrange(base: usize, pages: &[usize]) {
             ARRANGED[1].fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if let Some(other) = owner.get(&want).copied()
-            && let Some(slice) = table.pages.get_mut(&other)
-        {
-            slice.index = have;
-            owner.insert(have, other);
+        let other = section.owners[want].load(Ordering::Relaxed);
+        if other != 0 {
+            if let Some(slice) = table.pages.get_mut(&other) {
+                slice.index = have;
+            }
+            section.owners[have].store(other, Ordering::Relaxed);
+        } else {
+            section.owners[have].store(0, Ordering::Relaxed);
         }
-        if let Some(slice) = table.pages.get_mut(number) {
+        if let Some(slice) = table.pages.get_mut(&number) {
             slice.index = want;
         }
-        owner.insert(want, *number);
+        section.owners[want].store(number, Ordering::Relaxed);
         moved += 1;
     }
     if moved > 0 {
@@ -2071,7 +2294,7 @@ fn asked_threads() -> Option<usize> {
     static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
         match std::env::var("VICTORY_MAP_THREADS") {
             Ok(v) if v.trim() == "auto" => None,
-            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 32)),
+            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).clamp(1, 32)),
         }
     });
     *ASKED
@@ -2086,11 +2309,14 @@ static BUSY: (Mutex<Option<std::time::Instant>>, AtomicU64, std::sync::atomic::A
 /// More than a quarter of a window, and the calls are what loading waits for
 /// (one thread of the title's makes them); less than a twentieth, they are
 /// not any more.
-struct Busy(std::time::Instant);
+struct Busy(Option<std::time::Instant>);
 
 impl Busy {
     fn begin() -> Busy {
-        Busy(std::time::Instant::now())
+        if asked_threads().is_some() {
+            return Busy(None);
+        }
+        Busy(Some(std::time::Instant::now()))
     }
 }
 
@@ -2101,11 +2327,15 @@ fn busy_after(was: bool, spent: std::time::Duration, window: std::time::Duration
 
 impl Drop for Busy {
     fn drop(&mut self) {
+        let Some(started) = self.0 else {
+            return;
+        };
         const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
-        let all = BUSY.1.fetch_add((now - self.0).as_nanos() as u64, Ordering::Relaxed) + (now - self.0).as_nanos() as u64;
+        let elapsed = (now - started).as_nanos() as u64;
+        let all = BUSY.1.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
         let mut began = BUSY.0.lock().unwrap_or_else(|e| e.into_inner());
-        let window = now - *began.get_or_insert(self.0);
+        let window = now - *began.get_or_insert(started);
         if window < WINDOW {
             return;
         }
@@ -2330,11 +2560,6 @@ mod pool {
     }
 
     fn serve(pool: &Pool) {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-        };
-        // SAFETY: a plain call on our own thread.
-        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
         let mut batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let Some(batch) = batches.front().cloned() else {
@@ -2739,6 +2964,11 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     // Splitting and joining placeholders changes nothing they show.
     if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0 {
+        if kind & MEM_RELEASE != 0 {
+            let at = address as usize;
+            LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| r.0 != at);
+            HIGH_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| r.0 != at);
+        }
         private_region_free(address as usize, size, kind);
         victory_gpu::title_memory_freed(address as usize, size);
     }
@@ -2913,6 +3143,93 @@ mod tests {
         unsafe { at(3).cast::<u32>().write(7) };
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn arrange_fresh_run_coalesces_scattered_fresh_pages_and_preserves_committed_pages() {
+        let pages = allocate(8);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            8 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let at = |k: usize| base.wrapping_byte_add(k * PAGE);
+
+        // Map and write pages 0 and 1 so slices 0..2 are committed (not fresh).
+        assert_eq!(XMemMapPhysicalPages(at(0), 2, pages[..2].as_ptr()), at(0));
+        // SAFETY: pages 0..2 are mapped read-write.
+        unsafe {
+            at(0).cast::<u64>().write(0x1111_2222);
+            at(1).cast::<u64>().write(0x3333_4444);
+        }
+
+        // Duplicate page numbers must be rejected without mutating slice indices.
+        assert_eq!(arrange_fresh_run(&[pages[7], pages[7], pages[3]]), 0);
+        // Any committed page in the batch must prevent swapping.
+        assert_eq!(arrange_fresh_run(&[pages[0], pages[7], pages[3]]), 0);
+
+        // Four out-of-order fresh pages from the same section coalesce into one contiguous run.
+        let scrambled = [pages[7], pages[3], pages[5], pages[2]];
+        assert!(arrange_fresh_run(&scrambled) > 0);
+        let indices: Vec<usize> = {
+            let table = page_table();
+            scrambled.iter().map(|p| table.pages[p].index).collect()
+        };
+        assert!(indices[0] >= 2, "must not overwrite committed slices 0..2: {indices:?}");
+        assert_eq!(
+            indices,
+            vec![indices[0], indices[0] + 1, indices[0] + 2, indices[0] + 3],
+            "fresh pages must be arranged into a contiguous ascending run"
+        );
+        // All 8 pages still map to 8 distinct slice indices (exact bijection).
+        let all_indices: std::collections::HashSet<usize> = {
+            let table = page_table();
+            pages.iter().map(|p| table.pages[p].index).collect()
+        };
+        assert_eq!(all_indices.len(), 8);
+
+        // Mapping the arranged pages creates ONE single 4-page view instead of 4 scattered views.
+        assert_eq!(XMemMapPhysicalPages(at(2), 4, scrambled.as_ptr()), at(2));
+        let view_len = physical().views.get(&(at(2) as usize)).map(|v| v.0);
+        assert_eq!(view_len, Some(4 * PAGE));
+
+        // Committed pages 0 and 1 retain their exact bytes.
+        // SAFETY: pages 0..2 are still mapped read-write.
+        unsafe {
+            assert_eq!(at(0).cast::<u64>().read(), 0x1111_2222);
+            assert_eq!(at(1).cast::<u64>().read(), 0x3333_4444);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(base, 8, std::ptr::null()), base);
+        // SAFETY: unmapped reservation owned by this test.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+        assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn find_fresh_run_word_skips_across_word_boundaries_and_partial_tail() {
+        let section = allocate_section(135, false).expect("section");
+        // Mark word 0 completely full, word 1 full except bits 61..64, word 2 bit 0..3 fresh then bit 3 full.
+        section.committed[0].store(u64::MAX, Ordering::Release);
+        section.committed[1].store(!(0b111u64 << 61), Ordering::Release);
+        section.committed[2].store(1u64 << 3, Ordering::Release);
+
+        // Run of 6 spans word 1 (61..64) into word 2 (128..131).
+        assert_eq!(find_fresh_run(&section, 6), Some(125));
+        // Cursor advanced past full word 0, stopped before partially-free word 1.
+        assert_eq!(section.fresh_word.load(Ordering::Relaxed), 1);
+        // Run of 7 does not fit in 125..131 (len 6) or tail 132..135 (len 3).
+        assert_eq!(find_fresh_run(&section, 7), None);
+        // Run of 3 fits in 125..128 first, and if 125..131 are filled, fits at 132..135 (partial tail).
+        section.committed[1].store(u64::MAX, Ordering::Release);
+        section.committed[2].store(0b1111u64, Ordering::Release);
+        assert_eq!(find_fresh_run(&section, 3), Some(132));
+        assert_eq!(section.fresh_word.load(Ordering::Relaxed), 2);
+        // Partial tail only has 3 valid bits (132, 133, 134); requesting 4 must not read past section.pages.
+        assert_eq!(find_fresh_run(&section, 4), None);
     }
 
     #[test]

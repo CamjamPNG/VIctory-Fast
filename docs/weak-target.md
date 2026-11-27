@@ -42,7 +42,7 @@ it set, so your own overrides win.
 | `VICTORY_RENDER_SCALE` | `0.5` | Image sharpness for GPU time: the title renders 960x540 and its own upscaler stretches that to 1080p. **Read the clamp below**: below 2/3 the title's *largest* render size stays at 2/3, so this may render 1280x720 instead. |
 | `VICTORY_UPSCALER` | `6` | The title's own upscaler instead of FidelityFX. On Series S the picker returns FidelityFX, which reads its own scale constant, so `VICTORY_RENDER_SCALE` would do nothing; 6 is the picker that honours it. `VICTORY_FFX_SCALE` is not used: it is documented unsafe at 0.5 (the title divided by a zero jitter phase count). |
 | `VICTORY_TEXTURE_BUDGET_MB` | `3200` | Texture detail and eviction churn for room. A cap on the bytes of host copies of textures the title fills; past it the queue makes no more, which leaves ~2.9 GB of the card for render targets and buffer copies. Without it the policy allows up to nine tenths of the budget for textures alone, with nothing reserved. |
-| `VICTORY_TEXTURE_MAX` | `512` | Distant texture detail for memory, pinned: a streamed texture skips levels until no side passes 512. The default follows pressure (1024, then 512 from 92 %, 256 from 97 %), so it would keep changing step on this card; a fixed value keeps the copy each view reads the same across a run. |
+| `VICTORY_TEXTURE_MAX` | `512` | Distant texture detail for memory, pinned: a streamed texture skips levels until no side passes 512. The default follows pressure (upstream's bands: 2048 below 85 % of the target, 1024 at 85-92 %, 512 at 92-97 %, 256 above), so it would keep changing step on this card; a fixed value keeps the copy each view reads the same across a run. The pin also means the pinned cap already does everything a texture-quality tier would: with no side above 512 the chain has no level 0 left to drop. |
 | `VICTORY_TEXTURE_STAGE_MB` | `96` | Load time for texture memory: the per-frame upload budget for textures picked by index. 96 MiB is exactly what the code picks on a `<= 6 GiB` budget, so this only removes a dependence on what the driver reports. |
 | `VICTORY_CARD_BUFFERS_MAX_MB` | `512` | Buffer latency on the card for memory: the ceiling on card copies of title buffers. 512 MiB is the default for any budget up to 12 GiB, set here so it does not move if the reported budget does. |
 | `VICTORY_NATIVE_RT` | `0` | Nothing to trade: the switch only ever turns DXR on (`dxr.rs`, `requested()`). Stated so a run of this preset cannot quietly inherit it from a window that set it. |
@@ -112,21 +112,25 @@ later, moving the cache back is one line — set `VICTORY_CACHE_DIR` before the 
 ### Deliberately not set
 
 - **`VICTORY_TEXTURE_KEEP`** (default: on). It lets idle textures go early.
-  The default already switches to its 1.5 s and 5 s rules once the card is 88 %
-  full, which on 6 GB is most of a session; forcing `0` would only add the
-  re-upload churn the comment there counts.
-- **`VICTORY_TEXTURE_ROOM_PERCENT`** (default 90). `VICTORY_TEXTURE_BUDGET_MB`
+  The default already switches to its 5 s and 1.5 s rules once the card passes
+  91 % of its target and trims back to 88 %, which on 6 GB is most of a
+  session; forcing `0` would only add the re-upload churn the comment there
+  counts.
+- **`VICTORY_TEXTURE_ROOM_PERCENT`** (default 93 upstream, 90 in what this
+  page was written against). `VICTORY_TEXTURE_BUDGET_MB`
   caps those copies' bytes, but the card's own line is still read under it
   once `VICTORY_VRAM_TARGET_MB` or the computed target applies, so this
-  percentage is no longer bypassed: 90 holds the queue a tenth of the target
-  below the line, which is where the thrash in runs 20 and 24 began.
+  percentage is no longer bypassed: the default holds the queue a few per cent
+  of the target below the line. `VICTORY_TEXTURE_BUDGET_MB` pins the bytes
+  first, so the percentage only decides the case under that cap.
 - **`VICTORY_FAST_CORES`** (default 2). It moves threads onto the fastest
   efficiency class where a CPU has two; a 3600 has one, and the code returns
   without asking.
-- **`VICTORY_CARD_ROOM_FOR_TARGETS_MB`** (default 3072). It only feeds the
-  room test, which is now read under `VICTORY_TEXTURE_BUDGET_MB` as well, so
-  on this preset it is read: it is the room the queue leaves for render
-  targets and the card copies of title buffers, and 3,072 MB is the default.
+- **`VICTORY_CARD_ROOM_FOR_TARGETS_MB`** (default 2048 upstream, 3072 before
+  the merge). It only feeds the room test, which is read under
+  `VICTORY_TEXTURE_BUDGET_MB` as well, so on this preset it is read: it is the
+  room the queue leaves for render targets and the card copies of title
+  buffers, less what they already hold.
 - **`VICTORY_FRAME_INTERVAL_MS`**, **`VICTORY_WINDOW_MAX`**: they change what a
   frame *is* rather than how fast it is made, and this preset is the baseline.
 

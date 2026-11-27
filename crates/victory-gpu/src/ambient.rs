@@ -35,6 +35,7 @@
 //! bounds what the air scatters by a multiple of the light around.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
@@ -51,8 +52,11 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
-    /// Ends the title's reflections (`CS_UpdateHistory`).
+    /// Ends the title's opaque reflections (`CS_UpdateHistory`).
     Reflect,
+    /// Ends the title's forward/transparent/alpha reflections
+    /// (`CS_TemporalResolve1_Alpha`, `CS_TemporalResolveAlpha`, `CS_UpscaleAlpha`).
+    ReflectAlpha,
 }
 
 /// The program's part in this, by its name in the container.
@@ -66,6 +70,11 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Air)
     } else if has(b"CS_UpdateHistory") {
         Some(Role::Reflect)
+    } else if has(b"CS_TemporalResolve1_Alpha")
+        || has(b"CS_TemporalResolveAlpha")
+        || has(b"CS_UpscaleAlpha")
+    {
+        Some(Role::ReflectAlpha)
     } else {
         None
     }
@@ -79,8 +88,11 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
-/// Where the last reflection pass writes reflections (R9G9B9E5 as 32-bit integers).
+/// Where the last opaque reflection pass writes reflections (R9G9B9E5 as 32-bit integers).
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+/// Where `CS_TemporalResolve1_Alpha` writes forward/transparent reflections
+/// (R9G9B9E5 as 32-bit integers, aliased to R9G9B9E5_SHAREDEXP on read).
+pub(crate) const REFLECTIONS_ALPHA: (u8, u32) = (1, 136);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -98,12 +110,41 @@ fn parse(set: &str) -> Set {
     }
 }
 
-fn set() -> Set {
+/// Live override for the ambient estimate level (`u32::MAX` = use env default).
+static LIVE_LEVEL: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn env_set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
         Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
         set => set,
     })
+}
+
+fn set() -> Set {
+    let bits = LIVE_LEVEL.load(Ordering::Relaxed);
+    if bits != u32::MAX {
+        let level = f32::from_bits(bits);
+        return if level > 0.0 { Set::Estimate(level) } else { Set::Off };
+    }
+    env_set()
+}
+
+/// Active ambient level (`None` when off), reflecting any live HUD override.
+pub(crate) fn current_level() -> Option<f32> {
+    match set() {
+        Set::Off => None,
+        Set::Estimate(level) | Set::Constant(level) => Some(level),
+    }
+}
+
+/// Live override for the ambient estimate multiplier (clamped `0.0..=4.0`;
+/// `0.0` disables ambient immediately on the next frame).
+pub(crate) fn set_live_level(level: f32) {
+    if !level.is_finite() {
+        return;
+    }
+    LIVE_LEVEL.store(level.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
 }
 
 /// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
@@ -179,6 +220,17 @@ fn parse_reflect(set: &str) -> f32 {
 fn reflect_cap() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| parse_reflect(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default()))
+}
+
+/// Forward/alpha reflection clamping (`VICTORY_AMBIENT_REFLECT_ALPHA=0` disables;
+/// default on whenever RT-off reflection clamping is active).
+fn parse_reflect_alpha(set: &str) -> bool {
+    !matches!(set.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false")
+}
+
+pub(crate) fn reflect_alpha_on() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| parse_reflect_alpha(&std::env::var("VICTORY_AMBIENT_REFLECT_ALPHA").unwrap_or_default()))
 }
 
 /// How the slow mean of the light around follows the frames
@@ -288,11 +340,16 @@ Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
 RWStructuredBuffer<float4> cells : register(u1);
-// Three a point: red, green and blue, each a mean and a direction.
+// Four a point (64B-aligned): R/G/B directional harmonics + mean, then (mean RGB, linear Z).
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
+float3 seen_at(int2 p, int2 max_p, float2 proj_scale, float2 proj_bias) {
+    float d = depth.Load(int3(clamp(p, int2(0, 0), max_p), 0));
+    float z = min(near / max(d, 1e-7), 1000.0);
+    return float3((float2(p) * proj_scale + proj_bias) * z, z);
+}
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
     float z = min(near / max(d, 1e-7), 1000.0);
@@ -317,13 +374,32 @@ void keep(uint3 at : SV_DispatchThreadID) {
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
+#endif
+
+#ifdef MEAN
+groupshared float3 gs_sum[64];
 [RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void mean() {
+[numthreads(64, 1, 1)]
+void mean(uint gi : SV_GroupIndex) {
     float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    for (uint i = gi; i < CELLS; i += 64) {
+        sum += cells[i].rgb;
+    }
+    gs_sum[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 32) gs_sum[gi] += gs_sum[gi + 32];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 16) gs_sum[gi] += gs_sum[gi + 16];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 8) gs_sum[gi] += gs_sum[gi + 8];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 4) gs_sum[gi] += gs_sum[gi + 4];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 2) gs_sum[gi] += gs_sum[gi + 2];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi != 0) return;
     float4 was = cells[CELLS];
-    float3 now = sum / CELLS;
+    float3 now = (gs_sum[0] + gs_sum[1]) / CELLS;
     // (`jump` > 0: a change of more than that factor either way is
     // followed at once, as a new room is.)
     float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
@@ -346,35 +422,59 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+#define GATHER_TILE 64
+groupshared float4 gs_pos[GATHER_TILE];
+groupshared float3 gs_rad[GATHER_TILE];
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
-void gather(uint3 at : SV_DispatchThreadID) {
-    float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
-    float r2 = 0.25 + 0.0025 * p.z * p.z;
+[numthreads(8, 8, 1)]
+void gather(uint3 at : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    bool in_bounds = at.x < PX && at.y < PY;
+    float3 p = 0;
+    float r2 = 0.25;
+    if (in_bounds) {
+        float2 size = float2(width, height);
+        p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+        r2 = 0.25 + 0.0025 * p.z * p.z;
+    }
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
-        float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
-        float3 d = c.xyz - p;
-        float dd = dot(d, d);
-        float w = c.w / (dd + r2);
-        float3 dir = d / sqrt(dd + 0.25 * r2);
-        whole += w;
-        toward += w * dir;
-        light += w * L;
-        red += w * L.r * dir;
-        green += w * L.g * dir;
-        blue += w * L.b * dir;
+    for (uint base = 0; base < CELLS; base += GATHER_TILE) {
+        uint idx = base + gi;
+        if (idx < CELLS) {
+            gs_pos[gi] = cells[CELLS + 1 + idx];
+            gs_rad[gi] = cells[idx].rgb;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (in_bounds) {
+            uint count = min((uint)GATHER_TILE, (uint)CELLS - base);
+            for (uint j = 0; j < count; j++) {
+                float4 c = gs_pos[j];
+                float3 L = gs_rad[j];
+                float3 d = c.xyz - p;
+                float dd = dot(d, d);
+                float w = c.w / (dd + r2);
+                float3 dir = d * rsqrt(dd + 0.25 * r2);
+                float3 wd = w * dir;
+                whole += w;
+                toward += wd;
+                light += w * L;
+                red += wd * L.r;
+                green += wd * L.g;
+                blue += wd * L.b;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (!in_bounds) return;
     whole = max(whole, 1e-6);
-    light /= whole;
-    toward /= whole;
-    uint at0 = (at.y * PX + at.x) * 3;
-    points[at0] = float4(red / whole - light.r * toward, light.r);
-    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
-    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    float inv_whole = 1.0 / whole;
+    light *= inv_whole;
+    toward *= inv_whole;
+    uint at0 = (at.y * PX + at.x) * 4;
+    points[at0] = float4(red * inv_whole - light.r * toward, light.r);
+    points[at0 + 1] = float4(green * inv_whole - light.g * toward, light.g);
+    points[at0 + 2] = float4(blue * inv_whole - light.b * toward, light.b);
+    points[at0 + 3] = float4(light, p.z);
 }
 #endif
 
@@ -390,8 +490,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
-    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float3 seen_there = points[(q.y * PX + q.x) * 4 + 3].rgb;
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
@@ -422,17 +521,18 @@ uint pack(float3 c) {
 void hold_reflect(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
-    float3 c = unpack(light[p]);
+    uint raw = light[p];
+    if ((raw & 0x07FFFFFFu) == 0) return;
+    float3 c = unpack(raw);
     if (any(isnan(c)) || any(isinf(c))) { light[p] = 0; return; }
     if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) { light[p] = 0; return; }
-    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
-    float3 local = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
-    float3 room = cells[CELLS].rgb;
     float3 around;
     if (constant > 0.0) {
         around = float3(1.0, 0.98, 0.94) * constant;
     } else {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        float3 local = points[(q.y * PX + q.x) * 4 + 3].rgb;
+        float3 room = cells[CELLS].rgb;
         float3 base = dot(local, LUMA) > 1e-5 ? lerp(room, local, 0.35) : room;
         around = base * level;
     }
@@ -442,43 +542,71 @@ void hold_reflect(uint3 at : SV_DispatchThreadID) {
     if (has > cap) {
         float3 clamped = c * (cap / has);
         // Strong spikes indoors are unoccluded outdoor sky-miss rays: shift toward the room's tint.
-        float excess = saturate((has / cap - 1.0) / 3.0);
-        float3 room_tint = around * (cap / around_luma);
+        float excess = saturate((has / cap - 1.0) * (1.0 / 3.0));
+        float3 room_tint = around * reflect_cap;
         light[p] = pack(lerp(clamped, room_tint, 0.65 * excess));
     }
 }
 #endif
 
 #ifdef RAISE
+static const float2 VOGEL[12] = {
+    float2( 0.204124145,  0.000000000),
+    float2(-0.260699212,  0.238821944),
+    float2( 0.039903992, -0.454687810),
+    float2( 0.328594836,  0.428593164),
+    float2(-0.603011493, -0.106663671),
+    float2( 0.571224618, -0.363367265),
+    float2(-0.191062615,  0.710747314),
+    float2(-0.364380125, -0.701589000),
+    float2( 0.790557203,  0.288708576),
+    float2(-0.822441784,  0.339494003),
+    float2( 0.396469678, -0.847237744),
+    float2( 0.292984806,  0.934073464),
+};
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
-    float3 c = seen(p, size);
-    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
-    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    int2 max_p = int2(width, height) - 1;
+    float step = 2.0 * tan_y / size.y;
+    float tan_x = 0.5 * size.x * step;
+    float2 proj_scale = float2(step, -step);
+    float2 proj_bias = float2(0.5 * step - tan_x, tan_y - 0.5 * step);
+    float3 c = seen_at(p, max_p, proj_scale, proj_bias);
+    float3 l = seen_at(p + int2(-1, 0), max_p, proj_scale, proj_bias);
+    float3 r = seen_at(p + int2(1, 0), max_p, proj_scale, proj_bias);
+    float3 u = seen_at(p + int2(0, -1), max_p, proj_scale, proj_bias);
+    float3 d = seen_at(p + int2(0, 1), max_p, proj_scale, proj_bias);
     float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
     float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
     float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
     if (dot(n, c) > 0.0) n = -n;
     // How open it is (as in beloooo's cd9f78ce).
     float open = 1.0;
-    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+    float inv_cz = 1.0 / c.z;
+    float px = min((radius / step) * inv_cz, 128.0);
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
     if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
         float sum = 0.0;
-        const int N = 12;
-        for (int i = 0; i < N; i++) {
-            float a = i * 2.399963 + noise * 6.2831853;
-            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
-            float3 v = seen(p + int2(round(o)), size) - c;
+        float s, co;
+        sincos(noise * 6.2831853, s, co);
+        float2 rx = float2(co, -s) * px;
+        float2 ry = float2(s, co) * px;
+        float bias = 0.004 * c.z + 0.005;
+        float inv_r2 = 1.0 / (radius * radius);
+        [unroll]
+        for (int i = 0; i < 12; i++) {
+            float2 tap = VOGEL[i];
+            float2 o = float2(dot(tap, rx), dot(tap, ry));
+            float3 v = seen_at(p + int2(round(o)), max_p, proj_scale, proj_bias) - c;
             float vv = dot(v, v);
-            float over = dot(v, n) - 0.004 * c.z - 0.005;
-            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+            float over = dot(v, n) - bias;
+            sum += max(over, 0.0) * rsqrt(vv + 1e-6) * saturate(1.0 - vv * inv_r2);
         }
-        open = saturate(1.0 - strength * 2.0 * sum / N);
+        open = saturate(1.0 - strength * (2.0 / 12.0) * sum);
     }
     float3 found;
     if (constant > 0.0) {
@@ -488,26 +616,29 @@ void raise(uint3 at : SV_DispatchThreadID) {
     }
     // Between the four points around, those at its own depth first; which
     // four is dithered a little.
-    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    float2 g = (float2(p) + 0.5) * (float2(PX, PY) / size) - 0.5 + (noise - 0.5) * 0.5;
     int2 g0 = int2(floor(g));
     float2 f = g - float2(g0);
     float4 sr = 0, sg = 0, sb = 0;
     float sum = 0;
+    [unroll]
     for (int k = 0; k < 4; k++) {
         int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        uint at0 = (q.y * PX + q.x) * 4;
+        float z = points[at0 + 3].w;
         float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-        uint at0 = (q.y * PX + q.x) * 3;
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) * inv_cz);
         sr += w * points[at0];
         sg += w * points[at0 + 1];
         sb += w * points[at0 + 2];
         sum += w;
     }
-    float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    float inv_sum = 1.0 / sum;
+    float3 all = float3(sr.w, sg.w, sb.w) * inv_sum;
+    found = all + (1.2 * inv_sum) * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n));
     found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float4 room = cells[CELLS];
+    found = lerp(found, room.rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
@@ -516,7 +647,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // For `fresh` seconds after the light around jumped (a new room) the
     // title's leftover counts for no more than the estimate, then up to
     // `most` times it again: its history holds the place before.
-    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(room.a / fresh)) : most;
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
@@ -527,8 +658,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
+const PX: u32 = 160;
+const PY: u32 = 90;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
-const POINT_BYTES: u64 = 160 * 90 * 48;
+const POINT_BYTES: u64 = PX as u64 * PY as u64 * 64;
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -565,7 +698,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         }
     };
     let keep = pipeline("KEEP", s!("keep"))?;
-    let mean = pipeline("KEEP", s!("mean"))?;
+    let mean = pipeline("MEAN", s!("mean"))?;
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
@@ -597,10 +730,22 @@ fn pass() -> Option<&'static Pass> {
     .as_ref()
 }
 
-fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
-    // SAFETY: an open list; the barrier names no resource.
+fn uav_barrier(list: &ID3D12GraphicsCommandList, resource: Option<&ID3D12Resource>) {
+    let barrier = match resource {
+        Some(r) => crate::indirect::uav_barrier_for(r),
+        None => crate::indirect::uav_barrier(),
+    };
+    // SAFETY: an open list; `resource` (if any) is kept alive for the list.
     unsafe { list.ResourceBarrier(&[barrier]) };
+}
+
+fn uav_barrier_pair(list: &ID3D12GraphicsCommandList, a: &ID3D12Resource, b: &ID3D12Resource) {
+    let barriers = [
+        crate::indirect::uav_barrier_for(a),
+        crate::indirect::uav_barrier_for(b),
+    ];
+    // SAFETY: an open list; both resources are kept alive for the list.
+    unsafe { list.ResourceBarrier(&barriers) };
 }
 
 /// Whether the light of a frame has been kept: the estimate has something
@@ -637,15 +782,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    if role == Role::Reflect && (reflect_cap() <= 0.0 || (rays_run() && rt_band().is_none())) {
+    if role == Role::ReflectAlpha && !reflect_alpha_on() {
         return false;
     }
-    static SAID: [std::sync::atomic::AtomicBool; 4] = [const { std::sync::atomic::AtomicBool::new(false) }; 4];
+    if matches!(role, Role::Reflect | Role::ReflectAlpha) && (reflect_cap() <= 0.0 || (rays_run() && rt_band().is_none())) {
+        return false;
+    }
+    static SAID: [std::sync::atomic::AtomicBool; 5] = [const { std::sync::atomic::AtomicBool::new(false) }; 5];
     let slot = match role {
         Role::Resolve => 0,
         Role::Radiance => 1,
         Role::Air => 2,
         Role::Reflect => 3,
+        Role::ReflectAlpha => 4,
     };
     if !SAID[slot].swap(true, Ordering::Relaxed) {
         tracing::info!(?role, size = ?views.size, level, constant, reflect = reflect_cap(), "a stand-in for the indirect light");
@@ -674,35 +823,60 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     // program has just used both views, so their textures are in the states
     // these views need; buffers the list keeps.
     unsafe {
-        uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
-        let run = |pso: &ID3D12PipelineState, x, y, z| {
+        let dispatch = |name: &str, pso: &ID3D12PipelineState, x, y, z| {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("ambient {name} {x}x{y}x{z}"));
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = name;
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
-            uav_barrier(l);
         };
         match role {
             Role::Radiance => {
-                run(&pass.keep, 8, 9, 1);
-                run(&pass.mean, 1, 1, 1);
+                // Sync the title's radiance UAV write before `keep` reads it.
+                uav_barrier(l, None);
+                dispatch("keep", &pass.keep, 8, 9, 1);
+                uav_barrier(l, Some(&pass.cells));
+                dispatch("mean", &pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
-            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::Air => {
+                uav_barrier(l, None);
+                dispatch(
+                    "air",
+                    &pass.air,
+                    views.size[0].div_ceil(8),
+                    views.size[1].div_ceil(8),
+                    views.slices.div_ceil(2),
+                );
+            }
+            Role::Reflect | Role::ReflectAlpha => {
+                uav_barrier(l, None);
+                let name = if role == Role::Reflect { "reflect" } else { "reflect_alpha" };
+                dispatch(name, &pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    // `place` and `gather` read only `depth` (SRV) and internal buffers,
+                    // overlapping with the title's resolve UAV write until `raise`.
+                    uav_barrier(l, Some(&pass.cells));
+                    dispatch("place", &pass.place, 8, 9, 1);
+                    uav_barrier_pair(l, &pass.cells, &pass.points);
+                    dispatch("gather", &pass.gather, PX.div_ceil(8), PY.div_ceil(8), 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                // Flushes both the title's `light` UAV write and `gather`'s `points` write.
+                uav_barrier(l, None);
+                dispatch("raise", &pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }
+    list.mark_uav_dirty();
     true
 }
 
@@ -746,11 +920,33 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_UpdateHistory_12345678"), Some(Role::Reflect));
+        assert_eq!(role(b"CS_TemporalResolve1_Alpha_68979fba_Wrapped"), Some(Role::ReflectAlpha));
+        assert_eq!(role(b"CS_AlphaTransmissionHistoryResolve_852f50a1_Wrapped"), None);
+        assert_eq!(role(b"CS_DeferredFallbacksAlpha_SkyProbe_99ec4412_Wrapped"), None);
         assert_eq!(role(b"CS_TemporalResolve"), None);
         assert_eq!(parse_reflect(""), 0.5);
         assert_eq!(parse_reflect("0"), 0.0);
         assert_eq!(parse_reflect("0.75"), 0.75);
         assert_eq!(parse_reflect("-1"), 0.5);
+        assert!(parse_reflect_alpha(""));
+        assert!(parse_reflect_alpha("1"));
+        assert!(!parse_reflect_alpha("0"));
+        assert!(!parse_reflect_alpha("off"));
+        assert!(!parse_reflect_alpha("false"));
+    }
+
+    #[test]
+    fn live_level_override() {
+        LIVE_LEVEL.store(u32::MAX, Ordering::Relaxed);
+        set_live_level(1.8);
+        assert_eq!(current_level(), Some(1.8));
+        set_live_level(9.0);
+        assert_eq!(current_level(), Some(4.0));
+        set_live_level(-2.0);
+        assert_eq!(current_level(), None);
+        set_live_level(f32::NAN);
+        assert_eq!(current_level(), None);
+        LIVE_LEVEL.store(u32::MAX, Ordering::Relaxed);
     }
 
     /// The passes compile with the system's compiler and the host takes them.
@@ -760,5 +956,54 @@ mod tests {
             return;
         };
         make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+    }
+
+    /// Precomputed Vogel taps and linearized projection match the original `raise` math.
+    #[test]
+    fn raise_math_equivalence() {
+        const VOGEL: [[f32; 2]; 12] = [
+            [0.20412414, 0.0],
+            [-0.2606992, 0.23882194],
+            [0.03990399, -0.4546878],
+            [0.32859483, 0.42859316],
+            [-0.6030115, -0.106663674],
+            [0.57122463, -0.36336726],
+            [-0.19106261, 0.7107473],
+            [-0.36438012, -0.701589],
+            [0.7905572, 0.28870857],
+            [-0.82244176, 0.339494],
+            [0.39646968, -0.84723777],
+            [0.2929848, 0.93407345],
+        ];
+        for noise in [0.0f32, 0.13, 0.37, 0.5, 0.73, 0.999] {
+            let px = 64.0f32;
+            let (s, co) = (noise * std::f32::consts::TAU).sin_cos();
+            let rx = [co * px, -s * px];
+            let ry = [s * px, co * px];
+            for (i, tap) in VOGEL.iter().enumerate() {
+                let a = (i as f32) * 2.399963 + noise * std::f32::consts::TAU;
+                let r = (((i as f32) + 0.5) / 12.0).sqrt() * px;
+                let old = [a.cos() * r, a.sin() * r];
+                let new = [tap[0] * rx[0] + tap[1] * rx[1], tap[0] * ry[0] + tap[1] * ry[1]];
+                assert!((old[0] - new[0]).abs() < 5e-4, "x mismatch at i={i} noise={noise}: {old:?} vs {new:?}");
+                assert!((old[1] - new[1]).abs() < 5e-4, "y mismatch at i={i} noise={noise}: {old:?} vs {new:?}");
+            }
+        }
+
+        let (w, h, tan_y, z) = (1920.0f32, 1080.0f32, 0.45f32, 12.5f32);
+        let step = 2.0 * tan_y / h;
+        let tan_x = 0.5 * w * step;
+        let proj_scale = [step, -step];
+        let proj_bias = [0.5 * step - tan_x, tan_y - 0.5 * step];
+        for (px, py) in [(-1, -1), (0, 0), (959, 539), (1919, 1079), (1920, 1080)] {
+            let ndc_x = (px as f32 + 0.5) / w * 2.0 - 1.0;
+            let ndc_y = (py as f32 + 0.5) / h * 2.0 - 1.0;
+            let old_x = ndc_x * tan_y * w / h * z;
+            let old_y = -ndc_y * tan_y * z;
+            let new_x = (px as f32 * proj_scale[0] + proj_bias[0]) * z;
+            let new_y = (py as f32 * proj_scale[1] + proj_bias[1]) * z;
+            assert!((old_x - new_x).abs() < 1e-5, "proj x mismatch at ({px},{py}): {old_x} vs {new_x}");
+            assert!((old_y - new_y).abs() < 1e-5, "proj y mismatch at ({px},{py}): {old_y} vs {new_y}");
+        }
     }
 }

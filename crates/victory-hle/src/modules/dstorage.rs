@@ -320,17 +320,22 @@ struct Files {
     io: Io,
 }
 
+fn default_worker_count(parallelism: usize) -> usize {
+    (parallelism / 2).clamp(2, 6)
+}
+
 fn parse_worker_count(raw: Option<&str>, default: usize) -> usize {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .map_or(default, |n| n.clamp(1, 64))
 }
 
 /// Number of DirectStorage worker threads (`VICTORY_DSTORAGE_WORKERS`,
-/// clamped `1..=64`, default `available_parallelism()`).
+/// clamped `1..=64`, default `(available_parallelism() / 2).clamp(2, 6)`).
 fn worker_count() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
-        let default = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let default = std::thread::available_parallelism()
+            .map_or(4, |n| default_worker_count(n.get()));
         let env = std::env::var("VICTORY_DSTORAGE_WORKERS").ok();
         parse_worker_count(env.as_deref(), default)
     })
@@ -846,6 +851,15 @@ pub(crate) mod stream_log {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    #[cfg(windows)]
+    // SAFETY: plain priority adjustment on our own worker thread so streaming
+    // decompression does not preempt title or submission threads.
+    unsafe {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -1813,21 +1827,24 @@ fn into_destination_with(
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first, and until the
-        // bytes are there.
-        let writing = victory_gpu::kernel_writing(request.destination as usize, len);
+        let dst = request.destination as usize;
+        // Only raw file reads land through the kernel, which fails on guarded
+        // blocks instead of faulting into the GPU side's VEH. User-mode ZLIB /
+        // BCPack decompression and memory copies fault normally, so avoid
+        // holding `kernel_writing` (`GUARDS.lock`) across long CPU decodes.
+        let kernel_read = request.options & (ZLIB | BCPACK | MEMORY_SOURCE) == 0;
+        let writing = kernel_read.then(|| victory_gpu::kernel_writing(dst, len));
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
         drop(writing);
-        // Again now that the bytes are there: a texture looked at in between
-        // was uploaded without them (`xmem::pages_written`).
+        // Notify once the final bytes are in place so placed textures and
+        // guarded buffers always observe the completed payload.
         if super::xmem::stream_notice() {
-            victory_gpu::kernel_will_write(request.destination as usize, len);
+            victory_gpu::kernel_will_write(dst, len);
         } else {
-            victory_gpu::title_memory_written(request.destination as usize, len, false);
+            victory_gpu::title_memory_written(dst, len, false);
         }
         return filled;
     }
@@ -2964,12 +2981,18 @@ mod tests {
 
     #[test]
     fn bounded_queue_wakeups_and_worker_count_clamping() {
-        assert_eq!(parse_worker_count(None, 12), 12);
-        assert_eq!(parse_worker_count(Some("0"), 12), 1);
-        assert_eq!(parse_worker_count(Some("1"), 12), 1);
-        assert_eq!(parse_worker_count(Some(" 16 "), 12), 16);
-        assert_eq!(parse_worker_count(Some("999"), 12), 64);
-        assert_eq!(parse_worker_count(Some("invalid"), 12), 12);
+        assert_eq!(default_worker_count(1), 2);
+        assert_eq!(default_worker_count(4), 2);
+        assert_eq!(default_worker_count(8), 4);
+        assert_eq!(default_worker_count(12), 6);
+        assert_eq!(default_worker_count(16), 6);
+        assert_eq!(default_worker_count(32), 6);
+        assert_eq!(parse_worker_count(None, 6), 6);
+        assert_eq!(parse_worker_count(Some("0"), 6), 1);
+        assert_eq!(parse_worker_count(Some("1"), 6), 1);
+        assert_eq!(parse_worker_count(Some(" 16 "), 6), 16);
+        assert_eq!(parse_worker_count(Some("999"), 6), 64);
+        assert_eq!(parse_worker_count(Some("invalid"), 6), 6);
 
         let plain = pattern(16_384);
         let packed = compress_zlib(&plain);

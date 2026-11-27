@@ -95,11 +95,27 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
+const AMPLE_COMMIT: u64 = 12 * GIB;
+
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
-    if was {
-        physical < 5 * GIB || commit < 6 * GIB
+    let commit_tight = if was { commit < 6 * GIB } else { commit <= 4 * GIB };
+    if commit_tight {
+        return true;
+    }
+    // On 32 GiB hosts with ample pagefile commit headroom (>= 12 GiB), Windows
+    // routinely keeps `ullAvailPhys` around 2-4 GiB; only engage physical
+    // pressure when free physical RAM drops dangerously low (<= 1.5 GiB) and
+    // allow recovering once it eases back to >= 2.5 GiB.
+    if commit >= AMPLE_COMMIT {
+        if was {
+            physical < 2560 * MIB
+        } else {
+            physical <= 1536 * MIB
+        }
+    } else if was {
+        physical < 4 * GIB
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        physical <= 3 * GIB
     }
 }
 
@@ -232,12 +248,29 @@ mod tests {
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
+        // Low commit always enters pressure and requires >= 6 GiB to clear.
         assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
+        assert!(next_pressure(true, 12 * GIB, 5 * GIB));
+        assert!(!next_pressure(true, 4 * GIB, 6 * GIB));
+
+        // Moderate commit (< 12 GiB): enters at <= 3 GiB physical, clears at >= 4 GiB.
+        assert!(next_pressure(false, 3 * GIB, 8 * GIB));
+        assert!(next_pressure(true, 3584 * MIB, 8 * GIB));
+        assert!(!next_pressure(true, 4 * GIB, 8 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+    }
+
+    #[test]
+    fn ample_commit_avoids_latching_and_recovers_on_physical_ease() {
+        // With >= 12 GiB commit headroom, 2-3 GiB free physical RAM does NOT latch 64 MiB/f throttle.
+        assert!(!next_pressure(false, 3 * GIB, 12 * GIB));
+        assert!(!next_pressure(false, 2 * GIB, 16 * GIB));
+        // Critically low physical RAM (<= 1.5 GiB) still engages pressure with 1 GiB hysteresis.
+        assert!(next_pressure(false, 1536 * MIB, 16 * GIB));
+        assert!(next_pressure(true, 2 * GIB, 16 * GIB));
+        // Recovers cleanly once physical pressure eases to >= 2.5 GiB.
+        assert!(!next_pressure(true, 2560 * MIB, 16 * GIB));
+        assert!(!next_pressure(true, 3 * GIB, 12 * GIB));
     }
 
     #[test]

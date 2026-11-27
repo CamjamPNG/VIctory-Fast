@@ -128,14 +128,48 @@ static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// [`most`].
 static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Current pinned bytes held by `inplace`'s private address-opened heaps.
+pub(crate) fn pinned_bytes() -> u64 {
+    PINNED_BYTES.load(Ordering::Relaxed)
+}
+
+/// An owned `MapViewOfFile` view unmapped when the last heap/buffer referencing
+/// it is dropped.
+pub(crate) struct OwnedView(usize);
+
+// SAFETY: a mapped view address owned by the process until unmapped on drop.
+unsafe impl Send for OwnedView {}
+// SAFETY: read-only address wrapper; unmapped only once in `Drop`.
+unsafe impl Sync for OwnedView {}
+
+impl OwnedView {
+    pub(crate) fn new(view: usize) -> Self {
+        Self(view)
+    }
+}
+
+impl Drop for OwnedView {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            // SAFETY: our own view from `MapViewOfFile`, dropped only after all
+            // D3D12 resources and heaps opened on it have been released.
+            unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0 as *mut c_void }) };
+        }
+    }
+}
+
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
     pub(crate) buffer: ID3D12Resource,
     pub(crate) heap: ID3D12Heap,
+    /// Keeps our section view mapped until after `buffer` and `heap` drop.
+    pub(crate) view: Option<std::sync::Arc<OwnedView>>,
     /// The host GPU address of the title memory's first byte.
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// Bytes accounted in `inplace::PINNED_BYTES` (`0` for `port` and section heaps).
+    pub(crate) pinned: u64,
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -153,7 +187,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, view: None, gpu, bias: start - at, pinned: bytes })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -193,7 +227,8 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     let aligned_bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - (start & !(K64 as u64 - 1));
-    if PINNED_BYTES.load(Ordering::Relaxed) + crate::port::pinned_bytes() + aligned_bytes > most() {
+    let limit = most().saturating_sub(crate::port::pinned_bytes());
+    if !crate::inplace_sections::try_reserve_budget(&PINNED_BYTES, aligned_bytes, limit) {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -202,14 +237,15 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
-            PINNED_BYTES.fetch_add(len, Ordering::Relaxed);
             Some(placed)
         }
         Err(None) => {
+            crate::inplace_sections::release_budget(&PINNED_BYTES, aligned_bytes);
             STATS[4].fetch_add(1, Ordering::Relaxed);
             None
         }
         Err(Some(e)) => {
+            crate::inplace_sections::release_budget(&PINNED_BYTES, aligned_bytes);
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
             }
@@ -228,13 +264,13 @@ pub(crate) fn counted(window: bool, bytes: u64) {
 }
 
 /// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+pub(crate) fn gone(window: bool, bytes: u64, pinned: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
-    let _ = PINNED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        Some(cur.saturating_sub(bytes))
-    });
+    if pinned > 0 {
+        crate::inplace_sections::release_budget(&PINNED_BYTES, pinned);
+    }
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the

@@ -434,6 +434,168 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// Win32 `GROUP_AFFINITY` (`winnt.h`, 16 bytes on x64).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct GroupAffinity {
+    pub mask: usize,
+    pub group: u16,
+    pub reserved: [u16; 3],
+}
+
+const _: () = assert!(size_of::<GroupAffinity>() == 16);
+const _: () = assert!(std::mem::offset_of!(GroupAffinity, mask) == 0);
+const _: () = assert!(std::mem::offset_of!(GroupAffinity, group) == 8);
+const _: () = assert!(std::mem::offset_of!(GroupAffinity, reserved) == 10);
+
+const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TitleAffinityMode {
+    Ignore,
+    Passthrough,
+}
+
+fn parse_title_affinity(raw: Option<&str>) -> TitleAffinityMode {
+    match raw.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("ignore") || v == "1" => TitleAffinityMode::Ignore,
+        _ => TitleAffinityMode::Passthrough,
+    }
+}
+
+/// Title thread affinity policy (`VICTORY_TITLE_AFFINITY=ignore|passthrough`,
+/// default `passthrough`): honoring the title's affinity masks avoids
+/// cross-core thrashing on 8-core desktop CPUs (`ignore` / `1` keeps
+/// full-process affinity while shadowing masks for `GetThreadGroupAffinity`).
+fn title_affinity_mode() -> TitleAffinityMode {
+    static MODE: std::sync::OnceLock<TitleAffinityMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = parse_title_affinity(std::env::var("VICTORY_TITLE_AFFINITY").ok().as_deref());
+        tracing::info!(?mode, "title thread affinity policy (VICTORY_TITLE_AFFINITY)");
+        mode
+    })
+}
+
+fn shadow_affinity() -> &'static std::sync::Mutex<std::collections::HashMap<u64, GroupAffinity>> {
+    static SHADOW: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, GroupAffinity>>,
+    > = std::sync::OnceLock::new();
+    SHADOW.get_or_init(Default::default)
+}
+
+fn current_or_real_affinity(
+    map: &std::collections::HashMap<u64, GroupAffinity>,
+    key: u64,
+    thread: *mut c_void,
+) -> GroupAffinity {
+    if let Some(&saved) = map.get(&key) {
+        return saved;
+    }
+    let mut real = GroupAffinity::default();
+    if host::get_thread_group_affinity(thread, &mut real) != 0 && real.mask != 0 {
+        return real;
+    }
+    GroupAffinity {
+        mask: host::process_affinity_mask(),
+        group: 0,
+        reserved: [0; 3],
+    }
+}
+
+pub extern "system" fn SetThreadGroupAffinity(
+    thread: *mut c_void,
+    group_affinity: *const GroupAffinity,
+    previous_group_affinity: *mut GroupAffinity,
+) -> i32 {
+    if title_affinity_mode() == TitleAffinityMode::Passthrough {
+        return host::set_thread_group_affinity(thread, group_affinity, previous_group_affinity);
+    }
+    if group_affinity.is_null() {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    // SAFETY: checked non-null; caller passes a valid `GROUP_AFFINITY`.
+    let asked = unsafe { *group_affinity };
+    if asked.mask == 0 || asked.reserved != [0; 3] {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(key) = host::thread_key(thread) else {
+        host::set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let prev = {
+        let mut map = shadow_affinity().lock().unwrap_or_else(|e| e.into_inner());
+        let prev = current_or_real_affinity(&map, key, thread);
+        map.insert(key, asked);
+        prev
+    };
+    if !previous_group_affinity.is_null() {
+        // SAFETY: optional output parameter checked non-null.
+        unsafe { previous_group_affinity.write(prev) };
+    }
+    1
+}
+
+pub extern "system" fn GetThreadGroupAffinity(
+    thread: *mut c_void,
+    group_affinity: *mut GroupAffinity,
+) -> i32 {
+    if group_affinity.is_null() {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if title_affinity_mode() == TitleAffinityMode::Passthrough {
+        return host::get_thread_group_affinity(thread, group_affinity);
+    }
+    if let Some(key) = host::thread_key(thread)
+        && let Some(saved) = shadow_affinity()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+    {
+        // SAFETY: checked non-null.
+        unsafe { group_affinity.write(saved) };
+        return 1;
+    }
+    host::get_thread_group_affinity(thread, group_affinity)
+}
+
+pub extern "system" fn SetThreadAffinityMask(
+    thread: *mut c_void,
+    thread_affinity_mask: usize,
+) -> usize {
+    if title_affinity_mode() == TitleAffinityMode::Passthrough {
+        return host::set_thread_affinity_mask(thread, thread_affinity_mask);
+    }
+    if thread_affinity_mask == 0 {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let Some(key) = host::thread_key(thread) else {
+        host::set_last_error(ERROR_INVALID_HANDLE);
+        return 0;
+    };
+    let mut map = shadow_affinity().lock().unwrap_or_else(|e| e.into_inner());
+    let prev = current_or_real_affinity(&map, key, thread);
+    let prev_mask = if prev.mask != 0 {
+        prev.mask
+    } else {
+        host::process_affinity_mask()
+    };
+    map.insert(
+        key,
+        GroupAffinity {
+            mask: thread_affinity_mask,
+            group: prev.group,
+            reserved: [0; 3],
+        },
+    );
+    prev_mask
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +604,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +632,9 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(SetThreadGroupAffinity),
+            hle_export!(GetThreadGroupAffinity),
+            hle_export!(SetThreadAffinityMask),
         ],
     }
 }
@@ -594,6 +760,109 @@ mod host {
         victory_loader::note_title_output(line);
     }
 
+    pub(super) fn thread_key(thread: *mut c_void) -> Option<u64> {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, GetCurrentThreadId, GetThreadId,
+        };
+        if thread.is_null() {
+            return None;
+        }
+        // SAFETY: `GetThreadId` accepts real and pseudo thread handles.
+        let tid = unsafe { GetThreadId(thread) };
+        if tid != 0 {
+            return Some(u64::from(tid));
+        }
+        // SAFETY: plain current-thread queries.
+        if thread == unsafe { GetCurrentThread() } {
+            return Some(u64::from(unsafe { GetCurrentThreadId() }));
+        }
+        Some((1u64 << 63) | (thread as usize as u64))
+    }
+
+    pub(super) fn process_affinity_mask() -> usize {
+        type FnGetProcessAffinityMask =
+            unsafe extern "system" fn(*mut c_void, *mut usize, *mut usize) -> i32;
+        static FUNC: std::sync::OnceLock<Option<FnGetProcessAffinityMask>> =
+            std::sync::OnceLock::new();
+        let f = *FUNC.get_or_init(|| {
+            crate::host::function("kernel32.dll", "GetProcessAffinityMask").map(|a| {
+                // SAFETY: exact Win32 `GetProcessAffinityMask` signature from System32 `kernel32.dll`.
+                unsafe { std::mem::transmute::<usize, FnGetProcessAffinityMask>(a) }
+            })
+        });
+        let (mut proc_mask, mut sys_mask) = (0usize, 0usize);
+        if let Some(f) = f {
+            // SAFETY: valid process pseudo-handle and output pointers.
+            let ok = unsafe {
+                f(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    &mut proc_mask,
+                    &mut sys_mask,
+                )
+            };
+            if ok != 0 && proc_mask != 0 {
+                return proc_mask;
+            }
+        }
+        1
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        thread: *mut c_void,
+        group_affinity: *const super::GroupAffinity,
+        previous_group_affinity: *mut super::GroupAffinity,
+    ) -> i32 {
+        type FnSet = unsafe extern "system" fn(
+            *mut c_void,
+            *const super::GroupAffinity,
+            *mut super::GroupAffinity,
+        ) -> i32;
+        static FUNC: std::sync::OnceLock<Option<FnSet>> = std::sync::OnceLock::new();
+        let Some(f) = *FUNC.get_or_init(|| {
+            crate::host::function("kernel32.dll", "SetThreadGroupAffinity").map(|a| {
+                // SAFETY: exact Win32 `SetThreadGroupAffinity` signature from System32 `kernel32.dll`.
+                unsafe { std::mem::transmute::<usize, FnSet>(a) }
+            })
+        }) else {
+            return 0;
+        };
+        // SAFETY: forwarding caller arguments to host `SetThreadGroupAffinity`.
+        unsafe { f(thread, group_affinity, previous_group_affinity) }
+    }
+
+    pub(super) fn get_thread_group_affinity(
+        thread: *mut c_void,
+        group_affinity: *mut super::GroupAffinity,
+    ) -> i32 {
+        type FnGet = unsafe extern "system" fn(*mut c_void, *mut super::GroupAffinity) -> i32;
+        static FUNC: std::sync::OnceLock<Option<FnGet>> = std::sync::OnceLock::new();
+        let Some(f) = *FUNC.get_or_init(|| {
+            crate::host::function("kernel32.dll", "GetThreadGroupAffinity").map(|a| {
+                // SAFETY: exact Win32 `GetThreadGroupAffinity` signature from System32 `kernel32.dll`.
+                unsafe { std::mem::transmute::<usize, FnGet>(a) }
+            })
+        }) else {
+            return 0;
+        };
+        // SAFETY: forwarding caller arguments to host `GetThreadGroupAffinity`.
+        unsafe { f(thread, group_affinity) }
+    }
+
+    pub(super) fn set_thread_affinity_mask(thread: *mut c_void, mask: usize) -> usize {
+        type FnSetMask = unsafe extern "system" fn(*mut c_void, usize) -> usize;
+        static FUNC: std::sync::OnceLock<Option<FnSetMask>> = std::sync::OnceLock::new();
+        let Some(f) = *FUNC.get_or_init(|| {
+            crate::host::function("kernel32.dll", "SetThreadAffinityMask").map(|a| {
+                // SAFETY: exact Win32 `SetThreadAffinityMask` signature from System32 `kernel32.dll`.
+                unsafe { std::mem::transmute::<usize, FnSetMask>(a) }
+            })
+        }) else {
+            return 0;
+        };
+        // SAFETY: forwarding caller arguments to host `SetThreadAffinityMask`.
+        unsafe { f(thread, mask) }
+    }
+
     /// Our caller's callers, as `module+rva`.
     pub(super) fn callers() -> String {
         let mut frames = [std::ptr::null_mut(); 12];
@@ -673,6 +942,33 @@ mod host {
     pub(super) fn report_unhandled(_: *const c_void) {}
 
     pub(super) fn note_title_output(_: &str) {}
+
+    pub(super) fn thread_key(thread: *mut c_void) -> Option<u64> {
+        (!thread.is_null()).then_some(thread as usize as u64)
+    }
+
+    pub(super) fn process_affinity_mask() -> usize {
+        1
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        _: *mut c_void,
+        _: *const super::GroupAffinity,
+        _: *mut super::GroupAffinity,
+    ) -> i32 {
+        0
+    }
+
+    pub(super) fn get_thread_group_affinity(
+        _: *mut c_void,
+        _: *mut super::GroupAffinity,
+    ) -> i32 {
+        0
+    }
+
+    pub(super) fn set_thread_affinity_mask(_: *mut c_void, _: usize) -> usize {
+        0
+    }
 
     pub(super) fn callers() -> String {
         String::new()
@@ -827,5 +1123,62 @@ mod tests {
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
         }
+    }
+
+    #[test]
+    fn title_affinity_hook_shadows_masks_and_preserves_host_affinity() {
+        assert_eq!(parse_title_affinity(None), TitleAffinityMode::Passthrough);
+        assert_eq!(parse_title_affinity(Some("ignore")), TitleAffinityMode::Ignore);
+        assert_eq!(parse_title_affinity(Some("1")), TitleAffinityMode::Ignore);
+        assert_eq!(parse_title_affinity(Some("passthrough")), TitleAffinityMode::Passthrough);
+        assert_eq!(parse_title_affinity(Some("PASSTHROUGH")), TitleAffinityMode::Passthrough);
+        assert_eq!(parse_title_affinity(Some("0")), TitleAffinityMode::Passthrough);
+
+        // Verify API-set resolution catches processtopology and processthreads imports.
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-processtopology-l1-1-0.dll",
+            "api-ms-win-core-processthreads-l1-1-0.dll",
+        ] {
+            assert_eq!(
+                registry::lookup(dll, "SetThreadGroupAffinity"),
+                Some(SetThreadGroupAffinity as *const () as usize)
+            );
+            assert_eq!(
+                registry::lookup(dll, "GetThreadGroupAffinity"),
+                Some(GetThreadGroupAffinity as *const () as usize)
+            );
+            assert_eq!(
+                registry::lookup(dll, "SetThreadAffinityMask"),
+                Some(SetThreadAffinityMask as *const () as usize)
+            );
+        }
+
+        #[cfg(windows)]
+        std::thread::spawn(|| {
+            use windows_sys::Win32::System::Threading::GetCurrentThread;
+            // SAFETY: plain pseudo-handle query.
+            let thread = unsafe { GetCurrentThread() };
+            let mut real_before = GroupAffinity::default();
+            assert_ne!(host::get_thread_group_affinity(thread, &mut real_before), 0);
+
+            // Default passthrough mode forwards to the OS and preserves round-trip state.
+            let req = GroupAffinity { mask: 1, group: 0, reserved: [0; 3] };
+            let mut prev = GroupAffinity::default();
+            assert_ne!(SetThreadGroupAffinity(thread, &req, &mut prev), 0);
+            assert_eq!(prev, real_before);
+
+            let mut got = GroupAffinity::default();
+            assert_ne!(GetThreadGroupAffinity(thread, &mut got), 0);
+            assert_eq!(got, req);
+
+            // SetThreadAffinityMask returns previous mask and updates affinity.
+            assert_eq!(SetThreadAffinityMask(thread, real_before.mask), 1);
+            assert_ne!(GetThreadGroupAffinity(thread, &mut got), 0);
+            assert_eq!(got.mask, real_before.mask);
+        })
+        .join()
+        .unwrap();
     }
 }

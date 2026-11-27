@@ -1106,3 +1106,61 @@ fn a_parked_pair_another_save_or_restore_shares_stays_two_scalars() {
         assert!(!instructions(&p, "s_mov_b32").is_empty(), "{name}");
     }
 }
+
+#[test]
+fn rdna_direct_thread_id_in_group_matches_console_lanes() {
+    // 2D 8x8 Wave64 CS with a cross-lane op (ds_swizzle) so `console_lanes` is true,
+    // storing `(tid.y << 8 | tid.x)` at `dword = (tid.y * 8 + tid.x) * 4`.
+    let mut nat = native(&[
+        0xD8D4_0000,
+        0x0200_0000, // ds_swizzle_b32 v2, v0 offset:0 (sets console_lanes)
+        0x3406_0283, // v_lshlrev_b32 v3, 3, v1       (tid.y * 8)
+        0x4A06_0700, // v_add_nc_u32 v3, v0, v3       (flat = tid.y * 8 + tid.x)
+        0x3408_0682, // v_lshlrev_b32 v4, 2, v3       (byte offset = flat * 4)
+        0x340A_0288, // v_lshlrev_b32 v5, 8, v1       (tid.y << 8)
+        0x380A_0B00, // v_or_b32 v5, v0, v5           (tid.y << 8 | tid.x)
+        0xE070_1000,
+        0x8002_0504, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ]);
+    if let StageIo::Cs(ref mut cs) = nat.io {
+        cs.threads = [8, 8, 1];
+        // rsrc2: 5 user SGPRs (bits 1..6), tgid_x=0, tidig_comp_cnt=1 (v0=x, v1=y, bits 11..12)
+        cs.rsrc2 = (5 << 1) | (1 << 11);
+    }
+    let p = ir::build(&nat.code, nat.wave64, nat.vgprs).expect("ir::build");
+    let prev_rdna = lower::TEST_RDNA.replace(Some(super::rdna::ALL));
+    let prev_opt = lower::TEST_RDNA_FP16_OPT.replace(Some(true));
+    let on = on_64_lanes(&nat, &p);
+    lower::TEST_RDNA_FP16_OPT.set(Some(false));
+    let off = on_64_lanes(&nat, &p);
+    lower::TEST_RDNA_FP16_OPT.set(prev_opt);
+    lower::TEST_RDNA.set(prev_rdna);
+    assert!(
+        on.dxil.len() < off.dxil.len(),
+        "direct RDNA threadIdInGroup must shrink 2D CS DXIL ({} vs {})",
+        on.dxil.len(),
+        off.dxil.len()
+    );
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let Ok((root, pso)) = host.compute_pipeline(&on) else { return };
+    let ud = vec![0u32; on.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let idx = (y * 8 + x) as usize;
+            assert_eq!(out[0][idx], (y << 8) | x, "lane ({x}, {y})");
+        }
+    }
+}

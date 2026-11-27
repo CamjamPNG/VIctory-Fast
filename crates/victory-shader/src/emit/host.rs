@@ -62,6 +62,22 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+/// The root views a root signature for `stages` declares, after each stage's
+/// user data: by slot, then kind: 0 CBV, 1 SRV, 2 UAV.
+fn root_views(stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)]) -> Vec<(u8, u8)> {
+    let mut views: Vec<(u8, u8)> = stages
+        .iter()
+        .flat_map(|(s, _)| {
+            let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+            let srvs = s.root_srvs.iter().map(|&r| (r, 1));
+            cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
+        })
+        .collect();
+    views.sort_unstable();
+    views.dedup();
+    views
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -157,18 +173,7 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
-        let mut views: Vec<(u8, u8)> = stages
-            .iter()
-            .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
-                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
-                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
-            })
-            .collect();
-        views.sort_unstable();
-        views.dedup();
-        for (slot, kind) in views {
+        for (slot, kind) in root_views(stages) {
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: match kind {
                     1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
@@ -1042,6 +1047,45 @@ pub struct Dispatch<'a> {
     pub views: &'a [View<'a>],
     pub samplers: &'a [D3D12_SAMPLER_DESC],
     pub groups: [u32; 3],
+}
+
+/// The host's slot table for `views`: one buffer of
+/// [`super::shader::SLOT_STRIDES_COUNT`] dwords of element sizes and as many
+/// again of counts, the same buffer bound at [`super::shader::SLOT_STRIDES`]
+/// and [`super::shader::SLOT_TABLE_STRIDES`]. The host makes every buffer
+/// view raw (`victory-gpu`'s `write_stride`), so the element word is 1 and
+/// the count is bytes; a shader divides the bytes of a structured view by
+/// the stride its used resources name.
+#[cfg(test)]
+pub fn slot_table(views: &[View]) -> Vec<u32> {
+    let cap = super::shader::SLOT_STRIDES_COUNT as usize;
+    let mut words = vec![0u32; 2 * cap];
+    for (i, v) in views.iter().enumerate() {
+        if i >= cap {
+            break;
+        }
+        let bytes = match *v {
+            View::Buffer { data, .. } => data.len() as u32 * 4,
+            View::RawUav(n) | View::HalfUav(n) | View::HalfUintUav(n) => n * 4,
+            View::TypedUav { data, .. } => data.len() as u32 * 4,
+            _ => continue,
+        };
+        words[i] = 1;
+        words[cap + i] = bytes;
+    }
+    words
+}
+
+#[cfg(test)]
+impl HostShader {
+    /// The root parameter a root signature made for this shader alone gives
+    /// its root view at `slot`, of `kind` (0 CBV, 1 SRV, 2 UAV): user data
+    /// is parameter 0, root views follow.
+    pub fn root_view_parameter(&self, slot: u8, kind: u8) -> Option<u32> {
+        let views = root_views(&[(self, D3D12_SHADER_VISIBILITY_ALL)]);
+        let at = views.iter().position(|&v| v == (slot, kind))?;
+        Some(1 + at as u32)
+    }
 }
 
 #[cfg(test)]

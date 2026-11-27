@@ -548,6 +548,10 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// Under `VICTORY_INDIRECT_CLAMP=0`: a UAV barrier has already flushed all
+    /// prior buffer writes on the current host list, so consecutive read-only
+    /// indirect draws need not re-emit one.
+    uav_clean: bool,
 }
 
 impl Drop for State {
@@ -4497,6 +4501,7 @@ impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
     fn buffers_written(&mut self) {
+        self.uav_clean = false;
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
@@ -4507,12 +4512,14 @@ impl State {
     /// if its shaders can store to buffers).
     fn drew(&mut self, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
+            self.uav_clean = false;
             self.batch = None;
         }
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self) {
+        self.uav_clean = false;
         self.window = None;
         self.batch = None;
     }
@@ -4694,9 +4701,13 @@ impl State {
                 s.refresh(list, *at, 4);
             }
             self.window = None;
-            // Ensure earlier compute UAV writes to the argument/count buffer are visible.
-            // SAFETY: an open list; a null-resource UAV barrier is always valid.
-            unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+            const NOCLAMP_USE: usize = usize::MAX - 0x79;
+            if list.first_use(NOCLAMP_USE) || !self.uav_clean {
+                // Ensure earlier compute UAV / copy writes to argument or count buffers are visible.
+                // SAFETY: an open list; a null-resource UAV barrier is always valid.
+                unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+                self.uav_clean = true;
+            }
             (args.buffer.clone(), offset)
         } else {
             // One record without a count: clamped in a batch (`batches`).

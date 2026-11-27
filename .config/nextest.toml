@@ -12,4 +12,4 @@
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 # A failed test stops the run: the gate answers as soon as it is not green.
-fail-fast = false
+fail-fast = true

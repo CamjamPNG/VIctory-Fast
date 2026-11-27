@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod census;
 pub mod opt;
@@ -65,6 +65,13 @@ enum Const {
     Float(u32),
     Undef,
     Aggregate(Vec<u32>),
+}
+
+/// LLVM 3.7 `FastMathFlags` bits encoded as the optional 4th operand of
+/// `FUNC_CODE_INST_BINOP` (record code 2).
+pub(crate) mod fast_math {
+    /// `arcp`: allow reciprocal approximation (`1.0 / x` -> native `v_rcp_f32`).
+    pub const ARCP: u8 = 1 << 4;
 }
 
 /// LLVM binary opcodes (the same codes serve the float forms).
@@ -226,6 +233,11 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// LLVM 3.7 fast-math flags (`fast_math::*`) by instruction index.
+    fast_math: HashMap<u32, u8>,
+    /// Instructions whose result is proven to be a finite float in `[-1.0, 1.0]`
+    /// (as `f32` or its `i32` bit pattern), such as `norm_quotient` outputs.
+    unit_floats: HashSet<u32>,
 }
 
 impl Module {
@@ -326,6 +338,14 @@ impl Module {
         }
     }
 
+    /// Marks `v` as a finite float in `[-1.0, 1.0]` (or its `i32` bit pattern)
+    /// for [`Module::bounded`].
+    pub(crate) fn mark_unit_float(&mut self, v: V) {
+        if let V::Inst(i) = v {
+            self.unit_floats.insert(i);
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {
@@ -419,6 +439,13 @@ impl Module {
     pub fn bin(&mut self, block: usize, op: Bin, a: V, b: V) -> V {
         let ty = self.type_of(a);
         self.push(block, ty, Op::Bin(op, a, b))
+    }
+    pub fn bin_fast(&mut self, block: usize, op: Bin, a: V, b: V, flags: u8) -> V {
+        let v = self.bin(block, op, a, b);
+        if flags != 0 && let V::Inst(i) = v {
+            self.fast_math.insert(i, flags);
+        }
+        v
     }
     pub fn cast(&mut self, block: usize, op: Cast, v: V, to: Ty) -> V {
         self.push(block, to, Op::Cast(op, v))
@@ -839,7 +866,10 @@ impl Module {
                     u64::from(inst_id - a)
                 };
                 match &inst.op {
-                    Op::Bin(op, a, b) => w.record(2, &[rel(*a), rel(*b), *op as u64]),
+                    Op::Bin(op, a, b) => match self.fast_math.get(&i).copied().unwrap_or(0) {
+                        0 => w.record(2, &[rel(*a), rel(*b), *op as u64]),
+                        flags => w.record(2, &[rel(*a), rel(*b), *op as u64, u64::from(flags)]),
+                    },
                     Op::Cast(op, v) => w.record(3, &[rel(*v), u64::from(inst.ty.0), *op as u64]),
                     Op::Cmp(p, a, b) => w.record(28, &[rel(*a), rel(*b), u64::from(*p)]),
                     Op::Select(c, t, f) => w.record(29, &[rel(*t), rel(*f), rel(*c)]),

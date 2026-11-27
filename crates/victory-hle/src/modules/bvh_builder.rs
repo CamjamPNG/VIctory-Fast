@@ -238,7 +238,7 @@ extern "system" fn build_batched_2x(
     descs: *const GuestBatchedDesc2,
 ) {
     dispatch_build_batched_2x(
-        dxr::suppress_builder(),
+        dxr::suppress_builder() || dxr::skip_builder_rt_off(),
         real_exports().and_then(|r| r.build_batched_2x),
         this,
         cmd_list,
@@ -276,7 +276,7 @@ extern "system" fn copy_as(
     mode: u32,
 ) {
     dispatch_copy_as(
-        dxr::suppress_builder(),
+        dxr::suppress_builder() || dxr::skip_builder_rt_off(),
         real_exports().and_then(|r| r.copy),
         this,
         cmd_list,
@@ -356,6 +356,26 @@ extern "system" fn get_prebuild_info(
     );
 }
 
+fn dispatch_rehydrate_batched_2x(
+    suppress: bool,
+    real: Option<FnRehydrateBatched2X>,
+    this: *mut c_void,
+    cmd_list: *const c_void,
+    num_descs: u32,
+    descs: *const GuestBuildAsDesc,
+    sizes: *const u64,
+) -> i32 {
+    if !suppress
+        && !this.is_null()
+        && let Some(real) = real
+    {
+        // SAFETY: forwarded to real `XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X`.
+        unsafe { real(this, cmd_list, num_descs, descs, sizes) }
+    } else {
+        0
+    }
+}
+
 extern "system" fn rehydrate_batched_2x(
     this: *mut c_void,
     cmd_list: *const c_void,
@@ -363,18 +383,19 @@ extern "system" fn rehydrate_batched_2x(
     descs: *const GuestBuildAsDesc,
     sizes: *const u64,
 ) -> i32 {
-    // Always forward to the real console rehydrator when present: `memory.rs`
-    // uploads packed BVH4 pages to GPU arenas, while `XboxBvhBuilder.dll` runs
-    // the GPU compute passes that unpack them in place before `dxr.rs` extracts
-    // triangles.
-    let hr = if !this.is_null()
-        && let Some(real) = real_exports().and_then(|r| r.rehydrate_batched_2x)
-    {
-        // SAFETY: forwarded to real `XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X`.
-        unsafe { real(this, cmd_list, num_descs, descs, sizes) }
-    } else {
-        0
-    };
+    // Forward to the real console rehydrator whenever Native DXR or the
+    // software BVH builder is active: `memory.rs` uploads packed BVH4 pages
+    // to GPU arenas while `XboxBvhBuilder.dll` unpacks them in place before
+    // `dxr.rs` extracts triangles. Skip only when RT is completely off.
+    let hr = dispatch_rehydrate_batched_2x(
+        dxr::skip_builder_rt_off(),
+        real_exports().and_then(|r| r.rehydrate_batched_2x),
+        this,
+        cmd_list,
+        num_descs,
+        descs,
+        sizes,
+    );
     if dxr::enabled() {
         dxr::enqueue_rehydrate_batched(cmd_list, num_descs, descs, sizes);
     }
@@ -436,6 +457,18 @@ mod tests {
     static MOCK_BUILD_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MOCK_COPY_CALLS: AtomicUsize = AtomicUsize::new(0);
     static MOCK_PREBUILD_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MOCK_REHYDRATE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn mock_rehydrate(
+        _this: *mut c_void,
+        _cmd: *const c_void,
+        _num: u32,
+        _descs: *const GuestBuildAsDesc,
+        _sizes: *const u64,
+    ) -> i32 {
+        MOCK_REHYDRATE_CALLS.fetch_add(1, Ordering::Relaxed);
+        0
+    }
 
     unsafe extern "system" fn mock_build(
         _this: *mut c_void,
@@ -564,6 +597,34 @@ mod tests {
         assert_eq!(MOCK_COPY_CALLS.load(Ordering::Relaxed), c0);
         dispatch_copy_as(false, Some(mock_copy), this, std::ptr::null(), 0x100, 0x200, 0);
         assert_eq!(MOCK_COPY_CALLS.load(Ordering::Relaxed), c0 + 1);
+
+        let r0 = MOCK_REHYDRATE_CALLS.load(Ordering::Relaxed);
+        assert_eq!(
+            dispatch_rehydrate_batched_2x(
+                true,
+                Some(mock_rehydrate),
+                this,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            0
+        );
+        assert_eq!(MOCK_REHYDRATE_CALLS.load(Ordering::Relaxed), r0);
+        assert_eq!(
+            dispatch_rehydrate_batched_2x(
+                false,
+                Some(mock_rehydrate),
+                this,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            0
+        );
+        assert_eq!(MOCK_REHYDRATE_CALLS.load(Ordering::Relaxed), r0 + 1);
 
         let inputs = GuestBuildAsInputs {
             kind: 1,

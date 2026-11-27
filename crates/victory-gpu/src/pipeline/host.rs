@@ -424,6 +424,8 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// Bit `i` is set iff `root_srvs[i]` has a `USER_VIEW_BIAS` user-data entry.
+    pub(crate) root_srv_biased: u64,
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
@@ -434,6 +436,11 @@ impl Stage {
         self.shader
             .translated()
             .expect("host pipelines are made from translated shaders")
+    }
+
+    #[inline]
+    pub(crate) fn root_srv_is_biased(&self, idx: usize) -> bool {
+        idx < 64 && (self.root_srv_biased & (1u64 << idx)) != 0
     }
 }
 
@@ -449,6 +456,10 @@ pub(crate) struct HostPipeline {
     /// Precomputed per-root-table spans across `stages`: `(root slot, max slots
     /// among stages with a CBV in that table, max slots among all stages)`.
     pub(crate) stage_spans: Vec<(u8, u32, u32)>,
+    /// Precomputed `(param, first_word)` for compute `USER_DISPATCH_SPREAD`.
+    pub(crate) spread: Option<(u32, u32)>,
+    /// True if any stage matches `BAKE_PIXEL_SHADERS` or `BAKE_GEOMETRY_SHADERS`.
+    pub(crate) is_bake_shader: bool,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -553,6 +564,7 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_srv_biased: 0,
                 root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
@@ -645,6 +657,16 @@ impl HostPipeline {
                     });
                 }
             }
+            for (idx, &slot) in t.root_srvs.iter().enumerate() {
+                if idx < 64
+                    && t.user_data.iter().any(|u| {
+                        u.slot == slot
+                            && u.root == victory_shader::RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
+                    })
+                {
+                    stage.root_srv_biased |= 1u64 << idx;
+                }
+            }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
@@ -707,6 +729,16 @@ impl HostPipeline {
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             let stage_spans = crate::draw::stage_spans(&bound);
+            let spread = bound.first().and_then(|stage| {
+                let (param, _) = stage.user_data?;
+                let kind = victory_shader::RootType::Other(victory_shader::emit::USER_DISPATCH_SPREAD);
+                let words = &stage.translated().host.user_data;
+                let first = words.iter().find(|u| u.root == kind && u.dword == 0)?.index;
+                words
+                    .iter()
+                    .any(|u| u.root == kind && u.dword == 1 && u.index == first + 1)
+                    .then_some((param, first))
+            });
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -714,6 +746,8 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 stage_spans,
+                spread,
+                is_bake_shader: false,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -764,6 +798,7 @@ impl HostPipeline {
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
             let stage_spans = crate::draw::stage_spans(&bound);
+            let is_bake_shader = bound.iter().any(|s| crate::draw::is_bake_shader_hash(s.shader.hash.as_str()));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -771,6 +806,8 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 stage_spans,
+                spread: None,
+                is_bake_shader,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -884,6 +921,7 @@ impl HostPipeline {
             "host graphics state"
         );
         let stage_spans = crate::draw::stage_spans(&bound);
+        let is_bake_shader = bound.iter().any(|s| crate::draw::is_bake_shader_hash(s.shader.hash.as_str()));
         Some(HostPipeline {
             compute: false,
             mesh: false,
@@ -891,6 +929,8 @@ impl HostPipeline {
             root,
             stages: bound,
             stage_spans,
+            spread: None,
+            is_bake_shader,
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),

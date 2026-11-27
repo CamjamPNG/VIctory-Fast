@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_DESC, D3D12_RESOURCE_STATES, ID3D12Device,
     ID3D12GraphicsCommandList, ID3D12Resource,
 };
+use windows::core::Interface;
 
 use crate::object::This;
 
@@ -29,6 +30,7 @@ const MAX_BATCHED_BARRIERS: usize = 16;
 
 struct BarrierBatch {
     barriers: [MaybeUninit<D3D12_RESOURCE_BARRIER>; MAX_BATCHED_BARRIERS],
+    resources: [usize; MAX_BATCHED_BARRIERS],
     len: usize,
 }
 
@@ -36,15 +38,28 @@ impl BarrierBatch {
     const fn new() -> Self {
         Self {
             barriers: [const { MaybeUninit::uninit() }; MAX_BATCHED_BARRIERS],
+            resources: [0; MAX_BATCHED_BARRIERS],
             len: 0,
         }
     }
 
-    fn push(&mut self, list: &ID3D12GraphicsCommandList, barrier: D3D12_RESOURCE_BARRIER) {
-        if self.len == MAX_BATCHED_BARRIERS {
+    fn contains(&self, raw: usize) -> bool {
+        self.resources[..self.len].contains(&raw)
+    }
+
+    fn push(
+        &mut self,
+        list: &ID3D12GraphicsCommandList,
+        resource: &ID3D12Resource,
+        barrier: D3D12_RESOURCE_BARRIER,
+    ) {
+        let raw = Interface::as_raw(resource) as usize;
+        // D3D12 forbids two transitions on the same resource in one ResourceBarrier call.
+        if self.len == MAX_BATCHED_BARRIERS || self.contains(raw) {
             self.flush(list);
         }
         self.barriers[self.len].write(barrier);
+        self.resources[self.len] = raw;
         self.len += 1;
     }
 
@@ -73,9 +88,15 @@ pub struct PreparedTexture {
 pub struct Recording<'a> {
     host: &'a crate::host::HostList,
     barriers: RefCell<BarrierBatch>,
+    #[cfg(feature = "diagnostics")]
+    noted: std::cell::Cell<bool>,
 }
 
 impl Recording<'_> {
+    fn has_queued(&self, raw: usize) -> bool {
+        self.barriers.borrow().contains(raw)
+    }
+
     /// Move a title texture to the state the provider will see. The list
     /// holds the backing resource through submission.
     pub fn texture(&self, resource: This, state: u32) -> Option<(ID3D12Resource, u32)> {
@@ -87,7 +108,9 @@ impl Recording<'_> {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(legal as i32),
             );
-            self.barriers.borrow_mut().push(&self.host.list, barrier);
+            self.barriers
+                .borrow_mut()
+                .push(&self.host.list, texture, barrier);
         }
         Some((copy.texture.clone(), legal))
     }
@@ -100,14 +123,30 @@ impl Recording<'_> {
     }
 
     fn prepare_input_copy(&self, resource: This, texture: &ID3D12Resource) {
-        // Flush any queued barriers before alias/upload/twin helpers record commands.
-        self.flush_barriers();
-        let aliased = crate::resource::alias_of(resource)
-            .is_some_and(|source| crate::texture::alias(self.host, resource, source));
+        let tex_raw = Interface::as_raw(texture) as usize;
+        // Flush queued barriers only when an inline alias/upload/twin copy could touch them,
+        // keeping independent input transitions batched into a single `ResourceBarrier`.
+        let aliased = crate::resource::alias_of(resource).is_some_and(|source| {
+            let src_raw = crate::resource::host_resource(source)
+                .map(|r| Interface::as_raw(r) as usize);
+            if self.has_queued(tex_raw) || src_raw.is_some_and(|raw| self.has_queued(raw)) {
+                self.flush_barriers();
+            }
+            crate::texture::alias(self.host, resource, source)
+        });
         if !aliased && crate::texture::title_written(texture) {
+            if self.has_queued(tex_raw) {
+                self.flush_barriers();
+            }
             crate::texture::upload_from(self.host, resource, 0);
         }
-        self.host.twin_use(resource, false, false);
+        if let Some(twin) = crate::resource::twin(resource) {
+            let colour_raw = Interface::as_raw(&twin.colour.texture) as usize;
+            if self.has_queued(tex_raw) || self.has_queued(colour_raw) {
+                self.flush_barriers();
+            }
+            self.host.twin_use(resource, false, false);
+        }
     }
 
     /// Single-lookup preparation for an external pass (FidelityFX upscale /
@@ -134,7 +173,9 @@ impl Recording<'_> {
                 D3D12_RESOURCE_STATES(before as i32),
                 D3D12_RESOURCE_STATES(legal as i32),
             );
-            self.barriers.borrow_mut().push(&self.host.list, barrier);
+            self.barriers
+                .borrow_mut()
+                .push(&self.host.list, texture, barrier);
         }
         // SAFETY: `copy.texture` is a live D3D12 resource.
         let desc = unsafe { copy.texture.GetDesc() };
@@ -153,6 +194,10 @@ impl Recording<'_> {
     /// Access flushes any pending host barriers before the provider runs.
     pub fn commands(&self) -> &ID3D12GraphicsCommandList {
         self.flush_barriers();
+        #[cfg(feature = "diagnostics")]
+        if !self.noted.replace(true) {
+            self.host.note_op(|| "external".to_owned());
+        }
         &self.host.list
     }
 }
@@ -177,6 +222,8 @@ pub fn record<R>(list: This, f: impl FnOnce(&Recording<'_>) -> R) -> Option<R> {
         let recording = Recording {
             host,
             barriers: RefCell::new(BarrierBatch::new()),
+            #[cfg(feature = "diagnostics")]
+            noted: std::cell::Cell::new(false),
         };
         let out = f(&recording);
         recording.flush_barriers();

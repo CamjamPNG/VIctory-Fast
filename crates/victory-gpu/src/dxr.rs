@@ -106,6 +106,34 @@ pub fn suppress_builder() -> bool {
     })
 }
 
+fn should_skip_builder_rt_off(
+    skip_when_off: bool,
+    native_rt: bool,
+    bvh_builder_env: bool,
+    builder_runs: bool,
+) -> bool {
+    skip_when_off && !native_rt && !bvh_builder_env && !builder_runs
+}
+
+/// Whether `XboxBvhBuilder.dll` command recording (`build_batched_2x`, `copy_as`,
+/// `rehydrate_batched_2x`) should be skipped because ray tracing is completely off
+/// (neither Native DXR nor `VICTORY_BVH_BUILDER=1` is active).
+/// Set `VICTORY_BVH_SKIP_OFF=0` to keep forwarding in RT-off mode.
+pub fn skip_builder_rt_off() -> bool {
+    static SKIP_WHEN_OFF: OnceLock<bool> = OnceLock::new();
+    static BVH_BUILDER_ENV: OnceLock<bool> = OnceLock::new();
+    let skip_when_off = *SKIP_WHEN_OFF
+        .get_or_init(|| std::env::var_os("VICTORY_BVH_SKIP_OFF").is_none_or(|v| v != "0"));
+    let bvh_builder_env = *BVH_BUILDER_ENV
+        .get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"));
+    should_skip_builder_rt_off(
+        skip_when_off,
+        enabled(),
+        bvh_builder_env,
+        crate::pipeline::builder_runs(),
+    )
+}
+
 /// Default number of consecutive dynamic BLAS refits before forcing a clean full
 /// rebuild to prevent BVH quality degradation on deforming skinned meshes.
 const DEFAULT_REFIT_PERIOD: u32 = 64;
@@ -5180,5 +5208,18 @@ mod tests {
         // when VAs are disjoint, but still barriers on VA hazard.
         assert_eq!(b.alloc(2, 32 * 1024, 512, 0x6000, 0), (false, 0));
         assert_eq!(b.alloc(2, 32 * 1024, 512, 0x5000, 0), (true, 0));
+    }
+
+    #[test]
+    fn skip_builder_rt_off_respects_native_rt_bvh_builder_and_escape_hatch() {
+        // Default RT-off: skip forwarding.
+        assert!(should_skip_builder_rt_off(true, false, false, false));
+        // VICTORY_BVH_SKIP_OFF=0 escape hatch: keep forwarding.
+        assert!(!should_skip_builder_rt_off(false, false, false, false));
+        // Native DXR active: never skip via RT-off path.
+        assert!(!should_skip_builder_rt_off(true, true, false, false));
+        // Software BVH builder requested or running: never skip.
+        assert!(!should_skip_builder_rt_off(true, false, true, false));
+        assert!(!should_skip_builder_rt_off(true, false, false, true));
     }
 }

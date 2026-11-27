@@ -101,7 +101,8 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
-    fn levels_from(&self, base: u32) -> ResourceDesc {
+    #[allow(clippy::wrong_self_convention)] // upstream's name, kept so a sync stays textual
+    fn from_level(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
             d.width = (d.width >> base).max(1);
@@ -1198,6 +1199,10 @@ pub(crate) struct HostTexture {
     /// only when the source actually changed. Starts at 1 so the first alias
     /// read always syncs.
     pub(crate) write_gen: std::sync::atomic::AtomicU64,
+    /// Non-empty when created via `ID3D12Device10::CreateCommittedResource3`
+    /// with D3D12 Relaxed Format Casting: every view format in this list can
+    /// be bound directly on `texture` without an alias copy.
+    castable: &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1225,6 +1230,8 @@ struct Hosted {
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
+    /// Lock-free mirror of `made.is_some()` for [`host_waits`] and sweep scans.
+    has_made: std::sync::atomic::AtomicBool,
     /// The state and clear value the title created the texture with.
     state: u32,
     clear: Option<[u32; 5]>,
@@ -1306,15 +1313,16 @@ fn video_memory_percent() -> u64 {
 }
 
 /// Pure threshold logic for [`over_cap`]: skips top mips so neither side passes
-/// `set` (0: uncapped) or the VRAM-pressure cap (1024 below 92 %, 512 at
-/// 92..97 %, 256 at 97 %+).
+/// `set` (0: uncapped) or the VRAM-pressure cap (2048 below 85 %, 1024 at
+/// 85..92 %, 512 at 92..97 %, 256 at 97 %+).
 #[cfg(any(windows, test))]
 fn over_cap_for(desc: &ResourceDesc, set: Option<u64>, vram_pct: u64) -> u32 {
     if set == Some(0) {
         return 0;
     }
     let max = set.unwrap_or(match vram_pct {
-        0..92 => 1024,
+        0..85 => 2048,
+        85..92 => 1024,
         92..97 => 512,
         _ => 256,
     });
@@ -1329,8 +1337,8 @@ fn over_cap_for(desc: &ResourceDesc, set: Option<u64>, vram_pct: u64) -> u32 {
 }
 
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 2048 below 85 %, 1024 at
+/// 85..92 %, 512 from 92 % of the VRAM budget and 256 from 97 %).
 /// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
@@ -1346,95 +1354,13 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     over_cap_for(desc, set, video_memory_percent())
 }
 
-/// The level [`base_level`] starts a host copy at because of the texture
-/// quality tier alone, before a view or [`over_cap`] is considered: 1 for a
-/// texture no shader writes ([`fills`]) whose level 0 alone takes
-/// `threshold` bytes or more, and 0 for every other texture and at tier 0.
-///
-/// A full chain puts three quarters of its bytes in level 0, so storing the
-/// chain from level 1 on costs a quarter and gives up one level over the
-/// whole image - a uniform half resolution, the trade a texture quality
-/// setting makes. No mip bias goes with it: with the chain re-based onto the
-/// title's level 1, the sampler's implicit level 0 (`SampleLevel(0)` too)
-/// already reads that level, and a `MipLODBias` on top would shift every
-/// read a second level down for no further byte saved.
+/// [`base_level`] with the cap [`over_cap`] already answered: the level a
+/// host copy begins at for views that start at `first`, as a level whose
+/// texels are whole blocks.
 #[cfg(any(windows, test))]
-fn tier_base_for(desc: &ResourceDesc, tier: u64, threshold: u64) -> u32 {
+fn base_level_for(desc: &ResourceDesc, first: u32, cap: u32) -> u32 {
     const TEXTURE_2D: u32 = 3;
-    if tier == 0
-        || !fills(desc)
-        || desc.dimension != TEXTURE_2D
-        || desc.depth_or_array_size != 1
-        || desc.mip_levels <= 1
-        || desc.sample_count > 1
-    {
-        return 0;
-    }
-    let Some(t) = texture_layout(desc).filter(|t| t.planes.len() == 1) else {
-        return 0;
-    };
-    let layout = &t.planes[0].layout;
-    if layout.desc.swizzle.xor() {
-        return 0;
-    }
-    u32::from(level0_bytes(layout) >= threshold)
-}
-
-/// The bytes of level 0 alone: what a host copy started on level 1 does not
-/// store. 0 for a layout whose levels are not all in one span
-/// ([`victory_formats::texture::Layout::bytes_from`] gives the whole size
-/// for those), which [`tier_base_for`] does not take.
-#[cfg(any(windows, test))]
-fn level0_bytes(layout: &victory_formats::texture::Layout) -> u64 {
-    layout.size.saturating_sub(layout.bytes_from(1))
-}
-
-/// What a texture's level 0 must take for the quality tier to store its
-/// chain from level 1: a megabyte. Below that the level is small enough that
-/// the millimetres it saves do not pay for the detail it costs - a 512x512
-/// BC7 texture's level 0 is 256 KiB - and at or above it a level 0 is worth
-/// a quarter of the working set on a 6 GiB card (`texture_floor_bytes` is
-/// 1,300 MiB there and the recorded host copies are 6.3 and 6.7 GB).
-const TIER_LEVEL0_BYTES: u64 = 1 << 20;
-
-/// `VICTORY_TEXTURE_TIER`, read once: the texture quality tier
-/// ([`tier_base_for`], [`TIER_LEVEL0_BYTES`]). 0, the default and what a
-/// value that does not parse means, keeps every level a view shows, as
-/// before. 1 stores the chain from level 1 on for the textures
-/// [`tier_base_for`] names. 2 and up are tier 1: no other tier is defined
-/// yet, and a value there is clamped rather than invented.
-#[cfg(windows)]
-fn tier() -> u64 {
-    static TIER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *TIER.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_TIER")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(0, |tier| tier.min(1))
-    })
-}
-
-/// [`tier_base_for`] with the switch as it was read at the start.
-#[cfg(windows)]
-fn tier_base(desc: &ResourceDesc) -> u32 {
-    tier_base_for(desc, tier(), TIER_LEVEL0_BYTES)
-}
-
-/// The tier in force and the level-0 size it stores no level at or above
-/// ([`tier`], [`TIER_LEVEL0_BYTES`]), for the per-second lines.
-#[cfg(windows)]
-pub(crate) fn texture_tier() -> (u64, u64) {
-    (tier(), TIER_LEVEL0_BYTES)
-}
-
-/// [`base_level`] with the cap [`over_cap`] and the tier's level already
-/// answered: the level a host copy begins at for views that start at
-/// `first`, as a level whose texels are whole blocks. `cap` and `tier` 0
-/// give the level this layer chose before the tier existed.
-#[cfg(any(windows, test))]
-fn base_level_for(desc: &ResourceDesc, first: u32, cap: u32, tier: u32) -> u32 {
-    const TEXTURE_2D: u32 = 3;
-    let first = first.max(cap).max(tier);
+    let first = first.max(cap);
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1461,18 +1387,12 @@ fn base_level_for(desc: &ResourceDesc, first: u32, cap: u32, tier: u32) -> u32 {
 }
 
 /// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`], [`over_cap`],
-/// [`tier_base`]; block-compressed formats in whole blocks).
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
+/// block-compressed formats in whole blocks).
 #[cfg(windows)]
 fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
-    base_level_for(desc, first, over_cap(desc), tier_base(desc))
+    base_level_for(desc, first, over_cap(desc))
 }
-
-/// Since the start: host copies the quality tier started at level 1 rather
-/// than a view or [`over_cap`], and the bytes of level 0 they do not store.
-#[cfg(windows)]
-pub(crate) static TIERED: [std::sync::atomic::AtomicU64; 2] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
@@ -1540,6 +1460,7 @@ pub(crate) fn want_level(this: This, first: u32) {
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
     if let Some(old) = made.take() {
+        r.host.has_made.store(false, std::sync::atomic::Ordering::Release);
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
@@ -1612,17 +1533,182 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
-    use std::sync::atomic::Ordering::Relaxed;
+fn alias_copy_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if this.is_null()
-        || !*ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0"))
+}
+
+#[cfg(windows)]
+fn alias_copy_whole() -> bool {
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"))
+}
+
+#[cfg(windows)]
+fn relaxed_cast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAXED_CAST").is_none_or(|v| v != "0"))
+}
+
+/// Whether `device` supports `D3D12_FEATURE_DATA_D3D12_OPTIONS12::RelaxedFormatCastingSupported`
+/// and exposes `ID3D12Device10` (`CreateCommittedResource3`).
+#[cfg(windows)]
+fn device_supports_relaxed_casting(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: plain feature query into our own structure.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok();
+    ok && options.RelaxedFormatCastingSupported.as_bool() && device.cast::<ID3D12Device10>().is_ok()
+}
+
+/// Whether D3D12 Relaxed Format Casting is enabled (`VICTORY_RELAXED_CAST`,
+/// default `1`; `0` disables for A/B testing) and supported by `device`.
+#[cfg(windows)]
+pub(crate) fn relaxed_casting_supported(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> bool {
+    if !relaxed_cast_enabled() {
+        return false;
+    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let supported = device_supports_relaxed_casting(device);
+        tracing::info!(supported, "D3D12 relaxed format casting (VICTORY_RELAXED_CAST)");
+        supported
+    })
+}
+
+/// Castable view formats for a normalized host texture description `desc`.
+/// Non-empty for non-depth, non-MSAA, SRV-readable UAV 32-bit `R32_*` textures
+/// so `R9G9B9E5_SHAREDEXP` SRVs can bind directly on the `R32_UINT` resource.
+#[cfg(windows)]
+fn castable_formats_for(
+    desc: &ResourceDesc,
+) -> &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT] {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    const R32_CASTABLE: &[DXGI_FORMAT] = &[
+        DXGI_FORMAT_R32_UINT,
+        DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R32_SINT,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+    ];
+    if desc.dimension == BUFFER
+        || desc.sample_count > 1
+        || desc.flags & UNORDERED == 0
+        || desc.flags & (DEPTH | DENY_SHADER_RESOURCE) != 0
     {
+        return &[];
+    }
+    match desc.format {
+        // R32_TYPELESS (39), R32_FLOAT (41), R32_UINT (42), R32_SINT (43)
+        39 | 41 | 42 | 43 => R32_CASTABLE,
+        _ => &[],
+    }
+}
+
+/// For a placed texture SRV at `address` with title resource description `desc`
+/// and view format `view_format` (0 = placed resource's own format), returns
+/// the live host-written target resource at `address` if its geometry matches
+/// and its host copy supports relaxed format casting to that SRV format.
+#[cfg(windows)]
+pub(crate) fn relaxed_alias_target(
+    address: u64,
+    desc: &[u32; 14],
+    view_format: u32,
+) -> Option<This> {
+    if address == 0 || !alias_copy_on() || !relaxed_cast_enabled() {
         return None;
     }
-    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let whole =
-        *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"));
+    let host = crate::host::host()?;
+    if !relaxed_casting_supported(&host.device) {
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let whole = alias_copy_whole();
+    let one = |d: &ResourceDesc| {
+        d.dimension != BUFFER
+            && d.mip_levels >= 1
+            && d.depth_or_array_size >= 1
+            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && d.sample_count <= 1
+    };
+    if !fills(&d) || !one(&d) {
+        return None;
+    }
+    let fmt = pc_format(if view_format != 0 { view_format } else { d.format });
+    // Under `TARGETS_AT`'s lock, verify the target matches and bump its refcount
+    // so it stays alive while we inspect/create its host copy outside the lock.
+    let (other, o_fmt) = {
+        const DEPTH: u32 = 0x2;
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let other = *targets.get(&address)? as This;
+        let o = resource(other);
+        let same = one(&o.desc)
+            && o.desc.dimension == d.dimension
+            && o.desc.width == d.width
+            && o.desc.height == d.height
+            && o.desc.mip_levels == d.mip_levels
+            && o.desc.depth_or_array_size == d.depth_or_array_size
+            && o.desc.flags & DEPTH == 0
+            && target_format(o.desc.format) == o.desc.format
+            && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(d.format));
+        if !same || !crate::object::add_ref_alive(other) {
+            return None;
+        }
+        (other, o.desc.format)
+    };
+    let _held = Held(other);
+    let copy = host_copy(other)?;
+    if !copy.can_cast(fmt) {
+        return None;
+    }
+    static LOGGED: std::sync::Mutex<std::collections::BTreeSet<[u32; 6]>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let key = [
+        d.width as u32,
+        d.height,
+        u32::from(d.depth_or_array_size),
+        u32::from(d.mip_levels),
+        o_fmt,
+        fmt,
+    ];
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if logged.len() < 64 && logged.insert(key) {
+        tracing::info!(
+            texture = ?other,
+            width = d.width,
+            height = d.height,
+            layers = d.depth_or_array_size,
+            mips = d.mip_levels,
+            written_as = o_fmt,
+            read_as = fmt,
+            "format-aliased view bound directly via D3D12 relaxed format casting (no alias copy)"
+        );
+    }
+    Some(other)
+}
+
+#[cfg(windows)]
+pub(crate) fn alias_of(this: This) -> Option<This> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || !alias_copy_on() {
+        return None;
+    }
+    let whole = alias_copy_whole();
     let r = resource(this);
     // A level count of 0 asks for a full chain: not counted here.
     let one = |d: &ResourceDesc| {
@@ -1706,12 +1792,14 @@ pub(crate) fn title_fills(this: This) -> bool {
 /// (`crate::descriptor::make_waiting`).
 #[cfg(windows)]
 pub(crate) fn host_waits(this: This) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     if this.is_null() || !lazy() {
         return false;
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && !r.host.has_made.load(Acquire)
+        && !r.host.refused.load(Relaxed)
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
@@ -1766,7 +1854,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok() } else { None };
+            let reserved = if partly {
+                host_texture_as(&r.desc, r.host.state, clear, true)
+                    .ok()
+                    .map(|(t, _, _)| t)
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1779,8 +1873,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them, and the level the quality tier keeps
-        // out ([`tier_base`]).
+        // pick by index among them, and the level [`over_cap`] keeps out.
         let mut base = 0;
         if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
@@ -1788,21 +1881,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let first = wanted.min(viewed);
             let from = if first == u32::MAX { 0 } else { first };
             base = base_level(&r.desc, from);
-            // (Counted apart from what a view or `over_cap` asks, so the line
-            // reads what the tier itself did.)
-            if base > from.max(over_cap(&r.desc))
-                && let Some(t) = texture_layout(&r.desc)
-            {
-                TIERED[0].fetch_add(1, Relaxed);
-                TIERED[1].fetch_add(t.planes.first().map_or(0, |p| level0_bytes(&p.layout)), Relaxed);
-            }
         }
-        let texture = match texture {
-            Some(texture) => Ok(texture),
-            None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
+        let made_texture = match texture {
+            Some(texture) => Ok((texture, &[][..], false)),
+            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
-        let texture = match texture {
-            Ok(texture) => texture,
+        let (texture, castable, initial_common) = match made_texture {
+            Ok(made) => made,
             Err(NoTexture::Refused) => {
                 r.host.refused.store(true, Relaxed);
                 return None;
@@ -1833,11 +1918,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 "depth texture with unordered access"
             );
         }
-        let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+        // `CreateCommittedResource3` starts in `D3D12_BARRIER_LAYOUT_COMMON`
+        // (legacy state `COMMON = 0`); `plan_prelude` transitions on first use.
+        let state = if initial_common {
+            0
+        } else {
+            crate::host::legal_state(&texture, crate::host::texture_state(r.host.state))
+        };
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.castable = castable;
         host.base = base;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
@@ -1856,6 +1948,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        r.host.has_made.store(true, std::sync::atomic::Ordering::Release);
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -1987,7 +2080,7 @@ pub(crate) fn log_vram_target() {
     tracing::info!(
         "vram target: {} MB of the {} MB the system reports ({}), local in use {} MB, peak {} MB; \
          texture admissions refused {} times, host copies of textures the title fills let go {} \
-         ({} MB) since the start{}; texture tier {} (level 0 of {} KiB and up not stored)",
+         ({} MB) since the start{}",
         target >> 20,
         reported >> 20,
         match set {
@@ -2006,9 +2099,7 @@ pub(crate) fn log_vram_target() {
             "; the card is over its target"
         } else {
             ""
-        },
-        tier(),
-        TIER_LEVEL0_BYTES >> 10
+        }
     );
 }
 
@@ -2095,36 +2186,33 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     room
 }
 
+/// Pure calculation for [`targets_room_kept`]: reserves up to `override_mb`
+/// (clamped to 8,192 MiB) or the default 2,048 MiB minus live target bytes,
+/// keeping safe burst/growth headroom above steady-state targets (~1,807 MiB)
+/// without permanently locking ~1.26 GiB of phantom VRAM.
+#[cfg(any(windows, test))]
+fn targets_room_kept_for(targets: u64, override_mb: Option<u64>) -> u64 {
+    const DEFAULT_TARGETS_MB: u64 = 2048;
+    let most = override_mb.map_or(DEFAULT_TARGETS_MB << 20, |mb| mb.min(8192) << 20);
+    most.saturating_sub(targets)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
-///
-/// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
-/// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
-/// on, none of them idle (run 198's census). They are made with no room
-/// test, in the same frame as the card copies of title buffers (762 MB),
-/// after the texture queue has filled the card to its line with textures
-/// written while the world loaded (7.3 GB of them at the first world frame
-/// of run 193, of which 2.3 GB were let go again within 13 seconds). The
-/// card then stood at 99 to 100.5 % of its budget, buffer copies were
-/// turned down for good (31 of 95 made: the frame 355 ms where 95 give
-/// 238), and the queue was refused from the first world frame on. With
-/// their room kept, the queue stops that much earlier while the world
-/// loads and gets it back as the targets are made.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (default 2,048 MiB; 0:
+/// none) less what such copies hold now.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    targets_room_kept_for(targets, override_mb)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2146,12 +2234,8 @@ pub(crate) fn room_lately() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made ([`room`]): 93 unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97).
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -2159,7 +2243,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(93, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -2172,7 +2256,7 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
     map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
 }
 
@@ -2380,6 +2464,18 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Gives textures that were already evicted and remade (`r.host.gone`) twice
+/// the idle grace under active VRAM trimming (`idle_ms < 60_000`) to curb
+/// eviction/remake thrash while leaving emergency reclamation bounded.
+#[cfg(any(windows, test))]
+fn remade_idle_ms(idle_ms: u64, remade: bool) -> u64 {
+    if remade && idle_ms < 60_000 {
+        idle_ms.saturating_mul(2).min(60_000)
+    } else {
+        idle_ms
+    }
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2451,22 +2547,8 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
-    // With a limit, the longest idle first.
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
-    if most != u64::MAX {
-        for &at in all.iter() {
-            // SAFETY: as below.
-            let r = unsafe { &*(at as *const Resource) };
-            let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
-            }
-        }
-        by_age.sort_unstable();
-    }
-    // Without one, while textures are kept for minutes, a part of them at
-    // each look, the next one at the next: a play has over 100,000
+    // Without a byte limit, while textures are kept for minutes, a part of
+    // them at each look, the next one at the next: a play has over 100,000
     // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
     const PART: usize = 8192;
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2480,28 +2562,86 @@ pub(crate) fn let_go_idle() {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
-    let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    // Snapshot idle candidates under `TEXTURES`, bump their refcounts, then
+    // release `TEXTURES` before sorting, locking per-resource mutexes, or
+    // retiring host copies.
+    let candidates: Vec<Held> = {
+        let mut by_age: Vec<(u8, u64, usize)> = Vec::new();
+        let mut plain: Vec<usize> = Vec::new();
+        {
+            let all = textures();
+            if most != u64::MAX {
+                // With a limit, evict never-remade textures before already-remade
+                // ones, longest idle first within each group.
+                for &at in all.iter() {
+                    // SAFETY: a texture leaves the table before it is freed,
+                    // under the lock held here (`Drop for Resource`).
+                    let r = unsafe { &*(at as *const Resource) };
+                    if !r.host.has_made.load(Relaxed) {
+                        continue;
+                    }
+                    let used = r.host.used.load(Relaxed);
+                    let remade = r.host.gone.load(Relaxed);
+                    let need_ms = remade_idle_ms(idle_ms, remade);
+                    if used != 0
+                        && fills(&r.desc)
+                        && crate::host::long_ago(used, need_ms, IDLE_FRAMES)
+                        && crate::object::add_ref_alive(at as This)
+                    {
+                        by_age.push((u8::from(remade), used & 0xffff_ffff, at));
+                    }
+                }
+            } else {
+                let mut looked = 0;
+                let mut last_at = 0;
+                for &at in all.range(from..).take(part) {
+                    looked += 1;
+                    last_at = at;
+                    // SAFETY: a texture leaves the table before it is freed,
+                    // under the lock held here (`Drop for Resource`).
+                    let r = unsafe { &*(at as *const Resource) };
+                    if !r.host.has_made.load(Relaxed) {
+                        continue;
+                    }
+                    let used = r.host.used.load(Relaxed);
+                    let need_ms = remade_idle_ms(idle_ms, r.host.gone.load(Relaxed));
+                    if used != 0
+                        && fills(&r.desc)
+                        && crate::host::long_ago(used, need_ms, IDLE_FRAMES)
+                        && crate::object::add_ref_alive(at as This)
+                    {
+                        plain.push(at);
+                    }
+                }
+                if part == PART {
+                    FROM.store(if looked == PART { last_at.saturating_add(1) } else { 0 }, Relaxed);
+                }
+            }
+        }
+        if most != u64::MAX {
+            by_age.sort_unstable();
+            by_age.into_iter().map(|(_, _, at)| Held(at as This)).collect()
+        } else {
+            plain.into_iter().map(|at| Held(at as This)).collect()
+        }
+    };
+    for held in candidates {
         if bytes >= most {
             break;
         }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
+        let at = held.0 as usize;
+        let r = resource(held.0);
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        let need_ms = remade_idle_ms(idle_ms, r.host.gone.load(Relaxed));
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, need_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), need_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2510,6 +2650,7 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
+                r.host.has_made.store(false, std::sync::atomic::Ordering::Release);
                 made.take()
             } else {
                 None
@@ -2684,6 +2825,16 @@ impl HostTexture {
         self.flags
     }
 
+    pub(crate) fn castable_formats(
+        &self,
+    ) -> &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT] {
+        self.castable
+    }
+
+    pub(crate) fn can_cast(&self, format: u32) -> bool {
+        self.castable.iter().any(|f| f.0 as u32 == format)
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
@@ -2704,6 +2855,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             flags,
             write_gen: std::sync::atomic::AtomicU64::new(1),
+            castable: &[],
         }
     }
 
@@ -2730,6 +2882,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             flags,
             write_gen: std::sync::atomic::AtomicU64::new(1),
+            castable: &[],
         }
     }
 }
@@ -2751,7 +2904,7 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner()).len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -2841,14 +2994,76 @@ fn no_texture(code: HRESULT) -> NoTexture {
     if code == E_OUTOFMEMORY { NoTexture::ForNow } else { NoTexture::Refused }
 }
 
+/// Creates a committed texture with D3D12 Relaxed Format Casting via
+/// `ID3D12Device10::CreateCommittedResource3`, starting in
+/// `D3D12_BARRIER_LAYOUT_COMMON` (compatible with legacy `ResourceBarrier`
+/// transitions from `D3D12_RESOURCE_STATE_COMMON`).
+#[cfg(windows)]
+fn create_committed_castable(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    heap: &windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPERTIES,
+    heap_flags: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_FLAGS,
+    d: &ResourceDesc,
+    clear_value: Option<&[u32; 5]>,
+    castable: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+) -> windows::core::Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+    const TARGET_OR_DEPTH: u32 = 1 | 2;
+    let device10: ID3D12Device10 = device.cast()?;
+    let desc1 = D3D12_RESOURCE_DESC1 {
+        Dimension: D3D12_RESOURCE_DIMENSION(d.dimension as i32),
+        Alignment: d.alignment,
+        Width: d.width,
+        Height: d.height,
+        DepthOrArraySize: d.depth_or_array_size,
+        MipLevels: d.mip_levels,
+        Format: DXGI_FORMAT(d.format as i32),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: d.sample_count,
+            Quality: d.sample_quality,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT(d.layout as i32),
+        Flags: D3D12_RESOURCE_FLAGS(d.flags as i32),
+        SamplerFeedbackMipRegion: D3D12_MIP_REGION::default(),
+    };
+    let clear = (d.flags & TARGET_OR_DEPTH != 0)
+        .then_some(clear_value)
+        .flatten()
+        .map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: `heap`, `desc1`, `clear`, and `castable` point to valid initialized data.
+    unsafe {
+        device10.CreateCommittedResource3(
+            heap,
+            heap_flags,
+            &desc1,
+            D3D12_BARRIER_LAYOUT_COMMON,
+            clear,
+            None,
+            Some(castable),
+            &mut texture,
+        )?;
+    }
+    texture.ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+}
+
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags. Returns `(texture, castable_formats, initial_common)`.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+        bool,
+    ),
+    NoTexture,
+> {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2860,7 +3075,14 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+        bool,
+    ),
+    NoTexture,
+> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2933,9 +3155,11 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Ok(t);
+        return Ok((t, &[], false));
     }
     let mut texture: Option<ID3D12Resource> = None;
+    let mut castable: &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT] = &[];
+    let mut initial_common = false;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
@@ -2952,20 +3176,54 @@ fn host_texture_as(
             )
         }
     } else {
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                crate::host::not_resident(),
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
-                // The same layout: format, then color or depth and stencil.
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-                &mut texture,
-            )
+        let wanted_castable = castable_formats_for(&d);
+        let relaxed = (!wanted_castable.is_empty() && relaxed_casting_supported(&host.device))
+            .then(|| {
+                create_committed_castable(
+                    &host.device,
+                    &heap,
+                    crate::host::not_resident(),
+                    &d,
+                    clear_value.as_ref(),
+                    wanted_castable,
+                )
+            });
+        match relaxed {
+            Some(Ok(t)) => {
+                texture = Some(t);
+                castable = wanted_castable;
+                initial_common = true;
+                Ok(())
+            }
+            other => {
+                if let Some(Err(e)) = other {
+                    static FALLBACK: std::sync::Mutex<std::collections::BTreeSet<[u32; 4]>> =
+                        std::sync::Mutex::new(std::collections::BTreeSet::new());
+                    let key = [d.dimension, d.format, d.flags, e.code().0 as u32];
+                    if FALLBACK.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
+                        tracing::debug!(
+                            error = %e,
+                            desc = ?d,
+                            "CreateCommittedResource3 relaxed casting failed; falling back to legacy CreateCommittedResource"
+                        );
+                    }
+                }
+                // SAFETY: the description has the host layout (checked size, same
+                // fields); the out pointer is ours.
+                unsafe {
+                    host.device.CreateCommittedResource(
+                        &heap,
+                        crate::host::not_resident(),
+                        (&raw const d).cast(),
+                        D3D12_RESOURCE_STATES(
+                            crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                        ),
+                        // The same layout: format, then color or depth and stencil.
+                        clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                        &mut texture,
+                    )
+                }
+            }
         }
     };
     if let Err(e) = made {
@@ -2990,9 +3248,10 @@ fn host_texture_as(
         return Err(no_texture(e.code().0));
     }
     crate::host::name(&texture, || {
-        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+        let suffix = if castable.is_empty() { "" } else { " (castable)" };
+        format!("texture {}x{} f{} flags {:#x}{suffix}", d.width, d.height, d.format, d.flags)
     });
-    Ok(texture)
+    Ok((texture, castable, initial_common))
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -3126,6 +3385,7 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: Hosted {
             made: std::sync::Mutex::new(None),
+            has_made: std::sync::atomic::AtomicBool::new(false),
             state,
             // SAFETY: the title passes a whole clear value (the format,
             // then color or depth and stencil: 5 words) or null.
@@ -3382,24 +3642,23 @@ pub(crate) extern "system" fn create_at_address(
 /// its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::RwLock<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
 /// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
-#[allow(dead_code)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3457,7 +3716,7 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
 }
@@ -3480,6 +3739,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3487,9 +3747,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[13] = 0;
     }
     let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
@@ -3504,6 +3764,14 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             }
         }
     }
+    if let Some(&r) = PLACED_TEXTURES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, *desc))
+    {
+        return Some(r as This);
+    }
+    let mut map = PLACED_TEXTURES.write().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -4025,6 +4293,7 @@ mod tests {
         // As `hosted` leaves a texture the card had no room for just now:
         // not asked again yet, but still waited for (not refused).
         *r.host.made.lock().unwrap() = None;
+        r.host.has_made.store(false, Relaxed);
         r.host.no_room.store(crate::host::moment().max(1), Relaxed);
         assert!(hosted(image, true).is_none(), "asked again only after NO_ROOM_AGAIN_MS");
         assert!(host_waits(image), "a texture without room still waits for its host copy");
@@ -4034,6 +4303,7 @@ mod tests {
         assert_eq!(r.host.no_room.load(Relaxed), 0);
         // Refused: never again.
         *r.host.made.lock().unwrap() = None;
+        r.host.has_made.store(false, Relaxed);
         r.host.no_room.store(0, Relaxed);
         r.host.refused.store(true, Relaxed);
         assert!(hosted(image, true).is_none());
@@ -5036,10 +5306,16 @@ float4 lit() : SV_Target { return 1.0; }
         let mut t256 = texture(256, 256, 98, 1);
         t256.mip_levels = 9;
 
-        // Below 92 %: cap at 1024.
-        assert_eq!(over_cap_for(&t4k, None, 0), 2);
+        // Below 85 %: cap at 2048.
+        assert_eq!(over_cap_for(&t4k, None, 0), 1);
+        assert_eq!(over_cap_for(&t4k, None, 84), 1);
+        assert_eq!(over_cap_for(&t2k, None, 80), 0);
+        assert_eq!(over_cap_for(&t1k, None, 84), 0);
+
+        // 85..92 %: cap at 1024.
+        assert_eq!(over_cap_for(&t4k, None, 85), 2);
         assert_eq!(over_cap_for(&t4k, None, 91), 2);
-        assert_eq!(over_cap_for(&t2k, None, 80), 1);
+        assert_eq!(over_cap_for(&t2k, None, 85), 1);
         assert_eq!(over_cap_for(&t1k, None, 91), 0);
 
         // 92..97 %: cap at 512.
@@ -5069,6 +5345,28 @@ float4 lit() : SV_Target { return 1.0; }
     }
 
     #[test]
+    fn targets_room_kept_trims_phantom_and_respects_override() {
+        const MIB: u64 = 1 << 20;
+        // Loading screen (~652 MiB) still reserves burst room for incoming world targets.
+        assert_eq!(targets_room_kept_for(652 * MIB, None), (2048 - 652) * MIB);
+        // Steady-state targets (~1,807 MiB) keep 241 MiB headroom instead of 1,265 MiB phantom.
+        assert_eq!(targets_room_kept_for(1807 * MIB, None), 241 * MIB);
+        assert_eq!(targets_room_kept_for(2200 * MIB, None), 0);
+        // Explicit override (including 0 and upper clamp at 8192 MiB) is preserved.
+        assert_eq!(targets_room_kept_for(1807 * MIB, Some(0)), 0);
+        assert_eq!(targets_room_kept_for(1807 * MIB, Some(3072)), (3072 - 1807) * MIB);
+        assert_eq!(targets_room_kept_for(0, Some(16_384)), 8192 * MIB);
+    }
+
+    #[test]
+    fn remade_idle_ms_protects_remade_textures() {
+        assert_eq!(remade_idle_ms(5_000, false), 5_000);
+        assert_eq!(remade_idle_ms(5_000, true), 10_000);
+        assert_eq!(remade_idle_ms(1_500, true), 3_000);
+        assert_eq!(remade_idle_ms(600_000, true), 600_000);
+    }
+
+    #[test]
     fn budget_capped_keep_evicts_before_vram_pressure() {
         const MIB: u64 = 1 << 20;
         let calm = crate::host::vram_keep(15_000 * MIB, 9_500 * MIB);
@@ -5077,8 +5375,8 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(tighter_keep(calm, under), calm);
         assert_eq!(tighter_keep(calm, over), over);
         assert!(over.0 <= 5_000 && over.1 > 0 && over.1 < u64::MAX);
-        // When both VRAM and budget are over 88%, keep the tighter deadline and larger trim.
-        let vram_over = crate::host::vram_keep(15_000 * MIB, 13_500 * MIB);
+        // When both VRAM and budget are over 91%, keep the tighter deadline and larger trim.
+        let vram_over = crate::host::vram_keep(15_000 * MIB, 13_800 * MIB);
         assert_eq!(tighter_keep(vram_over, over), (over.0.min(vram_over.0), over.1.max(vram_over.1)));
     }
 
@@ -5139,9 +5437,10 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(target, VRAM_CEILING);
         let mut t4k = texture(4096, 4096, 98, 1);
         t4k.mip_levels = 13;
-        // Under the cap of 1024 a side still, by the reported budget…
+        // Below 85 % a side may be 2048 (upstream's bands), which costs a
+        // 4096 texture one level…
         assert_eq!((4_900u64 * 100) / (6 * GIB / (1 << 20)), 79);
-        assert_eq!(over_cap_for(&t4k, None, 4_900u64 * 100 / (6 * GIB / (1 << 20))), 2);
+        assert_eq!(over_cap_for(&t4k, None, 4_900u64 * 100 / (6 * GIB / (1 << 20))), 1);
         // …and past 92 % of the target.
         assert_eq!(held_percent_for(4_900 << 20, 6 * GIB, None), 94);
         assert_eq!(over_cap_for(&t4k, None, held_percent_for(4_900 << 20, 6 * GIB, None)), 3);
@@ -5155,9 +5454,10 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(held_percent_for(4_900 << 20, 16 * GIB, None), 29);
     }
 
-    /// `base_level` before the texture quality tier existed, kept here as the
-    /// answer the tier must not disturb at its default (`cap` is `over_cap`).
-    fn base_level_before_the_tier(desc: &ResourceDesc, first: u32, cap: u32) -> u32 {
+    /// A second way to the same answer, kept beside [`base_level_for`] so the
+    /// chain's start stays tied to the level the layout can read from and to
+    /// whole blocks, whatever the cap.
+    fn chain_base_written_out(desc: &ResourceDesc, first: u32, cap: u32) -> u32 {
         const TEXTURE_2D: u32 = 3;
         let first = first.max(cap);
         if first == 0
@@ -5206,7 +5506,7 @@ float4 lit() : SV_Target { return 1.0; }
         ] {
             let mut d = texture(width, height, 98, mips);
             push(&mut out, d);
-            // Render target, depth, unordered access: the tier refuses these.
+            // Render target, depth, unordered access.
             for flags in [1, 2, 4, 7] {
                 d.flags = flags;
                 push(&mut out, d);
@@ -5232,89 +5532,31 @@ float4 lit() : SV_Target { return 1.0; }
         out
     }
 
-    /// At its default the tier changes nothing: for every texture and first
-    /// level above, the level a host copy begins at is the one the code chose
-    /// before the tier existed, so the copy has the same levels and the same
-    /// bytes. It also never rises above what a view or the cap asked, which is
-    /// what keeps the tier's counter at zero at the default.
+    /// For every texture and first level above, the level a host copy begins
+    /// at is the one the written-out chain rule gives, and never rises above
+    /// what a view or the cap asked.
     #[test]
-    fn the_quality_tier_at_its_default_answers_as_the_code_did() {
+    fn a_host_copy_begins_at_the_level_the_chain_rule_gives() {
         for (desc, firsts) in base_levels_under_test() {
             for cap in [0u32, 1, 2, 3, 4] {
                 for &first in &firsts {
-                    let now = base_level_for(&desc, first, cap, 0);
+                    let now = base_level_for(&desc, first, cap);
                     assert_eq!(
                         now,
-                        base_level_before_the_tier(&desc, first, cap),
+                        chain_base_written_out(&desc, first, cap),
                         "{desc:?} from level {first} under cap {cap}"
                     );
-                    assert!(
-                        now <= first.max(cap),
-                        "the tier's counter would count {desc:?} from {first} under cap {cap}"
-                    );
-                    assert_eq!(tier_base_for(&desc, 0, TIER_LEVEL0_BYTES), 0);
+                    assert!(now <= first.max(cap), "{desc:?} from {first} under cap {cap} rises above the cap");
                 }
             }
         }
     }
 
-    /// Tier 1 takes level 0 of the textures it names - sampled, single-layer,
-    /// single-sample 2D, level 0 of a megabyte or more - and of nothing else.
-    /// A render target, depth texture, unordered access texture, array, 3D
-    /// texture or multisampled one is left whole whatever its size.
-    #[test]
-    fn the_quality_tier_keeps_level_0_out_of_the_textures_it_names() {
-        let mib = TIER_LEVEL0_BYTES;
-        let big = texture(1024, 1024, 98, 11);
-        let small = texture(512, 512, 98, 10);
-        // 1 MiB of level 0 exactly is enough; 256 KiB is not.
-        assert_eq!(level0_bytes(&texture_layout(&big).unwrap().planes[0].layout), mib);
-        assert_eq!(tier_base_for(&big, 1, mib), 1);
-        assert_eq!(tier_base_for(&small, 1, mib), 0);
-        assert_eq!(tier_base_for(&big, 1, mib + 1), 0);
-        // The switch off asks for nothing, whatever the texture.
-        assert_eq!(tier_base_for(&big, 0, mib), 0);
-
-        for (flags, what) in [(1, "render target"), (2, "depth"), (4, "unordered access"), (7, "all three")] {
-            let mut d = big;
-            d.flags = flags;
-            assert_eq!(tier_base_for(&d, 1, mib), 0, "a {what} texture is never cut");
-        }
-        for (arrays, dimension, samples, layout, what) in [
-            (2u16, 3u32, 1u32, 0u32, "an array"),
-            (1, 4, 1, 0, "a 3D texture"),
-            (1, 3, 2, 0, "a multisampled texture"),
-            (1, 3, 1, 0x100 | 21, "an XOR swizzle mode"),
-            (1, 1, 1, 0, "a buffer"),
-        ] {
-            let mut d = big;
-            d.depth_or_array_size = arrays;
-            d.dimension = dimension;
-            d.sample_count = samples;
-            d.layout = layout;
-            assert_eq!(tier_base_for(&d, 1, mib), 0, "{what} is never cut");
-        }
-        let mut one_mip = big;
-        one_mip.mip_levels = 1;
-        assert_eq!(tier_base_for(&one_mip, 1, mib), 0, "one level has no chain to shorten");
-
-        // And the level the host copy begins at follows: a whole chain
-        // becomes the chain from level 1, and a side that is no longer whole
-        // blocks of texels keeps level 0.
-        assert_eq!(base_level_for(&big, 0, 0, 0), 0);
-        assert_eq!(base_level_for(&big, 0, 0, tier_base_for(&big, 1, mib)), 1);
-        let odd = texture(4096, 350, 98, 12);
-        assert_eq!(tier_base_for(&odd, 1, mib), 1);
-        assert_eq!(base_level_for(&odd, 0, 0, 1), 0, "175 rows are not whole 4x4 blocks");
-        // A level the cap or a view already asked for is not asked for twice.
-        assert_eq!(base_level_for(&big, 4, 0, tier_base_for(&big, 1, mib)), 4);
-        assert_eq!(base_level_for(&big, 0, 2, tier_base_for(&big, 1, mib)), 2);
-    }
-
     /// What a texture stored from level 1 costs, from the layout's own
     /// accounting: a 1024x1024 and a 2048x2048 BC7 texture (one byte a texel,
     /// sixteen bytes a 4x4 block) with their whole chains. Three quarters of
-    /// the bytes are level 0, so the chain from level 1 is a quarter of it.
+    /// the bytes are level 0, so a chain starting at level 1 is a quarter of
+    /// the whole - which is what `over_cap` buys when it skips a level.
     #[test]
     fn a_texture_stored_from_level_1_costs_a_quarter_of_its_bytes() {
         for (width, mips, whole, from_one) in [
@@ -5326,10 +5568,10 @@ float4 lit() : SV_Target { return 1.0; }
             let layout = &t.planes[0].layout;
             assert_eq!(layout.size, whole, "{width} whole");
             assert_eq!(layout.bytes_from(1), from_one, "{width} from level 1");
-            // The level not stored is exactly a level 0: a megabyte of a
+            // The levels not stored are exactly a level 0: a megabyte of a
             // 1024 chain, four of a 2048 one.
-            assert_eq!(level0_bytes(layout), width * width, "{width} level 0");
-            assert_eq!(level0_bytes(layout), whole - from_one);
+            assert_eq!(layout.size.saturating_sub(layout.bytes_from(1)), width * width, "{width} level 0");
+            assert_eq!(layout.size.saturating_sub(layout.bytes_from(1)), whole - from_one);
             // And the chain from level 1 is a quarter of the whole, to
             // within a page of the layout's padding.
             assert!(from_one.abs_diff(whole / 4) <= 4_096, "{from_one} against {}", whole / 4);
@@ -5367,5 +5609,297 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// End-to-end verification on the real host D3D12 device:
+    /// `CreateCommittedResource3` with `ALLOW_UNORDERED_ACCESS` and
+    /// `pCastableFormats = [R32_UINT, R32_FLOAT, R32_SINT, R9G9B9E5_SHAREDEXP]`
+    /// accepts `R32_UINT` UAV + `R9G9B9E5_SHAREDEXP` / `R32_UINT` / `R32_FLOAT` SRVs,
+    /// works with legacy `ResourceBarrier` transitions from `COMMON`, and decodes
+    /// packed `R9G9B9E5` bits written through the `R32_UINT` UAV without an alias copy.
+    #[cfg(windows)]
+    #[test]
+    fn relaxed_format_casting_supports_r32_uav_and_r9g9b9e5_srv_on_host_device() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !device_supports_relaxed_casting(&host.device) {
+            return;
+        }
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        // Verify CreateCommittedResource3 across the shapes the title aliases:
+        // 2D R32_UINT, 2D R32_TYPELESS, 2D cube/array with mips, 3D volume, and RT+UAV.
+        let shapes = [
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 1, mip_levels: 1, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 1, mip_levels: 1, format: 39,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 128, height: 128,
+                depth_or_array_size: 6, mip_levels: 4, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 4, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 8, mip_levels: 1, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 1, mip_levels: 1, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 5,
+            },
+        ];
+        let mut created = Vec::new();
+        let clear_r32: [u32; 5] = [42, 0, 0, 0, 0];
+        for (i, shape) in shapes.iter().enumerate() {
+            let castable = castable_formats_for(shape);
+            assert!(
+                castable.contains(&DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
+                    && castable.contains(&DXGI_FORMAT_R32_UINT),
+                "expected R32+R9G9B9E5 castable list for {shape:?}"
+            );
+            let clear = (i == 4).then_some(&clear_r32);
+            let res = create_committed_castable(
+                &host.device,
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                shape,
+                clear,
+                castable,
+            )
+            .unwrap_or_else(|e| panic!("CreateCommittedResource3 failed for {shape:?}: {e}"));
+            created.push(res);
+        }
+
+        // Verify all 4 required views (R32_UINT UAV, R9G9B9E5 SRV, R32_UINT SRV, R32_FLOAT SRV)
+        // on the 2D R32_UINT texture AND run a real GPU write->barrier->read roundtrip.
+        let tex = &created[0];
+        // SAFETY: plain heap/buffer/view creation on the live test device.
+        let (view_heap, step, uav_buf, readback) = unsafe {
+            let vh: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 5,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let base = vh.GetCPUDescriptorHandleForHeapStart().ptr;
+            let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + i * step };
+
+            // Slot 0: R32_UINT UAV
+            let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            };
+            host.device
+                .CreateUnorderedAccessView(tex, None::<&ID3D12Resource>, Some(&uav_desc), at(0));
+
+            // Slot 1: R9G9B9E5_SHAREDEXP SRV
+            let srv_for = |fmt| D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: fmt,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            host.device.CreateShaderResourceView(
+                tex,
+                Some(&srv_for(DXGI_FORMAT_R9G9B9E5_SHAREDEXP)),
+                at(1),
+            );
+            // Slot 2: R32_UINT SRV
+            host.device
+                .CreateShaderResourceView(tex, Some(&srv_for(DXGI_FORMAT_R32_UINT)), at(2));
+            // Slot 3: R32_FLOAT SRV
+            host.device
+                .CreateShaderResourceView(tex, Some(&srv_for(DXGI_FORMAT_R32_FLOAT)), at(3));
+
+            let uav_buf = host.uav_buffer(256).unwrap();
+            let mut rb: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .unwrap();
+            (vh, step, uav_buf, rb.unwrap())
+        };
+
+        // Packed R9G9B9E5 for (1.0, 0.5, 2.0): E=17 (scale 2^-7 = 1/128), R=128, G=64, B=256.
+        const WRITE_SRC: &str = r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<uint> dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst[uint2(0, 0)] = (17u << 27) | (256u << 18) | (64u << 9) | 128u;
+}
+"#;
+        const READ_SRC: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float3> src : register(t0);
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    float3 c = src.Load(int3(0, 0, 0));
+    out_buf.Store4(0, asuint(float4(c, 1.0)));
+}
+"#;
+        let write_bc = crate::host::compile(WRITE_SRC, s!("main"), s!("cs_5_1")).unwrap();
+        let read_bc = crate::host::compile(READ_SRC, s!("main"), s!("cs_5_1")).unwrap();
+        let make_pso = |bc: &[u8]| -> (ID3D12RootSignature, ID3D12PipelineState) {
+            // SAFETY: compiled shader bytecode with embedded root signature.
+            unsafe {
+                let rs: ID3D12RootSignature = host.device.CreateRootSignature(0, bc).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&rs),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bc.as_ptr().cast(),
+                            BytecodeLength: bc.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (rs, pso)
+            }
+        };
+        let (write_rs, write_pso) = make_pso(&write_bc);
+        let (read_rs, read_pso) = make_pso(&read_bc);
+
+        let list = host.new_list().unwrap();
+        // SAFETY: live resources, descriptors, and pipelines on an open list.
+        unsafe {
+            let l = &list.list;
+            let gpu_base = view_heap.GetGPUDescriptorHandleForHeapStart().ptr;
+            l.SetDescriptorHeaps(&[Some(view_heap.clone())]);
+            // Legacy transition from initial COMMON -> UNORDERED_ACCESS.
+            l.ResourceBarrier(&[crate::host::transition(
+                tex,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            l.SetComputeRootSignature(&write_rs);
+            l.SetPipelineState(&write_pso);
+            l.SetComputeRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_base });
+            l.Dispatch(1, 1, 1);
+
+            // Legacy transition UNORDERED_ACCESS -> NON_PIXEL_SHADER_RESOURCE.
+            l.ResourceBarrier(&[crate::host::transition(
+                tex,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            l.SetComputeRootSignature(&read_rs);
+            l.SetPipelineState(&read_pso);
+            l.SetComputeRootDescriptorTable(
+                0,
+                D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_base + step as u64 },
+            );
+            l.SetComputeRootUnorderedAccessView(1, uav_buf.GetGPUVirtualAddress());
+            l.Dispatch(1, 1, 1);
+
+            l.ResourceBarrier(&[crate::host::transition(
+                &uav_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyBufferRegion(&readback, 0, &uav_buf, 0, 16);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: `host.execute` waited for completion; 16 bytes mapped.
+        let floats = unsafe {
+            readback
+                .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut mapped))
+                .unwrap();
+            let out = std::slice::from_raw_parts(mapped.cast::<f32>(), 4).to_vec();
+            readback.Unmap(0, None);
+            out
+        };
+        assert_eq!(floats, [1.0, 0.5, 2.0, 1.0]);
+
+        // Verify Victory's `Resource` + `relaxed_alias_target` path end-to-end.
+        let null = std::ptr::null();
+        let mut src_res = null;
+        let mut src_desc = texture(64, 64, 42, 2);
+        src_desc.flags = 4; // ALLOW_UNORDERED_ACCESS
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &src_desc,
+                0x8, // UNORDERED_ACCESS
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut src_res,
+            ),
+            S_OK
+        );
+        let copy = host_copy(src_res).unwrap();
+        if relaxed_cast_enabled() {
+            assert!(copy.can_cast(67));
+            assert!(copy.can_cast(42));
+            assert_eq!(copy.state.load(std::sync::atomic::Ordering::Relaxed), 0);
+            let addr = resource(src_res).data() as u64;
+            let placed_desc = ResourceDesc { format: 67, flags: 0, ..src_desc };
+            // SAFETY: `ResourceDesc` is 56 bytes (14 u32 words).
+            let placed_words: [u32; 14] = unsafe { std::mem::transmute(placed_desc) };
+            assert_eq!(relaxed_alias_target(addr, &placed_words, 67), Some(src_res));
+            assert_eq!(relaxed_alias_target(addr, &placed_words, 0), Some(src_res));
+            assert_eq!(relaxed_alias_target(addr, &placed_words, 28), None);
+        }
+        assert_eq!(slot::<Release>(src_res, 0x10)(src_res), 0);
     }
 }

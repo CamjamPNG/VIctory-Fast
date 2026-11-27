@@ -100,6 +100,19 @@ pub struct Phi {
     pub args: Vec<Value>,
 }
 
+/// Wait-counter flags seen immediately before an instruction (preserved across
+/// `DROPPED` `s_waitcnt*` instructions for `s_barrier` fence narrowing).
+pub mod wait {
+    /// Preceded by a `vmcnt` wait (vector memory loads / atomics).
+    pub const VM: u8 = 1;
+    /// Preceded by a `vscnt` wait (vector memory stores).
+    pub const VS: u8 = 2;
+    /// Preceded by an `lgkmcnt` wait (LDS / SMEM / GDS).
+    pub const LGKM: u8 = 4;
+    /// Preceded by an `expcnt` wait.
+    pub const EXP: u8 = 8;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inst {
     pub machine: Instruction,
@@ -108,6 +121,8 @@ pub struct Inst {
     pub reads: Vec<(Reg, Value)>,
     /// Every register dword written, with the value it receives.
     pub writes: Vec<(Reg, Value)>,
+    /// Console `s_waitcnt*` flags immediately preceding this instruction ([`wait`]).
+    pub wait: u8,
 }
 
 impl Inst {
@@ -172,6 +187,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
+    let mut pending_wait = vec![0u8; blocks.len()];
     for (n, ((machine, flow), next)) in list.into_iter().zip(flows).zip(next_offsets).enumerate() {
         let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
         let name = machine.name().ok_or(ShaderError::Unsupported {
@@ -210,6 +226,48 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 Flow::Stop => Exit::End,
             };
         }
+        let wait_bits = match name {
+            "s_waitcnt" => match fields {
+                Fields::Sopp { imm } => {
+                    let vm = (imm & 0xF) | ((imm >> 14) << 4);
+                    let exp = (imm >> 4) & 7;
+                    let lgkm = (imm >> 8) & 0x3F;
+                    let mut w = 0u8;
+                    if vm != 0x3F {
+                        w |= wait::VM;
+                    }
+                    if exp != 7 {
+                        w |= wait::EXP;
+                    }
+                    if lgkm != 0x3F {
+                        w |= wait::LGKM;
+                    }
+                    w
+                }
+                _ => 0,
+            },
+            "s_waitcnt_vscnt" => match fields {
+                Fields::Sop { imm: Some(imm), .. } if (imm & 0x3F) != 0x3F => wait::VS,
+                _ => 0,
+            },
+            "s_waitcnt_vmcnt" => match fields {
+                Fields::Sop { imm: Some(imm), .. } if (imm & 0x3F) != 0x3F => wait::VM,
+                _ => 0,
+            },
+            "s_waitcnt_lgkmcnt" => match fields {
+                Fields::Sop { imm: Some(imm), .. } if (imm & 0x3F) != 0x3F => wait::LGKM,
+                _ => 0,
+            },
+            "s_waitcnt_expcnt" => match fields {
+                Fields::Sop { imm: Some(imm), .. } if (imm & 7) != 7 => wait::EXP,
+                _ => 0,
+            },
+            "s_wait_idle" => wait::VM | wait::VS | wait::LGKM | wait::EXP,
+            _ => 0,
+        };
+        if wait_bits != 0 {
+            pending_wait[b] |= wait_bits;
+        }
         if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
@@ -218,12 +276,33 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 }
             }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
+            let wait = std::mem::take(&mut pending_wait[b]);
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
                 reads: unset(reads),
                 writes: unset(writes),
+                wait,
             });
+        }
+    }
+    // Carry any trailing waitcnt at the end of a fallthrough block onto the first
+    // instruction of each reachable successor block.
+    for (b, &w) in pending_wait.iter().enumerate() {
+        if w == 0 {
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = blocks[b].exit.successors();
+        while let Some(s) = stack.pop() {
+            if !seen.insert(s) {
+                continue;
+            }
+            if let Some(first) = blocks[s].insts.first_mut() {
+                first.wait |= w;
+            } else {
+                stack.extend(blocks[s].exit.successors());
+            }
         }
     }
     link(&mut blocks);

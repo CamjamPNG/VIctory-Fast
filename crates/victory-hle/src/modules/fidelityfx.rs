@@ -2005,7 +2005,7 @@ mod tests {
         let dir = std::env::var_os("VICTORY_FIDELITYFX_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"D:\Victory\fidelityfx-4.1.2"));
+            .unwrap_or_else(|| PathBuf::from("fidelityfx"));
         let dll_path = dir.join(DLL);
         if !dll_path.is_file() {
             eprintln!(

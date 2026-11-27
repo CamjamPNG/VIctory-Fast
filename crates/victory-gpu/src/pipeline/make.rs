@@ -62,14 +62,17 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if !shaders.iter().any(|s| s.stage == "compute") {
         return None;
     }
+    let rays_active = || {
+        crate::dxr::enabled()
+            || std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+    };
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if rays_active() {
             return false;
         }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
+        // Without BVH or native DXR, ~1,000 CS_RaytracingResolve shaders shade no
+        // hits while clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
         std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
     });
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
@@ -77,8 +80,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if rays_active() {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
@@ -88,8 +90,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_RAYMARCHED_LOCAL_LIGHTS: OnceLock<bool> = OnceLock::new();
     let skip_raymarched = *SKIP_RAYMARCHED_LOCAL_LIGHTS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if rays_active() {
             return std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_some_and(|v| v == "0");
         }
         std::env::var_os("VICTORY_RAYMARCHED_LOCAL_LIGHTS").is_none_or(|v| v == "0")
@@ -419,6 +420,9 @@ fn lost(slot: usize) {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(reason) = p.left_out {
+        return Some(reason.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),

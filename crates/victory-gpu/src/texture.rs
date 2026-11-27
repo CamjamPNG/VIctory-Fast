@@ -23,7 +23,8 @@
 pub(crate) mod ahead;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -162,7 +163,52 @@ unsafe impl Send for Staging {}
 // SAFETY: as above.
 unsafe impl Sync for Staging {}
 
-static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+static STAGING: RwLock<Option<HashMap<usize, Arc<Staging>>>> = RwLock::new(None);
+/// Exact entry count of [`STAGING`], maintained under `STAGING.write()` so empty
+/// checks and cold misses avoid locking.
+static STAGING_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Generation bumped (with `Release` under `STAGING.write()`) on every insert,
+/// removal, or idle sweep in [`STAGING`], invalidating [`STAGING_TLS`].
+static STAGING_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+const STAGING_TLS_CAP: usize = 512;
+
+thread_local! {
+    /// Per-thread direct-mapped `Weak<Staging>` lookup cache (`(epoch, resource, weak)`).
+    /// Uses `Weak` so [`let_go_idle`]'s `Arc::strong_count(s) > 1` check remains exact.
+    static STAGING_TLS: std::cell::RefCell<Vec<(u64, usize, Weak<Staging>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn staging_tls_slot(key: usize) -> usize {
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15usize) >> (usize::BITS - 9)) & (STAGING_TLS_CAP - 1)
+}
+
+fn staging_tls_get(key: usize) -> Option<Arc<Staging>> {
+    let epoch = STAGING_EPOCH.load(Ordering::Acquire);
+    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    STAGING_TLS.with(|cell| {
+        let slots = cell.borrow();
+        let &(at, k, ref weak) = slots.get(staging_tls_slot(key))?;
+        (at == epoch && k == key).then(|| weak.upgrade()).flatten()
+    })
+}
+
+fn staging_tls_put(epoch: u64, key: usize, s: &Arc<Staging>) {
+    if STAGING_EPOCH.load(Ordering::Acquire) != epoch {
+        return;
+    }
+    STAGING_TLS.with(|cell| {
+        let mut slots = cell.borrow_mut();
+        if slots.is_empty() {
+            slots.resize_with(STAGING_TLS_CAP, || (0, 0, Weak::new()));
+        }
+        slots[staging_tls_slot(key)] = (epoch, key, Arc::downgrade(s));
+    });
+}
 
 /// The buffer a texture the host writes is copied through into the texture
 /// of a view the title placed in its memory in another format
@@ -243,7 +289,46 @@ unsafe impl Send for Through {}
 unsafe impl Sync for Through {}
 
 /// The copy buffers of [`alias`], by the placed view's texture.
-static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+static THROUGH: RwLock<Option<HashMap<usize, Arc<Through>>>> = RwLock::new(None);
+static THROUGH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static THROUGH_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+const THROUGH_TLS_CAP: usize = 64;
+
+thread_local! {
+    static THROUGH_TLS: std::cell::RefCell<Vec<(u64, usize, Weak<Through>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn through_tls_slot(key: usize) -> usize {
+    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15usize) >> (usize::BITS - 6)) & (THROUGH_TLS_CAP - 1)
+}
+
+fn through_tls_get(key: usize) -> Option<Arc<Through>> {
+    let epoch = THROUGH_EPOCH.load(Ordering::Acquire);
+    if THROUGH_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    THROUGH_TLS.with(|cell| {
+        let slots = cell.borrow();
+        let &(at, k, ref weak) = slots.get(through_tls_slot(key))?;
+        (at == epoch && k == key).then(|| weak.upgrade()).flatten()
+    })
+}
+
+fn through_tls_put(epoch: u64, key: usize, t: &Arc<Through>) {
+    if THROUGH_EPOCH.load(Ordering::Acquire) != epoch {
+        return;
+    }
+    THROUGH_TLS.with(|cell| {
+        let mut slots = cell.borrow_mut();
+        if slots.is_empty() {
+            slots.resize_with(THROUGH_TLS_CAP, || (0, 0, Weak::new()));
+        }
+        slots[through_tls_slot(key)] = (epoch, key, Arc::downgrade(t));
+    });
+}
 
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
@@ -269,11 +354,26 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     };
     let (to, from) = (&to_copy.texture, &from_copy.texture);
     let Some(host) = host() else { return false };
-    let through = {
-        let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-        let map = map.get_or_insert_with(HashMap::new);
-        match map.get(&(placed as usize)) {
-            Some(through) => through.clone(),
+    let through = if let Some(through) = through_tls_get(placed as usize) {
+        through
+    } else if let Some(through) = {
+        if THROUGH_COUNT.load(Ordering::Acquire) > 0 {
+            let map = THROUGH.read().unwrap_or_else(|e| e.into_inner());
+            let epoch = THROUGH_EPOCH.load(Ordering::Acquire);
+            map.as_ref()
+                .and_then(|m| m.get(&(placed as usize)).cloned())
+                .map(|t| (epoch, t))
+        } else {
+            None
+        }
+    } {
+        through_tls_put(through.0, placed as usize, &through.1);
+        through.1
+    } else {
+        let mut guard = THROUGH.write().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(HashMap::new);
+        let (epoch, through) = match map.get(&(placed as usize)) {
+            Some(through) => (THROUGH_EPOCH.load(Ordering::Acquire), through.clone()),
             None => {
                 // SAFETY: live textures.
                 let (of_from, of_to) = unsafe { (from.GetDesc(), to.GetDesc()) };
@@ -352,9 +452,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                     synced_gen: std::sync::atomic::AtomicU64::new(0),
                 });
                 map.insert(placed as usize, through.clone());
-                through
+                THROUGH_COUNT.store(map.len(), Ordering::Release);
+                let epoch = THROUGH_EPOCH.fetch_add(1, Ordering::Release) + 1;
+                (epoch, through)
             }
-        }
+        };
+        drop(guard);
+        through_tls_put(epoch, placed as usize, &through);
+        through
     };
     if alias_dirty_tracking() && crate::resource::host_tiled(placed).is_none() {
         if !list.alias_use(&from_copy, &to_copy, &through) {
@@ -492,10 +597,13 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sy
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
-fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+#[inline]
+fn waited<T>(_slot: usize, f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let out = f();
-    REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    REFRESH_WAITS[_slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     out
 }
 
@@ -564,7 +672,7 @@ impl Drop for Staging {
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .map_or(0, |map| map.len() as u64);
@@ -591,7 +699,10 @@ pub(crate) fn let_go() -> [u64; 2] {
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
     };
@@ -615,6 +726,8 @@ pub(crate) fn let_go_idle() {
         keep
     });
     if went > 0 {
+        STAGING_COUNT.store(map.len(), Ordering::Release);
+        STAGING_EPOCH.fetch_add(1, Ordering::Release);
         crate::host::trail(|| format!("sweep: {went} staging buffers of textures let go ({} KiB), held by no list", bytes >> 10));
     }
 }
@@ -622,24 +735,47 @@ pub(crate) fn let_go_idle() {
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// Exact cardinality of [`HOST_WRITTEN`], updated under its lock before bumping
+/// [`HOST_WRITTEN_EPOCH`].
+static HOST_WRITTEN_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Monotonic generation bumped (with `Release` under `HOST_WRITTEN.lock()`) on
+/// every insert or remove, invalidating per-thread [`HOST_WRITTEN_TLS`] snapshots.
+static HOST_WRITTEN_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// Per-thread sorted snapshot of [`HOST_WRITTEN`] tagged with [`HOST_WRITTEN_EPOCH`],
+    /// making [`host_wrote`] and [`upload_from`]'s host-written check lock-free on the hot path.
+    static HOST_WRITTEN_TLS: std::cell::RefCell<(u64, Vec<usize>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
+    if host_wrote(resource as usize) {
+        return;
+    }
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        set.get_or_insert_with(Default::default).insert(resource as usize)
+        let set = set.get_or_insert_with(Default::default);
+        let inserted = set.insert(resource as usize);
+        if inserted {
+            HOST_WRITTEN_COUNT.store(set.len(), Ordering::Release);
+            HOST_WRITTEN_EPOCH.fetch_add(1, Ordering::Release);
+        }
+        inserted
     };
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
+    #[cfg(feature = "diagnostics")]
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
-            HOST_WRITTEN_AT
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+            let mut map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(at as u64, (bytes, words[4], words[6], words[7], words[8], resource as usize));
+            HOST_WRITTEN_AT_COUNT.store(map.len(), Ordering::Release);
         }
     }
 }
@@ -647,8 +783,11 @@ pub(crate) fn host_written(resource: This) {
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
+#[cfg(feature = "diagnostics")]
 static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
     Mutex::new(std::collections::BTreeMap::new());
+#[cfg(feature = "diagnostics")]
+static HOST_WRITTEN_AT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// A texture the title placed at `address` (description words `desc`) was
 /// made: says so once if it lies in the memory of a texture the host
@@ -656,7 +795,11 @@ static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u3
 /// memory, which the copy never reached: the copied texels are on the
 /// card in the other texture, where no shader that reads this view finds
 /// them.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
+    if HOST_WRITTEN_AT_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let hit = {
         let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.range(..=address)
@@ -686,33 +829,76 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     }
 }
 
+#[cfg(not(feature = "diagnostics"))]
+#[inline]
+pub(crate) fn placed_in_host_written(_address: u64, _desc: &[u32; 14]) {}
+
 /// Whether the host GPU wrote `resource` by a copy or resolve
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
 pub(crate) fn host_wrote(resource: usize) -> bool {
-    HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&resource))
+    let epoch = HOST_WRITTEN_EPOCH.load(Ordering::Acquire);
+    if HOST_WRITTEN_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    HOST_WRITTEN_TLS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0 != epoch {
+            let set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            let cur_epoch = HOST_WRITTEN_EPOCH.load(Ordering::Acquire);
+            cache.1.clear();
+            if let Some(set) = set.as_ref() {
+                cache.1.extend(set.iter().copied());
+                cache.1.sort_unstable();
+            }
+            cache.0 = cur_epoch;
+        }
+        cache.1.binary_search(&resource).is_ok()
+    })
 }
 
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if STAGING_COUNT.load(Ordering::Acquire) > 0 {
+        let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut()
+            && map.remove(&resource).is_some()
+        {
+            STAGING_COUNT.store(map.len(), Ordering::Release);
+            STAGING_EPOCH.fetch_add(1, Ordering::Release);
+        }
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
-    }
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let removed_host_written = if host_wrote(resource) {
+        let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = set.as_mut()
+            && set.remove(&resource)
+        {
+            HOST_WRITTEN_COUNT.store(set.len(), Ordering::Release);
+            HOST_WRITTEN_EPOCH.fetch_add(1, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
-    HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, d| d.5 != resource);
-    let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(through) = through.as_mut() {
-        through.remove(&resource);
+    #[cfg(feature = "diagnostics")]
+    if removed_host_written && HOST_WRITTEN_AT_COUNT.load(Ordering::Acquire) > 0 {
+        let mut map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, d| d.5 != resource);
+        HOST_WRITTEN_AT_COUNT.store(map.len(), Ordering::Release);
+    }
+    if THROUGH_COUNT.load(Ordering::Acquire) > 0 {
+        let mut through = THROUGH.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(through) = through.as_mut()
+            && through.remove(&resource).is_some()
+        {
+            THROUGH_COUNT.store(through.len(), Ordering::Release);
+            THROUGH_EPOCH.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -740,6 +926,25 @@ thread_local! {
     /// The thread is staging a texture for a copy-only queue (`texture::ahead`),
     /// which cannot dispatch GPU compute detile shaders.
     pub(crate) static COPY_QUEUE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Active while `heap_worker::Batch::record` collects `Staging` handles
+    /// deferred into its upload list for parallel burst detiling.
+    static AHEAD_COLLECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AHEAD_STAGED: std::cell::RefCell<Vec<Arc<Staging>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` while capturing any [`Staging`] handles passed to
+/// `HostList::defer_texture` on this thread into `out`.
+pub(crate) fn capture_deferred_staging<R>(out: &mut Vec<Arc<Staging>>, f: impl FnOnce() -> R) -> R {
+    struct Guard<'a>(&'a mut Vec<Arc<Staging>>, bool);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            AHEAD_COLLECT.set(self.1);
+            AHEAD_STAGED.with(|staged| self.0.extend(staged.borrow_mut().drain(..)));
+        }
+    }
+    let prev = AHEAD_COLLECT.replace(true);
+    let _guard = Guard(out, prev);
+    f()
 }
 
 /// Whether a staging buffer made for one upload of a texture picked by index
@@ -810,14 +1015,9 @@ pub(crate) struct Digest(u128);
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written {
+    if host_wrote(resource as usize) {
         return;
     }
     // Once a list for each first level; not again for one that the list's
@@ -838,15 +1038,18 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     use std::sync::atomic::Ordering::Relaxed;
     let baking = BAKING.get();
-    if baking {
+    if baking && !staging.exact.load(Relaxed) {
         staging.exact.store(true, Relaxed);
     }
     let picking = PICKING.get();
-    if picking.is_none() {
+    if picking.is_none() && staging.once.load(Relaxed) {
         // A draw samples it through a table: kept and checked from here on.
         staging.once.store(false, Relaxed);
     }
-    staging.used.store(crate::host::moment(), Relaxed);
+    let now = crate::host::moment();
+    if staging.used.load(Relaxed) != now {
+        staging.used.store(now, Relaxed);
+    }
     // Levels on demand: a view of the texture now starts at another
     // level, or another texture now starts inside its span, with no byte
     // of its memory changed. The levels are judged anew: detiled again at
@@ -906,6 +1109,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // latency when title memory changes (including 3-buffer video rings) and
     // avoids stale-frame races with joined submissions / `VICTORY_THIN`.
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+    if AHEAD_COLLECT.get() {
+        AHEAD_STAGED.with(|staged| staged.borrow_mut().push(staging.clone()));
+    }
     list.defer_texture(PreludeUpload {
         staging,
         copy,
@@ -1600,13 +1806,19 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let preparing = &crate::host::PREPARING;
+            preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+            preparing[3].fetch_add(read as u64, Relaxed);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = read;
     }
 
     fn movie_plane(&self) -> bool {
@@ -1625,10 +1837,82 @@ impl Staging {
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
+        #[cfg(feature = "diagnostics")]
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
+        #[cfg(feature = "diagnostics")]
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
+    }
+
+    /// Copies only the tiled byte spans of dirty subresources into `read` at
+    /// their exact offsets when `sub_mask` is a strict subset and detiling will
+    /// not read outside those spans; falls back to copying all `read.len()` bytes.
+    fn copy_dirty_mapped(&self, read: &mut [u8], sub_mask: u64, gpu_seeded: bool) -> usize {
+        let sub_count = self.footprints.len();
+        let all = all_subs_mask(sub_count);
+        if !self.on_demand
+            && (!self.gpu_detile || gpu_seeded)
+            && sub_count > 1
+            && sub_count <= 64
+            && (sub_mask & all) != all
+        {
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            let mut ok = true;
+            for i in 0..sub_count {
+                if !sub_selected(sub_mask, i, sub_count) {
+                    continue;
+                }
+                let (mip, slice) = self.part(i);
+                let Some((s, e)) = self.layout.subresource_byte_span(mip, slice) else {
+                    ok = false;
+                    break;
+                };
+                let (s, e) = (s as usize, e as usize);
+                if s > e || e > read.len() {
+                    ok = false;
+                    break;
+                }
+                if e > s {
+                    spans.push((s, e));
+                }
+            }
+            if ok && !spans.is_empty() {
+                spans.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+                let mut total = 0usize;
+                for (s, e) in spans {
+                    if let Some(last) = merged.last_mut()
+                        && s <= last.1
+                    {
+                        if e > last.1 {
+                            total += e - last.1;
+                            last.1 = e;
+                        }
+                    } else {
+                        total += e - s;
+                        merged.push((s, e));
+                    }
+                }
+                if total < read.len() {
+                    for (s, e) in merged {
+                        // SAFETY: `s < e <= read.len() == self.read`; writing
+                        // into `read[s..e]` matches `self.memory + s`.
+                        unsafe {
+                            crate::host::copy_mapped(
+                                read.as_mut_ptr().add(s),
+                                self.memory.wrapping_add(s),
+                                e - s,
+                                false,
+                            );
+                        }
+                    }
+                    return total;
+                }
+            }
+        }
+        crate::host::copy_mapped(read.as_mut_ptr(), self.memory, read.len(), false);
+        read.len()
     }
 
     fn refresh_timed(&self) -> usize {
@@ -1666,13 +1950,14 @@ impl Staging {
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let copied = with_read(size, |read| {
+                let copied = self.copy_dirty_mapped(read, sub_mask, last.gpu_seeded);
                 self.detile_masked(read, last, sub_mask);
+                copied
             });
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            crate::copystat::add(crate::copystat::C::TexWatched, copied as u64);
+            return copied;
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -1681,8 +1966,8 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // the hash, which is taken periodically by the texture's address so
+        // textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
@@ -1715,8 +2000,8 @@ impl Staging {
                 .wrapping_add((start >> 16) as u64)
                 .is_multiple_of(HASH_EVERY)
                 && !recent_ahead;
-            // A texture starts hot: one written that way from its first
-            // frames on changes before the hash has ever caught it.
+            // A texture starts hot: one written through an alias view from its
+            // first frames on changes before the periodic hash catches it.
             if last.hot_until == 0 {
                 last.hot_until = frame + HOT_FRAMES;
             }
@@ -2090,15 +2375,24 @@ impl Staging {
 /// upload from it hold it until they have run); the next upload makes one
 /// anew.
 pub(crate) fn unstage(resource: This) {
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&(resource as usize));
+    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut map = STAGING.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut()
+        && map.remove(&(resource as usize)).is_some()
+    {
+        STAGING_COUNT.store(map.len(), Ordering::Release);
+        STAGING_EPOCH.fetch_add(1, Ordering::Release);
     }
 }
 
 /// Where a staged title texture's memory is: address and bytes.
 pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
     Some((at as u64, len as u64))
 }
@@ -2141,7 +2435,10 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     let staging = map.as_ref()?.get(&(resource as usize))?;
     Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
 }
@@ -2149,10 +2446,26 @@ pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
 /// The first level a title texture's staging buffer holds; `u32::MAX`
 /// without one.
 fn staged_from(resource: This) -> u32 {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    map.as_ref()
-        .and_then(|map| map.get(&(resource as usize)))
-        .map_or(u32::MAX, |s| s.first)
+    if let Some(s) = staging_tls_get(resource as usize) {
+        return s.first;
+    }
+    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+        return u32::MAX;
+    }
+    let hit = {
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
+        let epoch = STAGING_EPOCH.load(Ordering::Acquire);
+        map.as_ref()
+            .and_then(|map| map.get(&(resource as usize)))
+            .map(|s| (epoch, s.clone()))
+    };
+    if let Some((epoch, s)) = hit {
+        let first = s.first;
+        staging_tls_put(epoch, resource as usize, &s);
+        first
+    } else {
+        u32::MAX
+    }
 }
 
 /// Whether the levels from `first` on of `resource`'s host copy were filled
@@ -2200,7 +2513,13 @@ pub(crate) fn title_span(resource: This, first: u32) -> Option<(u64, u64)> {
 }
 
 pub(crate) fn is_staged(resource: This) -> bool {
-    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    if staging_tls_get(resource as usize).is_some() {
+        return true;
+    }
+    let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))
 }
 
@@ -2208,8 +2527,13 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// if the texture has been staged for upload.
 /// (Whether it is mapped is asked only if `ask`; else it counts as mapped.)
 pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
-    let s = {
-        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let s = if let Some(s) = staging_tls_get(resource as usize) {
+        s
+    } else {
+        if STAGING_COUNT.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
     Some((s.read as u64, !ask || committed(s.memory, s.read)))
@@ -2430,17 +2754,43 @@ fn mapped_regions(start: usize, end: usize, first_only: bool) -> u64 {
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
+    let key = resource as usize;
+    let need_first = first.max(copy.base);
+    if let Some(s) = staging_tls_get(key)
+        && s.first <= need_first
+        && s.serial == copy.serial
+    {
+        return Some(s);
+    }
+    if STAGING_COUNT.load(Ordering::Acquire) > 0 {
+        let hit = {
+            let map = STAGING.read().unwrap_or_else(|e| e.into_inner());
+            let epoch = STAGING_EPOCH.load(Ordering::Acquire);
+            map.as_ref()
+                .and_then(|m| m.get(&key))
+                .filter(|s| s.first <= need_first && s.serial == copy.serial)
+                .map(|s| (epoch, s.clone()))
+        };
+        if let Some((epoch, s)) = hit {
+            staging_tls_put(epoch, key, &s);
+            return Some(s);
+        }
+    }
     let texture = &copy.texture;
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
-    let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    let map = map.get_or_insert_with(HashMap::new);
-    if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first.max(copy.base)
+    let mut guard = STAGING.write().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(s) = map.get(&key)
+        && s.first <= need_first
         && s.serial == copy.serial
     {
-        return Some(s.clone());
+        let epoch = STAGING_EPOCH.load(Ordering::Acquire);
+        let out = s.clone();
+        drop(guard);
+        staging_tls_put(epoch, key, &out);
+        return Some(out);
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
     let Some(layout) = crate::resource::texture_layout(&desc).map(|t| t.planes[0].layout.clone())
@@ -2547,7 +2897,11 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         waiting: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
-    map.insert(resource as usize, s.clone());
+    map.insert(key, s.clone());
+    STAGING_COUNT.store(map.len(), Ordering::Release);
+    let epoch = STAGING_EPOCH.fetch_add(1, Ordering::Release) + 1;
+    drop(guard);
+    staging_tls_put(epoch, key, &s);
     Some(s)
 }
 
@@ -3042,6 +3396,161 @@ mod prelude_upload_tests {
                 );
             }
         }
+    }
+
+    static FAST_PATH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn host_written_lock_free_fast_path_and_epoch_invalidation() {
+        use std::sync::atomic::Ordering;
+        let _guard = FAST_PATH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let res_a = 0xDEAD_BEE0usize;
+        let res_b = 0xDEAD_BEE8usize;
+        super::forget(res_a);
+        super::forget(res_b);
+
+        assert!(!super::host_wrote(res_a));
+        assert!(!super::host_wrote(res_b));
+
+        // Insert `res_a` under `HOST_WRITTEN` (mirrors `host_written` without COM deref).
+        let epoch0 = super::HOST_WRITTEN_EPOCH.load(Ordering::Acquire);
+        {
+            let mut set = super::HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            let set = set.get_or_insert_with(Default::default);
+            assert!(set.insert(res_a));
+            super::HOST_WRITTEN_COUNT.store(set.len(), Ordering::Release);
+            super::HOST_WRITTEN_EPOCH.fetch_add(1, Ordering::Release);
+        }
+        let epoch1 = super::HOST_WRITTEN_EPOCH.load(Ordering::Acquire);
+        assert!(epoch1 > epoch0);
+
+        // First call populates TLS snapshot; second call hits TLS with identical epoch.
+        assert!(super::host_wrote(res_a));
+        assert!(!super::host_wrote(res_b));
+        super::HOST_WRITTEN_TLS.with(|cell| {
+            let cache = cell.borrow();
+            assert_eq!(cache.0, epoch1);
+            assert!(cache.1.binary_search(&res_a).is_ok());
+        });
+
+        // Cross-thread visibility: a fresh thread observes `res_a` via Acquire/Release.
+        let seen_other_thread = std::thread::spawn(move || super::host_wrote(res_a) && !super::host_wrote(res_b))
+            .join()
+            .unwrap();
+        assert!(seen_other_thread);
+
+        // `forget` removes `res_a`, decrements count, and bumps epoch to invalidate TLS.
+        super::forget(res_a);
+        assert!(super::HOST_WRITTEN_EPOCH.load(Ordering::Acquire) > epoch1);
+        assert!(!super::host_wrote(res_a));
+    }
+
+    #[test]
+    fn staging_and_through_tls_caches_invalidate_on_unstage_and_forget_without_pinning_arc() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        let _guard = FAST_PATH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let key = 0xCAFE_0010usize;
+        let res = key as crate::object::This;
+        super::forget(key);
+
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 64,
+            height: 64,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        })
+        .unwrap();
+        // SAFETY: dummy interface pointers never dereferenced; leaked once via `mem::forget`
+        // so `ID3D12Resource::drop` never runs.
+        let dummy_buf = || unsafe { std::mem::transmute::<usize, ID3D12Resource>(8) };
+        let staging = std::sync::Arc::new(super::Staging {
+            buffer: dummy_buf(),
+            base: 0,
+            _piece: None,
+            #[cfg(feature = "diagnostics")]
+            size: 0,
+            data: std::ptr::null_mut(),
+            footprints: Vec::new(),
+            rows: Vec::new(),
+            layout,
+            mips: 1,
+            first: 2,
+            level0: 0,
+            read: 0,
+            serial: 7,
+            holds: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            once: AtomicBool::new(false),
+            bytes: 0,
+            linear_bytes: 0,
+            gpu_detile: false,
+            memory: std::ptr::null(),
+            last: std::sync::Mutex::default(),
+            dirty: AtomicBool::new(false),
+            dirty_subs: AtomicU64::new(0),
+            uploaded: AtomicBool::new(true),
+            used: AtomicU64::new(0),
+            expected: AtomicU64::new(0),
+            on_demand: false,
+            detiled: AtomicU32::new(0),
+            judged: [AtomicU64::new(0), AtomicU64::new(0)],
+            waiting: AtomicU64::new(0),
+            exact: AtomicBool::new(false),
+        });
+        std::mem::forget(staging.clone());
+
+        let epoch = {
+            let mut map = super::STAGING.write().unwrap_or_else(|e| e.into_inner());
+            let map = map.get_or_insert_with(std::collections::HashMap::new);
+            map.insert(key, staging.clone());
+            super::STAGING_COUNT.store(map.len(), Ordering::Release);
+            super::STAGING_EPOCH.fetch_add(1, Ordering::Release) + 1
+        };
+
+        // Populate TLS (`Weak<Staging>`) and confirm strong_count is NOT inflated by TLS.
+        let strong_before = std::sync::Arc::strong_count(&staging);
+        super::staging_tls_put(epoch, key, &staging);
+        assert_eq!(std::sync::Arc::strong_count(&staging), strong_before);
+        assert!(super::staging_tls_get(key).is_some());
+        assert_eq!(super::staged_from(res), 2);
+        assert!(super::is_staged(res));
+
+        // `unstage` bumps `STAGING_EPOCH` and immediately invalidates TLS.
+        super::unstage(res);
+        assert!(super::STAGING_EPOCH.load(Ordering::Acquire) > epoch);
+        assert!(super::staging_tls_get(key).is_none());
+        assert_eq!(super::staged_from(res), u32::MAX);
+        assert!(!super::is_staged(res));
+
+        // Same check for `THROUGH` + `forget`.
+        let through = std::sync::Arc::new(super::Through {
+            buffer: dummy_buf(),
+            parts: Vec::new(),
+            synced_gen: AtomicU64::new(0),
+        });
+        std::mem::forget(through.clone());
+        let t_epoch = {
+            let mut map = super::THROUGH.write().unwrap_or_else(|e| e.into_inner());
+            let map = map.get_or_insert_with(std::collections::HashMap::new);
+            map.insert(key, through.clone());
+            super::THROUGH_COUNT.store(map.len(), Ordering::Release);
+            super::THROUGH_EPOCH.fetch_add(1, Ordering::Release) + 1
+        };
+        let t_strong = std::sync::Arc::strong_count(&through);
+        super::through_tls_put(t_epoch, key, &through);
+        assert_eq!(std::sync::Arc::strong_count(&through), t_strong);
+        assert!(super::through_tls_get(key).is_some());
+
+        super::forget(key);
+        assert!(super::THROUGH_EPOCH.load(Ordering::Acquire) > t_epoch);
+        assert!(super::through_tls_get(key).is_none());
     }
 }
 

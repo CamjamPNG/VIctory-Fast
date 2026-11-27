@@ -32,8 +32,18 @@ pub(crate) fn on() -> bool {
 /// be asked for (it is `asked + 1` then). A round asked for and not begun
 /// yet (`asked >= done + 2`: the one before it is not done) begins after
 /// now; with `asked == done + 1` round `asked` may be running already.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn round_after(asked: u64, done: u64) -> (u64, bool) {
     if asked >= done + 2 { (asked, false) } else { (asked + 1, true) }
+}
+
+/// With rounds `asked` asked for and `started` already begun by the heap-sync
+/// thread: returns a round number guaranteed to begin after now, and whether
+/// `asked` must be incremented to queue one. When `asked > started`, the
+/// queued round `asked` has not begun yet and will coalesce all callers that
+/// arrive before it starts.
+pub(crate) fn round_after_started(asked: u64, started: u64) -> (u64, bool) {
+    if asked > started { (asked, false) } else { (asked + 1, true) }
 }
 
 thread_local! {
@@ -203,6 +213,65 @@ mod tests {
             if let Some(&at) = began.get(&round) {
                 assert!(at > call, "round {round} began at {at}, before the call at {call}");
             }
+        }
+    }
+
+    /// Coalesced rounds (`asked, started, done`) satisfy every queued caller in
+    /// one pass while guaranteeing each caller's round begins after its call.
+    #[test]
+    fn coalesced_rounds_begin_after_every_caller_and_avoid_redundant_passes() {
+        let (mut asked, mut started, mut done) = (0u64, 0u64, 0u64);
+        let mut began: std::collections::HashMap<u64, u64> = Default::default();
+        let mut given: Vec<(u64, u64)> = Vec::new();
+        let mut running: Option<u64> = None;
+        let mut runs = 0u64;
+        let mut seed = 0x517c_c1b7_2722_0a95u64;
+        for call in 1..5000u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            match seed % 4 {
+                0 | 1 => {
+                    let (round, ask) = round_after_started(asked, started);
+                    if ask {
+                        asked = round;
+                    }
+                    given.push((call, round));
+                }
+                2 => {
+                    if let Some(target) = running.take() {
+                        done = target;
+                    }
+                }
+                _ => {
+                    if running.is_none() && asked > started {
+                        let target = asked;
+                        for r in (started + 1)..=target {
+                            began.insert(r, call);
+                        }
+                        started = target;
+                        running = Some(target);
+                        runs += 1;
+                    }
+                }
+            }
+        }
+        if let Some(target) = running.take() {
+            done = target;
+        }
+        if asked > started {
+            let target = asked;
+            for r in (started + 1)..=target {
+                began.insert(r, 5000);
+            }
+            done = target;
+            runs += 1;
+        }
+        assert_eq!(done, asked);
+        assert!(runs < given.len() as u64, "queued callers should coalesce into fewer passes");
+        for (call, round) in given {
+            let at = began[&round];
+            assert!(at > call, "round {round} began at {at}, before call at {call}");
         }
     }
 }

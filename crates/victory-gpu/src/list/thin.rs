@@ -130,6 +130,61 @@ impl Front {
         }
     }
 
+    /// Serializes `count` console `BarrierGroup` descriptors (and their inline
+    /// barrier structs) into the thin stream so translation threads can decode
+    /// them without reading guest memory after the call returns.
+    fn put_barrier_groups(&mut self, count: u32, groups: *const u8) {
+        if self.closed || self.recording.is_none() || count == 0 {
+            return;
+        }
+        const MAX_BARRIERS_PER_GROUP: u32 = 4096;
+        if groups.is_null() {
+            self.put(BARRIER_GROUPS, &[u64::from(count), 1]);
+            return;
+        }
+        // SAFETY: the title passes `count` `BarrierGroup` headers.
+        let slice = unsafe {
+            std::slice::from_raw_parts(groups.cast::<super::BarrierGroup>(), count as usize)
+        };
+        let valid = slice.iter().all(|g| {
+            super::barrier_group_item_bytes(g.kind).is_some()
+                && g.count <= MAX_BARRIERS_PER_GROUP
+                && (g.count == 0 || !g.barriers.is_null())
+        });
+        if !valid {
+            self.put(BARRIER_GROUPS, &[u64::from(count), 1]);
+            return;
+        }
+        let at = self.words.len();
+        self.words.push(0);
+        self.words.push(u64::from(count));
+        self.words.push(0); // opaque = 0
+        for g in slice {
+            self.words.push(u64::from(g.kind) | (u64::from(g.count) << 32));
+            if g.count > 0
+                && let Some(item_bytes) = super::barrier_group_item_bytes(g.kind)
+            {
+                let total_bytes = g.count as usize * item_bytes;
+                let from = self.words.len();
+                self.words.resize(from + total_bytes.div_ceil(8), 0);
+                // SAFETY: `g.barriers` is non-null with `g.count` plain barrier structs;
+                // `self.words[from..]` holds `total_bytes`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        g.barriers,
+                        self.words.as_mut_ptr().add(from).cast::<u8>(),
+                        total_bytes,
+                    );
+                }
+            }
+        }
+        let len = (self.words.len() - at - 1) as u64;
+        self.words[at] = BARRIER_GROUPS | (len << 16);
+        if self.words.len() >= CHUNK {
+            self.hand_over();
+        }
+    }
+
     fn hand_over(&mut self) {
         let Some(recording) = &self.recording else { return };
         if self.words.is_empty() {
@@ -623,8 +678,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    front(this).put_barrier_groups(count, groups);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -754,6 +809,39 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+#[inline]
+fn is_state_op(op: u64) -> bool {
+    op == Plain::GRAPHICS_TABLE as u64
+        || op == Plain::COMPUTE_TABLE as u64
+        || op == Plain::GRAPHICS_CONSTANT as u64
+        || op == Plain::COMPUTE_CONSTANT as u64
+        || op == Plain::GRAPHICS_VIEW as u64
+        || op == Plain::COMPUTE_VIEW as u64
+        || op == Plain::SET_PIPELINE as u64
+        || op == Plain::TOPOLOGY as u64
+        || op == Plain::STENCIL_REF as u64
+        || op == Plain::DEPTH_BOUNDS as u64
+        || op == Plain::DRAW as u64
+        || op == Plain::DRAW_INDEXED as u64
+        || op == Plain::DISPATCH as u64
+        || op == Plain::DISPATCH_X as u64
+        || op == Plain::DISPATCH_MESH as u64
+        || op == Plain::DISPATCH_MESH_X as u64
+        || op == Plain::EXECUTE_INDIRECT as u64
+        || matches!(
+            op,
+            GRAPHICS_CONSTANTS
+                | COMPUTE_CONSTANTS
+                | VIEWPORTS
+                | SCISSORS
+                | BLEND_FACTOR
+                | HEAPS
+                | INDEX_BUFFER
+                | VERTEX_BUFFERS
+                | TARGETS
+        )
+}
+
 /// Attempts to execute a hot state/draw/dispatch opcode directly against an
 /// already-held `(&HostList, &mut draw::State)` without re-locking `list.state`
 /// or taking per-call diagnostic timestamps. Returns `true` if handled.
@@ -806,6 +894,10 @@ fn run_state_op(op: u64, host: &crate::host::HostList, state: &mut crate::draw::
         n if n == Plain::DISPATCH as u64 => {
             super::count_dispatch();
             state.dispatch(host, word(0) as u32, word(1) as u32, word(2) as u32, 0);
+        }
+        n if n == Plain::DISPATCH_X as u64 => {
+            super::count_dispatch();
+            state.dispatch(host, word(0) as u32, word(1) as u32, word(2) as u32, word(3) as u32);
         }
         n if n == Plain::DISPATCH_MESH as u64 => {
             super::count_draw();
@@ -910,6 +1002,37 @@ fn run_state_op(op: u64, host: &crate::host::HostList, state: &mut crate::draw::
     true
 }
 
+/// Reconstructs `count` [`super::BarrierGroup`] headers pointing into the
+/// serialized stream slice `words`. Returns `None` if malformed.
+fn unpack_barrier_groups(count: usize, words: &[u64]) -> Option<Vec<super::BarrierGroup>> {
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for _ in 0..count {
+        let hdr = *words.get(pos)?;
+        pos += 1;
+        let kind = hdr as u32;
+        let num = (hdr >> 32) as u32;
+        let item_bytes = super::barrier_group_item_bytes(kind)?;
+        let item_words = item_bytes.div_ceil(8);
+        let needed = (num as usize).checked_mul(item_words)?;
+        if pos.checked_add(needed)? > words.len() {
+            return None;
+        }
+        let barriers = if num == 0 {
+            std::ptr::null()
+        } else {
+            words[pos..].as_ptr().cast::<u8>()
+        };
+        pos += needed;
+        out.push(super::BarrierGroup {
+            kind,
+            count: num,
+            barriers,
+        });
+    }
+    Some(out)
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
@@ -951,27 +1074,29 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
-        if held_state.is_none()
-            && let Some(host) = super::host_list(list)
-        {
-            // SAFETY: `list` is one of our backing `List`s, exclusively owned by this worker.
-            let state = unsafe { &(*list.cast::<List>()).state }
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            #[cfg(feature = "diagnostics")]
+        if is_state_op(op) {
+            if held_state.is_none()
+                && let Some(host) = super::host_list(list)
             {
-                batch = Some((0, std::time::Instant::now()));
+                // SAFETY: `list` is one of our backing `List`s, exclusively owned by this worker.
+                let state = unsafe { &(*list.cast::<List>()).state }
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                {
+                    batch = Some((0, std::time::Instant::now()));
+                }
+                held_state = Some((host, state));
             }
-            held_state = Some((host, state));
-        }
-        if let Some((host, state)) = held_state.as_mut()
-            && run_state_op(op, host, state, w)
-        {
-            #[cfg(feature = "diagnostics")]
-            if let Some((n, _)) = batch.as_mut() {
-                *n += 1;
+            if let Some((host, state)) = held_state.as_mut()
+                && run_state_op(op, host, state, w)
+            {
+                #[cfg(feature = "diagnostics")]
+                if let Some((n, _)) = batch.as_mut() {
+                    *n += 1;
+                }
+                continue;
             }
-            continue;
         }
         flush_held(
             &mut held_state,
@@ -995,7 +1120,21 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             BARRIER => {
                 super::barrier(list, n as u32, at_or(w, 1));
             }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+            BARRIER_GROUPS => {
+                let opaque = w.get(1).copied().unwrap_or(1);
+                if n == 0 {
+                    continue;
+                }
+                if opaque != 0 {
+                    super::barrier_groups(list, n as u32, std::ptr::null());
+                    continue;
+                }
+                if let Some(rebuilt) = unpack_barrier_groups(n, &w[2..]) {
+                    super::barrier_groups(list, n as u32, rebuilt.as_ptr().cast());
+                } else {
+                    super::barrier_groups(list, n as u32, std::ptr::null());
+                }
+            }
             VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
             SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
             BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
@@ -1194,5 +1333,74 @@ mod tests {
         slot[1] = 99;
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// Serialized barrier groups preserve child Global/Buffer/Texture structs
+    /// even after the caller overwrites its stack arrays, and mark unknown
+    /// group kinds as opaque for conservative fallback.
+    #[test]
+    fn barrier_groups_round_trip_in_thin_stream() {
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+
+        let mut g_bar = super::GlobalBarrierDesc {
+            sync_before: 0x80,
+            sync_after: 0x80,
+            access_before: 0x10,
+            access_after: 0x80,
+        };
+        let mut b_bar = super::BufferBarrierDesc {
+            sync_before: 0x80,
+            sync_after: 0x800,
+            access_before: 0x10,
+            access_after: 0x200,
+            resource: 0x1234usize as This,
+            offset: 0,
+            size: u64::MAX,
+        };
+        let groups = [
+            super::BarrierGroup {
+                kind: super::BARRIER_GROUP_GLOBAL,
+                count: 1,
+                barriers: (&raw const g_bar).cast(),
+            },
+            super::BarrierGroup {
+                kind: super::BARRIER_GROUP_BUFFER,
+                count: 1,
+                barriers: (&raw const b_bar).cast(),
+            },
+        ];
+        f.put_barrier_groups(groups.len() as u32, groups.as_ptr().cast());
+        // Mutate caller stack structs after recording to prove deep copy.
+        g_bar.sync_before = 0;
+        b_bar.offset = 999;
+        assert_eq!((g_bar.sync_before, b_bar.offset), (0, 999));
+
+        let s = std::mem::take(&mut f.words);
+        assert_eq!(s[0] & 0xffff, BARRIER_GROUPS);
+        let len = (s[0] >> 16) as usize;
+        let w = &s[1..1 + len];
+        assert_eq!((w[0], w[1]), (2, 0));
+        let unpacked = unpack_barrier_groups(w[0] as usize, &w[2..]).expect("valid groups");
+        assert_eq!(unpacked.len(), 2);
+        assert_eq!((unpacked[0].kind, unpacked[0].count), (super::BARRIER_GROUP_GLOBAL, 1));
+        assert_eq!((unpacked[1].kind, unpacked[1].count), (super::BARRIER_GROUP_BUFFER, 1));
+        // SAFETY: unpacked pointers point into `w` with valid aligned structs.
+        let got_g = unsafe { *unpacked[0].barriers.cast::<super::GlobalBarrierDesc>() };
+        let got_b = unsafe { *unpacked[1].barriers.cast::<super::BufferBarrierDesc>() };
+        assert_eq!(got_g.sync_before, 0x80);
+        assert_eq!(got_b.resource as usize, 0x1234);
+        assert_eq!(got_b.offset, 0);
+
+        // Unknown group kind marks opaque = 1 so translation falls back conservatively.
+        let bad = [super::BarrierGroup {
+            kind: 99,
+            count: 1,
+            barriers: (&raw const g_bar).cast(),
+        }];
+        f.put_barrier_groups(1, bad.as_ptr().cast());
+        let s2 = std::mem::take(&mut f.words);
+        assert_eq!(s2[0] & 0xffff, BARRIER_GROUPS);
+        assert_eq!((s2[1], s2[2]), (1, 1));
     }
 }

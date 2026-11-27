@@ -1894,6 +1894,17 @@ struct PreludeWorker {
     done_cv: std::sync::Condvar,
 }
 
+fn prelude_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_PRELUDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2usize)
+            .clamp(1, 16)
+    })
+}
+
 fn prelude_worker() -> &'static PreludeWorker {
     static WORKER: OnceLock<PreludeWorker> = OnceLock::new();
     WORKER.get_or_init(|| {
@@ -1902,7 +1913,7 @@ fn prelude_worker() -> &'static PreludeWorker {
             work_cv: std::sync::Condvar::new(),
             done_cv: std::sync::Condvar::new(),
         };
-        for i in 0..2 {
+        for i in 0..prelude_threads() {
             let _ = std::thread::Builder::new()
                 .name(format!("victory-prelude-{i}"))
                 .spawn(|| {
@@ -3332,6 +3343,16 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Indices into `copies` of steps that are not `Step::Refresh`, in order,
+    /// so `run_deferred` skips covered refreshes in O(non-refresh) time while
+    /// `skip_front_refreshes && batch.front_intact` holds.
+    non_refreshes: Vec<usize>,
+    /// Total `Step::Refresh` entries and bytes in `copies` (diagnostics stats
+    /// when `run_deferred` stays on the `non_refreshes` fast path).
+    #[cfg(feature = "diagnostics")]
+    refresh_count: u64,
+    #[cfg(feature = "diagnostics")]
+    refresh_bytes: u64,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -3419,6 +3440,15 @@ impl Deferred {
         if self.copies.capacity() > 16_384 {
             self.copies.shrink_to(4_096);
         }
+        self.non_refreshes.clear();
+        if self.non_refreshes.capacity() > 4_096 {
+            self.non_refreshes.shrink_to(1_024);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            self.refresh_count = 0;
+            self.refresh_bytes = 0;
+        }
         self.kept.clear();
         if self.kept.capacity() > 4_096 {
             self.kept.shrink_to(1_024);
@@ -3456,12 +3486,38 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// Appends a non-`Step::Refresh` step and records its index for `run_deferred`.
+    fn push_step(&mut self, step: Step) {
+        debug_assert!(!matches!(step, Step::Refresh(..)));
+        let idx = self.copies.len();
+        self.copies.push(step);
+        self.non_refreshes.push(idx);
+    }
+
+    /// Appends a `Step::Refresh` step without adding it to `non_refreshes`.
+    fn push_refresh(&mut self, shadow: std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        self.copies.push(Step::Refresh(shadow, address, len));
+        #[cfg(feature = "diagnostics")]
+        {
+            self.refresh_count += 1;
+            self.refresh_bytes += len as u64;
+        }
+    }
+
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
+        // `place.rs` pushes `Step::Placed` directly into `copies` right before
+        // calling `title_written()`; record its index in `non_refreshes` here.
+        if let Some(Step::Placed(_)) = self.copies.last() {
+            let idx = self.copies.len() - 1;
+            if self.non_refreshes.last().copied() != Some(idx) {
+                self.non_refreshes.push(idx);
+            }
+        }
     }
 }
 
@@ -3653,8 +3709,15 @@ fn relay_exact() -> bool {
 /// may be in what is fetched, as before.
 fn relay_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_RELAY_COPY") {
+        Some(v) => v != "0",
+        None => relay_exact(),
+    })
 }
+
+/// True once `victory-relay` has created its dedicated Copy Queue, after which
+/// `relay_card_back` never locks `QUEUE_ORDER` (ordering via `CardPlan::sent_as`).
+static COPY_QUEUE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Told when something joins [`LINE`], for the thread that lands flights
 /// ([`relay`]); [`LINE_MOVED`] stays the word for the thread that looks at
@@ -4492,9 +4555,15 @@ fn land() {
         let n = line.landed.len().saturating_sub(lag);
         line.landed.drain(..n).collect()
     };
-    for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+    if !landed.is_empty() {
+        crate::list::recycle_many(landed);
     }
+}
+
+/// Reclaims any fence-completed flights past `land_lag` so `list::fresh_list`
+/// can refill the idle pool before allocating a new command allocator.
+pub(crate) fn reclaim_landed() {
+    land();
 }
 
 fn fence_reached(completed: u64, target: u64) -> bool {
@@ -5669,7 +5738,10 @@ impl Host {
                 .collect()
         };
         // With the relay: the order of the queue is held from here until
-        // what is taken is on the queue, and the taking is numbered.
+        // what is taken is on the queue, and the taking is numbered. Once
+        // `victory-relay` is on its dedicated Copy Queue it orders via
+        // `CardPlan::sent_as` rather than `QUEUE_ORDER`, so drop the lock
+        // immediately after claiming `sent_as`.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         let sent_as = match order.as_mut() {
             Some(order) => {
@@ -5678,6 +5750,9 @@ impl Host {
             }
             None => 0,
         };
+        if COPY_QUEUE_ACTIVE.load(Ordering::Acquire) {
+            order = None;
+        }
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
@@ -6108,7 +6183,10 @@ impl Host {
             })()
         });
         let (list, queue) = match copying {
-            Some(Ok((list, queue))) => (list, Some(queue)),
+            Some(Ok((list, queue))) => {
+                COPY_QUEUE_ACTIVE.store(true, Ordering::Release);
+                (list, Some(queue))
+            }
             Some(Err(e)) => {
                 tracing::warn!(error = %e, "no copy queue: what shaders wrote to the card's memory is fetched on the drawing queue");
                 (self.make_prelude()?, None)
@@ -6694,7 +6772,7 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // Behind what the title's queues were given before it.
         crate::queue::before_sync();
-        let _ = self.submit(runs, &[], false, false);
+        let _ = self.submit(runs, &[], false, false, true);
     }
 
     /// Runs a closed internal upload-only host list synchronously without
@@ -6702,7 +6780,7 @@ impl Host {
     /// when invoked from `VICTORY_THIN=1` worker threads. Settles in-flight
     /// GPU work and waits for the upload list's fence before returning.
     pub(crate) fn execute_sync_internal(&self, list: &HostList) {
-        let _ = self.submit(&[list], &[], false, false);
+        let _ = self.submit(&[list], &[], false, false, true);
     }
 
     /// A queue's submission with [`late`]: the host lists `lists`, taken
@@ -6744,7 +6822,7 @@ impl Host {
     fn send_late(&self, mut lists: Vec<crate::list::Detached>, mut order: Vec<usize>, parts: &[usize]) {
         let sent = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
-            self.submit(&runs, parts, true, true)
+            self.submit(&runs, parts, true, true, true)
         };
         let Some((mut submitted, mut sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
@@ -6758,9 +6836,9 @@ impl Host {
         }
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
-        let most = {
+        let (most, wake_land) = {
             let mut line = line();
-            let Line { line: items, written, lists: flying, target, .. } = &mut *line;
+            let Line { line: items, written, lists: flying, target, landed, poke, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -6782,7 +6860,11 @@ impl Host {
                 dxr: sent.dxr,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
-            *flying >= late_most()
+            let wake_land = landed.len() > bury_lag() as usize;
+            if wake_land {
+                *poke = true;
+            }
+            (*flying >= late_most(), wake_land)
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
@@ -6799,18 +6881,30 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        if wake_land {
+            LINE_MOVED.notify_one();
+        }
     }
 
-    /// Sends `list`, a closed list of ours (the present's copy), as a
-    /// flight ([`late_free_present`]): not waited for, settled with the
-    /// others. The caller keeps the list and does not reset it before the
-    /// submission whose number comes back has finished ([`FINISHED`]); 0 if
-    /// it ran and was waited for after all.
+    /// Sends `list`, a closed list of ours, as a flight ([`late_free_present`]):
+    /// not waited for, settled with the others. The caller keeps the list and
+    /// does not reset it before the submission whose number comes back has
+    /// finished ([`FINISHED`]); 0 if it ran and was waited for after all.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn execute_own(&self, list: &HostList) -> u64 {
+        self.execute_own_inner(list, true)
+    }
+
+    /// Copy-only variant of [`Host::execute_own`] for swapchain present copies
+    /// that bind no title descriptor heaps, touch no buffer shadows, and record
+    /// no DXR ops.
+    fn execute_own_copy(&self, list: &HostList) -> u64 {
+        self.execute_own_inner(list, false)
+    }
+
+    fn execute_own_inner(&self, list: &HostList, needs_heaps: bool) -> u64 {
         late_threads();
-        let Some((submitted, sent)) = self.submit(&[list], &[], true, false) else {
+        let Some((submitted, sent)) = self.submit(&[list], &[], true, false, needs_heaps) else {
             return 0;
         };
         let number = sent.number;
@@ -7056,11 +7150,17 @@ impl Host {
         parts: &[usize],
         late: bool,
         take_ahead: bool,
+        needs_heaps: bool,
     ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        // Splice any asynchronous heap-pass refreshes before taking the submission
+        // lock so waiting on `victory-aside` never blocks other `submitted` callers.
+        for list in runs {
+            list.take_coming();
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
@@ -7086,10 +7186,6 @@ impl Host {
             (runs, parts)
         };
         submitting(1, runs.len());
-        // Splice any asynchronous heap-pass refreshes before scanning deferred steps.
-        for list in runs {
-            list.take_coming();
-        }
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -7126,11 +7222,11 @@ impl Host {
         // command lists that index those slots are submitted.
         // Renderer port #7: the round asked for when the title submitted it,
         // if that is known (`crate::port_journal`).
-        let heaps_on = crate::port_journal::on();
-        let heaps_synced = match crate::port_journal::needed() {
+        let heaps_on = needs_heaps && crate::port_journal::on();
+        let heaps_synced = needs_heaps.then(|| match crate::port_journal::needed() {
             0 => crate::descriptor::begin_sync_heaps(),
             mark => crate::descriptor::begin_sync_heaps_after(mark),
-        };
+        });
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -7155,10 +7251,10 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 5000 {
-            // With the present sent ahead nothing else brings a moment
-            // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
+            // `sweep()` uses refcounts and `retire()`/`bury_lag()` rather than
+            // requiring GPU idle; only drain flights when `upcheck::at_rest` is on.
             if upcheck::on() {
+                self.settle(&mut submitted, WHY_SYNC);
                 upcheck::at_rest(self);
             }
             sweep();
@@ -7350,27 +7446,63 @@ impl Host {
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
         #[cfg(feature = "diagnostics")]
+        {
+            PREP_PHASE_NS[6].fetch_add(p_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            p_t = std::time::Instant::now();
+        }
+        #[cfg(feature = "diagnostics")]
         split.part(3);
+        // Wait for placed-heap sync BEFORE `card_before` so `QUEUE_ORDER` is
+        // never held across `wait_heaps` even when Direct Queue fallback is used.
+        if let Some(heaps_synced) = heaps_synced {
+            stage.next("submit: waiting for the heaps' records");
+            let heaps_began = std::time::Instant::now();
+            drop(heaps_synced);
+            crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        }
+        // Publish slots for the heap worker's texture uploads after
+        // placed-heap sync completes and before `make_waiting` /
+        // `dxr::record_submission` / `ExecuteCommandLists`.
+        ahead_publish.publish();
+        if needs_heaps {
+            // The slots that waited for a texture's host copy, before the
+            // lists that may read them run.
+            crate::descriptor::make_waiting();
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            PREP_PHASE_NS[7].fetch_add(p_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            p_t = std::time::Instant::now();
+        }
         stage.next("submit: copies in the card's memory");
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
         let flown = late && relay();
-        if flown && self.card_results_low() {
+        if needs_heaps && flown && self.card_results_low() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
-        let picked = crate::picked::declare(runs);
-        for (shadow, at, len) in &picked.written {
-            shadow.writing(*at, *len);
-        }
+        let picked = if needs_heaps {
+            let picked = crate::picked::declare(runs);
+            for (shadow, at, len) in &picked.written {
+                shadow.writing(*at, *len);
+            }
+            picked
+        } else {
+            crate::picked::Ranges::default()
+        };
         let declared = std::mem::take(&mut batch.declared);
-        let (card, mut card_order) = match self.card_before(&declared, &picked, flown) {
-            Some((plan, order)) => (Some(plan), order),
-            None => (None, None),
+        let (card, mut card_order) = if needs_heaps {
+            match self.card_before(&declared, &picked, flown) {
+                Some((plan, order)) => (Some(plan), order),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
         };
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
@@ -7384,22 +7516,6 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(4);
-        stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
-        // Publish slots for the heap worker's texture uploads after
-        // placed-heap sync completes and before `make_waiting` /
-        // `dxr::record_submission` / `ExecuteCommandLists`.
-        ahead_publish.publish();
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
-        #[cfg(feature = "diagnostics")]
-        {
-            PREP_PHASE_NS[7].fetch_add(p_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            p_t = std::time::Instant::now();
-        }
         // Collect any async state preludes before DXR splicing / ExecuteCommandLists.
         prelude_batch.finish(&mut lists);
         #[cfg(feature = "diagnostics")]
@@ -7407,7 +7523,11 @@ impl Host {
         // Replay queued native DXR AS builds/copies/extractions (and initialize
         // any newly allocated empty TLAS slots from `heaps_synced`/`make_waiting`)
         // right after `card_before` uploads dirty buffers and before `ExecuteCommandLists`.
-        let dxr = crate::dxr::record_submission(self, runs, &mut lists, &mut firsts);
+        let dxr = if needs_heaps {
+            crate::dxr::record_submission(self, runs, &mut lists, &mut firsts)
+        } else {
+            None
+        };
         // Prepend `card_before`'s `sync` AFTER `dxr::record_submission` so `runs`
         // and `firsts` stay aligned during DXR splicing, while `sync` executes
         // FIRST ahead of `ahead_lists`, DXR ops, and title lists in one
@@ -8070,11 +8190,25 @@ impl HostList {
             return;
         };
         let found = coming.wait();
+        let inserted = found.len();
+        if inserted == 0 {
+            return;
+        }
         let mut deferred = self.deferred();
         let at = at.min(deferred.copies.len());
+        #[cfg(feature = "diagnostics")]
+        {
+            deferred.refresh_count += inserted as u64;
+            deferred.refresh_bytes += found.iter().map(|(_, from, to)| *to - *from).sum::<u64>();
+        }
         deferred
             .copies
             .splice(at..at, found.into_iter().map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)));
+        for idx in &mut deferred.non_refreshes {
+            if *idx >= at {
+                *idx += inserted;
+            }
+        }
     }
 
     /// Returns any prelude held by this finished list to the global pool (or
@@ -8119,6 +8253,69 @@ impl HostList {
             let left = std::mem::take(&mut args.1);
             let buffers = std::mem::take(&mut args.0);
             drop(args);
+            if left == 0 {
+                give_batch_buffers(buffers);
+            }
+        }
+        // SAFETY: the list is not executing.
+        let reset = unsafe {
+            self.allocator
+                .Reset()
+                .and_then(|()| self.list.Reset(&self.allocator, None))
+        };
+        if let Err(e) = reset {
+            fail(format_args!("a host command list did not reset ({e})"));
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Exclusive-access [`HostList::reset`]: skips per-field mutex locking via
+    /// `.get_mut()` when the caller owns `&mut HostList` (during list recycle or
+    /// title list reset).
+    pub(crate) fn reset_mut(&mut self) {
+        *self.epoch.get_mut() = next_epoch();
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let _resetting = crate::timeline::span("resetting a host list");
+        self._alive.used();
+        if let Some(prelude) = self.prelude.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            recycle_prelude(prelude);
+        }
+        *self.coming.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        self.deferred.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        self.states.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        self.twins.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.twins_writing.get_mut() = false;
+        self.aliases.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(pipelines) = std::sync::Arc::get_mut(&mut self.pipelines) {
+            pipelines.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        } else {
+            self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(indirects) = std::sync::Arc::get_mut(&mut self.indirects) {
+            indirects.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        } else {
+            self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(notes) = std::sync::Arc::get_mut(&mut self.notes) {
+            notes.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        } else {
+            self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        {
+            let scratch = self.scratch.get_mut().unwrap_or_else(|e| e.into_inner());
+            (scratch.current, scratch.used) = (0, 0);
+            if scratch_pool() {
+                give_chunks(std::mem::take(&mut scratch.chunks));
+            }
+        }
+        {
+            let args = self.batch_args.get_mut().unwrap_or_else(|e| e.into_inner());
+            let left = std::mem::take(&mut args.1);
+            let buffers = std::mem::take(&mut args.0);
             if left == 0 {
                 give_batch_buffers(buffers);
             }
@@ -8836,9 +9033,7 @@ impl HostList {
                 return;
             }
         }
-        deferred
-            .copies
-            .push(Step::Copy(dst as usize, src as usize, len));
+        deferred.push_step(Step::Copy(dst as usize, src as usize, len));
         deferred.title_written();
         self.changed_something();
     }
@@ -8848,7 +9043,7 @@ impl HostList {
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
         let src = Self::forward_fill_in(&deferred, src as usize, len);
-        deferred.copies.push(Step::Fill(dst as usize, src, len, None));
+        deferred.push_step(Step::Fill(dst as usize, src, len, None));
     }
 
     /// Renderer port RT: forwards a fill behind a same-list placed copy out of
@@ -8885,7 +9080,7 @@ impl HostList {
         let (gpu, to) = self.scratch(len)?;
         let mut deferred = self.deferred();
         let forwarded = Self::forward_fill_in(&deferred, src as usize, len as usize);
-        deferred.copies.push(Step::Fill(to as usize, forwarded, len as usize, None));
+        deferred.push_step(Step::Fill(to as usize, forwarded, len as usize, None));
         deferred.filled.insert(key, gpu);
         Some(gpu)
     }
@@ -8895,9 +9090,7 @@ impl HostList {
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
         let mut deferred = self.deferred();
         let src = Self::forward_fill_in(&deferred, src as usize, len);
-        deferred
-            .copies
-            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+        deferred.push_step(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
@@ -8906,7 +9099,7 @@ impl HostList {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
         let mut deferred = self.deferred();
         let src = Self::forward_fill_in(&deferred, src as usize, len);
-        deferred.copies.push(Step::Fill(dst as usize, src, len, to));
+        deferred.push_step(Step::Fill(dst as usize, src, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -8921,9 +9114,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+            deferred.push_refresh(shadow.clone(), address, len);
         }
     }
 
@@ -8941,7 +9132,7 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
-            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+            deferred.push_step(Step::GpuWrite(shadow.clone(), address, len));
         }
     }
 
@@ -9020,8 +9211,15 @@ impl HostList {
 
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
+    #[allow(dead_code)]
     pub(crate) fn scratch_kept(&self) -> u64 {
         let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        scratch.chunks.iter().map(|c| c.1).sum()
+    }
+
+    /// Exclusive-access [`HostList::scratch_kept`], skipping the scratch mutex.
+    pub(crate) fn scratch_kept_mut(&mut self) -> u64 {
+        let scratch = self.scratch.get_mut().unwrap_or_else(|e| e.into_inner());
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
@@ -9070,7 +9268,7 @@ impl HostList {
                     words.add(k).write_volatile(0);
                 }
             });
-            deferred.copies.push(Step::Host(notes, (0, 0)));
+            deferred.push_step(Step::Host(notes, (0, 0)));
             drop(deferred);
             if let Some(card) = card {
                 self.zero_card_budget(card);
@@ -9337,7 +9535,7 @@ impl HostList {
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.push_step(Step::Run(Box::new(work)));
         deferred.title_written();
         drop(deferred);
         self.changed_something();
@@ -9345,20 +9543,20 @@ impl HostList {
 
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
+        self.deferred().push_step(Step::Host(Box::new(work), (0, 0)));
     }
 
     /// As [`HostList::defer_host`], for work that reads `len` bytes of title
     /// memory at `from`.
     pub(crate) fn defer_host_read(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work), (from, from + len)));
+        self.deferred().push_step(Step::Host(Box::new(work), (from, from + len)));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted and records its upload on the prelude if changed, keeping
     /// both staging and host texture alive until the list is reset.
     pub(crate) fn defer_texture(&self, upload: crate::texture::PreludeUpload) {
-        self.deferred().copies.push(Step::Texture(upload));
+        self.deferred().push_step(Step::Texture(upload));
     }
 
     /// Detiles the textures the list uploads now, ahead of its submission
@@ -9389,7 +9587,7 @@ impl HostList {
         let destination = chunk.data;
         let mut deferred = self.deferred();
         deferred.plane_uploads.push((chunk, size));
-        deferred.copies.push(Step::Plane(read, Box::new(move || fill(destination))));
+        deferred.push_step(Step::Plane(read, Box::new(move || fill(destination))));
         Some(source)
     }
 
@@ -9419,7 +9617,47 @@ impl HostList {
         let wide_fills_on = wide_fills();
         let parallel_tex = parallel_refresh();
         let send_own = send::own();
-        for (i, step) in self.deferred().copies.iter().enumerate() {
+        let deferred = self.deferred();
+        let copies_slice = &deferred.copies;
+        let non_refreshes = &deferred.non_refreshes;
+        let mut nr_pos = 0usize;
+        let mut linear_pos = 0usize;
+        let mut using_fast = skip_front_refreshes && batch.front_intact;
+        #[cfg(feature = "diagnostics")]
+        let started_fast = using_fast;
+        loop {
+            let i = if using_fast {
+                if !batch.front_intact {
+                    using_fast = false;
+                    #[cfg(feature = "diagnostics")]
+                    for s in &copies_slice[..linear_pos] {
+                        if let Step::Refresh(_, _, len) = s {
+                            refreshes += 1;
+                            refreshed += *len as u64;
+                        }
+                    }
+                    continue;
+                }
+                let Some(&idx) = non_refreshes.get(nr_pos) else {
+                    #[cfg(feature = "diagnostics")]
+                    if started_fast {
+                        refreshes += deferred.refresh_count;
+                        refreshed += deferred.refresh_bytes;
+                    }
+                    break;
+                };
+                nr_pos += 1;
+                linear_pos = idx + 1;
+                idx
+            } else {
+                if linear_pos >= copies_slice.len() {
+                    break;
+                }
+                let idx = linear_pos;
+                linear_pos += 1;
+                idx
+            };
+            let step = &copies_slice[i];
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
@@ -9592,6 +9830,7 @@ impl HostList {
             us += started.elapsed();
             bytes += copied as u64;
         }
+        drop(deferred);
         if !batch.cpu_reads.is_empty() {
             crate::shadow::note_cpu_reads(&batch.cpu_reads);
             batch.cpu_reads.clear();
@@ -12598,7 +12837,7 @@ impl Host {
             copy.close();
             let flown = match slot {
                 Some(i) => {
-                    let flown = self.execute_own(copy);
+                    let flown = self.execute_own_copy(copy);
                     p.ahead[i].1 = flown;
                     flown
                 }

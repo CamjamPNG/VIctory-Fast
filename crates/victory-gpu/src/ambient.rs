@@ -339,13 +339,32 @@ void keep(uint3 at : SV_DispatchThreadID) {
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
+#endif
+
+#ifdef MEAN
+groupshared float3 gs_sum[64];
 [RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void mean() {
+[numthreads(64, 1, 1)]
+void mean(uint gi : SV_GroupIndex) {
     float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    for (uint i = gi; i < CELLS; i += 64) {
+        sum += cells[i].rgb;
+    }
+    gs_sum[gi] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 32) gs_sum[gi] += gs_sum[gi + 32];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 16) gs_sum[gi] += gs_sum[gi + 16];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 8) gs_sum[gi] += gs_sum[gi + 8];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 4) gs_sum[gi] += gs_sum[gi + 4];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi < 2) gs_sum[gi] += gs_sum[gi + 2];
+    GroupMemoryBarrierWithGroupSync();
+    if (gi != 0) return;
     float4 was = cells[CELLS];
-    float3 now = sum / CELLS;
+    float3 now = (gs_sum[0] + gs_sum[1]) / CELLS;
     // (`jump` > 0: a change of more than that factor either way is
     // followed at once, as a new room is.)
     float a = max(dot(now, LUMA), 1e-5), b = max(dot(was.rgb, LUMA), 1e-5);
@@ -368,35 +387,58 @@ void place(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef GATHER
+#define GATHER_TILE 64
+groupshared float4 gs_pos[GATHER_TILE];
+groupshared float3 gs_rad[GATHER_TILE];
 [RootSignature(RS)]
-[numthreads(8, 2, 1)]
-void gather(uint3 at : SV_DispatchThreadID) {
-    float2 size = float2(width, height);
-    float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
-    float r2 = 0.25 + 0.0025 * p.z * p.z;
+[numthreads(8, 8, 1)]
+void gather(uint3 at : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    bool in_bounds = at.x < PX && at.y < PY;
+    float3 p = 0;
+    float r2 = 0.25;
+    if (in_bounds) {
+        float2 size = float2(width, height);
+        p = seen(int2((float2(at.xy) + 0.5) * size / float2(PX, PY)), size);
+        r2 = 0.25 + 0.0025 * p.z * p.z;
+    }
     float whole = 0;
     float3 toward = 0, light = 0, red = 0, green = 0, blue = 0;
-    for (uint i = 0; i < CELLS; i++) {
-        float4 c = cells[CELLS + 1 + i];
-        float3 L = cells[i].rgb;
-        float3 d = c.xyz - p;
-        float dd = dot(d, d);
-        float w = c.w / (dd + r2);
-        float3 dir = d / sqrt(dd + 0.25 * r2);
-        whole += w;
-        toward += w * dir;
-        light += w * L;
-        red += w * L.r * dir;
-        green += w * L.g * dir;
-        blue += w * L.b * dir;
+    for (uint base = 0; base < CELLS; base += GATHER_TILE) {
+        uint idx = base + gi;
+        if (idx < CELLS) {
+            gs_pos[gi] = cells[CELLS + 1 + idx];
+            gs_rad[gi] = cells[idx].rgb;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (in_bounds) {
+            uint count = min((uint)GATHER_TILE, (uint)CELLS - base);
+            for (uint j = 0; j < count; j++) {
+                float4 c = gs_pos[j];
+                float3 L = gs_rad[j];
+                float3 d = c.xyz - p;
+                float dd = dot(d, d);
+                float w = c.w / (dd + r2);
+                float3 dir = d * rsqrt(dd + 0.25 * r2);
+                float3 wd = w * dir;
+                whole += w;
+                toward += wd;
+                light += w * L;
+                red += wd * L.r;
+                green += wd * L.g;
+                blue += wd * L.b;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
     }
+    if (!in_bounds) return;
     whole = max(whole, 1e-6);
-    light /= whole;
-    toward /= whole;
+    float inv_whole = 1.0 / whole;
+    light *= inv_whole;
+    toward *= inv_whole;
     uint at0 = (at.y * PX + at.x) * 3;
-    points[at0] = float4(red / whole - light.r * toward, light.r);
-    points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
-    points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+    points[at0] = float4(red * inv_whole - light.r * toward, light.r);
+    points[at0 + 1] = float4(green * inv_whole - light.g * toward, light.g);
+    points[at0 + 2] = float4(blue * inv_whole - light.b * toward, light.b);
 }
 #endif
 
@@ -549,8 +591,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
+const PX: u32 = 160;
+const PY: u32 = 90;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
-const POINT_BYTES: u64 = 160 * 90 * 48;
+const POINT_BYTES: u64 = PX as u64 * PY as u64 * 48;
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -587,7 +631,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         }
     };
     let keep = pipeline("KEEP", s!("keep"))?;
-    let mean = pipeline("KEEP", s!("mean"))?;
+    let mean = pipeline("MEAN", s!("mean"))?;
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
@@ -619,10 +663,22 @@ fn pass() -> Option<&'static Pass> {
     .as_ref()
 }
 
-fn uav_barrier(list: &ID3D12GraphicsCommandList) {
-    let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
-    // SAFETY: an open list; the barrier names no resource.
+fn uav_barrier(list: &ID3D12GraphicsCommandList, resource: Option<&ID3D12Resource>) {
+    let barrier = match resource {
+        Some(r) => crate::indirect::uav_barrier_for(r),
+        None => crate::indirect::uav_barrier(),
+    };
+    // SAFETY: an open list; `resource` (if any) is kept alive for the list.
     unsafe { list.ResourceBarrier(&[barrier]) };
+}
+
+fn uav_barrier_pair(list: &ID3D12GraphicsCommandList, a: &ID3D12Resource, b: &ID3D12Resource) {
+    let barriers = [
+        crate::indirect::uav_barrier_for(a),
+        crate::indirect::uav_barrier_for(b),
+    ];
+    // SAFETY: an open list; both resources are kept alive for the list.
+    unsafe { list.ResourceBarrier(&barriers) };
 }
 
 /// Whether the light of a frame has been kept: the estimate has something
@@ -700,37 +756,61 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     // program has just used both views, so their textures are in the states
     // these views need; buffers the list keeps.
     unsafe {
-        uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
         l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
-        let run = |pso: &ID3D12PipelineState, x, y, z| {
+        let dispatch = |name: &str, pso: &ID3D12PipelineState, x, y, z| {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("ambient {name} {x}x{y}x{z}"));
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = name;
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
-            uav_barrier(l);
         };
         match role {
             Role::Radiance => {
-                run(&pass.keep, 8, 9, 1);
-                run(&pass.mean, 1, 1, 1);
+                // Sync the title's radiance UAV write before `keep` reads it.
+                uav_barrier(l, None);
+                dispatch("keep", &pass.keep, 8, 9, 1);
+                uav_barrier(l, Some(&pass.cells));
+                dispatch("mean", &pass.mean, 1, 1, 1);
+                uav_barrier(l, Some(&pass.cells));
                 KEPT.store(true, Ordering::Relaxed);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Air => {
+                uav_barrier(l, None);
+                dispatch(
+                    "air",
+                    &pass.air,
+                    views.size[0].div_ceil(8),
+                    views.size[1].div_ceil(8),
+                    views.slices.div_ceil(2),
+                );
+            }
             Role::Reflect | Role::ReflectAlpha => {
-                run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                uav_barrier(l, None);
+                let name = if role == Role::Reflect { "reflect" } else { "reflect_alpha" };
+                dispatch(name, &pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9, 1);
-                    run(&pass.gather, 20, 45, 1);
+                    // `place` and `gather` read only `depth` (SRV) and internal buffers,
+                    // overlapping with the title's resolve UAV write until `raise`.
+                    uav_barrier(l, Some(&pass.cells));
+                    dispatch("place", &pass.place, 8, 9, 1);
+                    uav_barrier_pair(l, &pass.cells, &pass.points);
+                    dispatch("gather", &pass.gather, PX.div_ceil(8), PY.div_ceil(8), 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                // Flushes both the title's `light` UAV write and `gather`'s `points` write.
+                uav_barrier(l, None);
+                dispatch("raise", &pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }
+    list.mark_uav_dirty();
     true
 }
 

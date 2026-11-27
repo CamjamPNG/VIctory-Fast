@@ -1121,21 +1121,26 @@ fn coalesce_overlapping_pieces(pieces: &mut Vec<(usize, usize)>) {
     pieces.truncate(write + 1);
 }
 
-/// Opt-in thread count for parallel `GetWriteWatch` across disjoint groups in
+fn parse_watch_threads(raw: Option<&str>, _cpus: usize) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
+/// Thread count for parallel `GetWriteWatch` across disjoint groups in
 /// `ask_once` (`VICTORY_WATCH_THREADS=<N>`, default `1` / single-threaded).
 fn watch_threads() -> usize {
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THREADS.get_or_init(|| {
-        std::env::var("VICTORY_WATCH_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 8)
+        let raw = std::env::var("VICTORY_WATCH_THREADS").ok();
+        let cpus = std::thread::available_parallelism().map(usize::from).unwrap_or(4);
+        parse_watch_threads(raw.as_deref(), cpus)
     })
 }
 
 /// Dedicated lazy worker pool for `VICTORY_WATCH_THREADS >= 2`.
 struct WatchPool {
+    busy: Mutex<()>,
     state: Mutex<WatchPoolState>,
     more: Condvar,
     idle: Condvar,
@@ -1161,6 +1166,7 @@ impl WatchPool {
         static POOL: std::sync::OnceLock<&'static WatchPool> = std::sync::OnceLock::new();
         POOL.get_or_init(|| {
             let pool: &'static WatchPool = Box::leak(Box::new(WatchPool {
+                busy: Mutex::new(()),
                 state: Mutex::new(WatchPoolState {
                     work: None,
                     count: 0,
@@ -1221,7 +1227,9 @@ impl WatchPool {
             (0..count).for_each(f);
             return;
         }
-        // SAFETY: erased lifetime does not escape `each`, which waits for `running == 0`.
+        let _busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `_busy` serializes callers and `each` waits for `running == 0`
+        // before returning, so the erased lifetime never escapes.
         let work = WatchWork(unsafe {
             std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f)
         });
@@ -1270,9 +1278,24 @@ struct Reservation {
 
 static RESERVATIONS: RwLock<Vec<Reservation>> = RwLock::new(Vec::new());
 
+const DEFAULT_WATCH_GAP_KB: usize = 8 * 1024;
+const MAX_WATCH_GAP_KB: usize = 1024 * 1024;
+
+fn parse_watch_gap_pages(kb_raw: Option<&str>, mb_raw: Option<&str>) -> usize {
+    let kb = if let Some(kb) = kb_raw.and_then(|v| v.trim().parse::<usize>().ok()) {
+        kb.min(MAX_WATCH_GAP_KB)
+    } else if let Some(mb) = mb_raw.and_then(|v| v.trim().parse::<usize>().ok()) {
+        mb.min(1024) << 10
+    } else {
+        DEFAULT_WATCH_GAP_KB
+    };
+    (kb << 10) / PAGE
+}
+
 /// Maximum intra-reservation gap (in 64 KiB pages) bridged between ranges in
-/// the same confirmed `MEM_PRIVATE` reservation (`VICTORY_WATCH_GAP_MB=<MiB>`,
-/// default `8` MiB; `0`: only touching/overlapping ranges merge).
+/// the same confirmed `MEM_PRIVATE` reservation (`VICTORY_WATCH_GAP_KB=<KiB>`
+/// or `VICTORY_WATCH_GAP_MB=<MiB>`, default `8192` KiB / `8` MiB; `0`: only
+/// touching/overlapping ranges merge).
 fn watch_gap_pages() -> usize {
     #[cfg(test)]
     if let Some(pages) = WATCH_GAP_IN_TEST.get() {
@@ -1280,12 +1303,9 @@ fn watch_gap_pages() -> usize {
     }
     static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PAGES.get_or_init(|| {
-        let mb = std::env::var("VICTORY_WATCH_GAP_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(8)
-            .min(1024);
-        (mb << 20) / PAGE
+        let kb = std::env::var("VICTORY_WATCH_GAP_KB").ok();
+        let mb = std::env::var("VICTORY_WATCH_GAP_MB").ok();
+        parse_watch_gap_pages(kb.as_deref(), mb.as_deref())
     })
 }
 
@@ -7342,6 +7362,13 @@ mod port7_tests {
             (b_base, b_base + 4),
         ];
         pieces.sort_unstable();
+        // With an 8 MiB gap limit, pieces 19.5 MiB apart inside res_a stay split (3 groups).
+        super::WATCH_GAP_IN_TEST.set(Some((8 << 20) / PAGE));
+        let split_groups = super::group_pieces(&pieces, true);
+        assert_eq!(split_groups.len(), 3, "expected 3 groups under 8 MiB gap, got {split_groups:?}");
+
+        // With a >= 20 MiB gap limit, the two pieces inside res_a coalesce into ONE group while res_b stays separate.
+        super::WATCH_GAP_IN_TEST.set(Some((64 << 20) / PAGE));
         let groups = super::group_pieces(&pieces, true);
         // Must coalesce the two pieces inside res_a into ONE group, and keep res_b separate!
         assert_eq!(groups.len(), 2, "expected 2 groups (1 for res_a, 1 for res_b), got {groups:?}");
@@ -7379,6 +7406,7 @@ mod port7_tests {
         assert!(wa2.iter().any(|&(p, at)| p == a_base + RES_A_PAGES - 2 && at > before_a));
         assert!(wb.iter().any(|&(p, at)| p == b_base + 2 && at > before_b));
         super::ask_once_end();
+        super::WATCH_GAP_IN_TEST.set(None);
 
         super::title_memory_freed(res_a, RES_A_PAGES * PAGE);
         super::title_memory_freed(res_b, RES_B_PAGES * PAGE);
@@ -7444,5 +7472,20 @@ mod port7_tests {
         super::title_memory_freed(at, PAGES * PAGE);
         // SAFETY: reservation allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn watch_threads_and_gap_parsing_honor_defaults_and_overrides() {
+        assert_eq!(super::parse_watch_threads(None, 16), 1);
+        assert_eq!(super::parse_watch_threads(None, 2), 1);
+        assert_eq!(super::parse_watch_threads(Some("4"), 16), 4);
+        assert_eq!(super::parse_watch_threads(Some("0"), 16), 1);
+        assert_eq!(super::parse_watch_threads(Some("12"), 16), 8);
+
+        assert_eq!(super::parse_watch_gap_pages(None, None), (8 << 20) / PAGE);
+        assert_eq!(super::parse_watch_gap_pages(Some("2048"), Some("8")), (2 << 20) / PAGE);
+        assert_eq!(super::parse_watch_gap_pages(None, Some("2")), (2 << 20) / PAGE);
+        assert_eq!(super::parse_watch_gap_pages(Some("0"), None), 0);
+        assert_eq!(super::parse_watch_gap_pages(Some("999999999"), None), (1024 << 20) / PAGE);
     }
 }

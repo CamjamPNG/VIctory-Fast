@@ -285,7 +285,7 @@ fn pools() -> bool {
 /// after its reset, or a new one.
 #[cfg(windows)]
 pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
-    let idle = {
+    let take_idle = || {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
         if let Some(Idle(_, bytes)) = &taken {
@@ -294,9 +294,147 @@ pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
         }
         taken
     };
-    match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+    if let Some(Idle(list, _)) = take_idle() {
+        return Some(list);
+    }
+    // Reclaim any landed flights past `land_lag` before allocating a new
+    // command allocator, since `Host::send_late` no longer calls `land()` inline.
+    crate::host::reclaim_landed();
+    if let Some(Idle(list, _)) = take_idle() {
+        return Some(list);
+    }
+    crate::host::host().and_then(|h| h.new_list().ok())
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct RecycleState {
+    queue: std::collections::VecDeque<Idle>,
+    done: Vec<Idle>,
+    pending: usize,
+}
+
+#[cfg(windows)]
+struct RecyclePool {
+    turn: std::sync::Mutex<()>,
+    state: std::sync::Mutex<RecycleState>,
+    work_cv: std::sync::Condvar,
+    done_cv: std::sync::Condvar,
+}
+
+#[cfg(windows)]
+impl RecyclePool {
+    fn get() -> &'static Self {
+        static POOL: std::sync::OnceLock<&'static RecyclePool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            let pool: &'static RecyclePool = Box::leak(Box::new(RecyclePool {
+                turn: std::sync::Mutex::new(()),
+                state: std::sync::Mutex::new(RecycleState::default()),
+                work_cv: std::sync::Condvar::new(),
+                done_cv: std::sync::Condvar::new(),
+            }));
+            let workers = 2usize;
+            for i in 1..workers {
+                let _ = std::thread::Builder::new()
+                    .name(format!("victory-recycle-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let mut item = {
+                                let mut s = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                                while s.queue.is_empty() {
+                                    s = pool.work_cv.wait(s).unwrap_or_else(|e| e.into_inner());
+                                }
+                                s.queue.pop_front().unwrap()
+                            };
+                            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                item.0.reset_mut();
+                                item.1 = item.0.scratch_kept_mut();
+                            }))
+                            .is_ok();
+                            let ready = ok.then_some(item);
+                            let mut s = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(item) = ready {
+                                s.done.push(item);
+                            }
+                            s.pending -= 1;
+                            if s.pending == 0 {
+                                pool.done_cv.notify_one();
+                            }
+                        }
+                    });
+            }
+            pool
+        })
+    }
+
+    fn reset_all(&self, items: Vec<Idle>) -> Vec<Idle> {
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        let count = items.len();
+        {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.queue.extend(items);
+            s.done.reserve(count);
+            s.pending = count;
+        }
+        self.work_cv.notify_all();
+        loop {
+            let item = {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                s.queue.pop_front()
+            };
+            let Some(mut item) = item else {
+                break;
+            };
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                item.0.reset_mut();
+                item.1 = item.0.scratch_kept_mut();
+            }))
+            .is_ok();
+            let ready = ok.then_some(item);
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(item) = ready {
+                s.done.push(item);
+            }
+            s.pending -= 1;
+        }
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        while s.pending > 0 {
+            s = self.done_cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+        std::mem::take(&mut s.done)
+    }
+}
+
+#[cfg(windows)]
+fn recycle_collected(mut to_reset: Vec<Idle>, cap: usize) {
+    if !to_reset.is_empty() {
+        const PARALLEL_MIN: usize = 8;
+        let reset = if to_reset.len() >= PARALLEL_MIN {
+            RecyclePool::get().reset_all(to_reset)
+        } else {
+            for Idle(host, bytes) in &mut to_reset {
+                host.reset_mut();
+                *bytes = host.scratch_kept_mut();
+            }
+            to_reset
+        };
+        let mut excess = Vec::new();
+        {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            for item in reset {
+                if idle.0.len() < cap && idle.1 + item.1 <= IDLE_BYTES_MOST {
+                    idle.1 += item.1;
+                    idle.0.push(item);
+                } else {
+                    excess.push(item);
+                }
+            }
+            IDLE_COUNT.store(idle.0.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(excess);
+    }
+    if IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) > cap as u64 {
+        trim_idle();
     }
 }
 
@@ -310,38 +448,45 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         return;
     }
     let cap = crate::host::current_allocator_caps().0;
+    let mut to_reset = Vec::new();
+    let mut current_idle = IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize;
     for (i, Detached { host, _uploads, tables }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(tables);
         drop(_uploads);
-        if !ran.contains(&i)
-            || cap == 0
-            || IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) >= cap as u64
-        {
+        if !ran.contains(&i) || cap == 0 || current_idle >= cap {
             host.release_prelude();
             continue;
         }
-        // As the title's reset does: what the list kept for its commands
-        // goes (including returning its prelude to the prelude pool), its
-        // allocator stays for reuse.
-        host.reset();
-        let bytes = host.scratch_kept();
-        let excess = {
-            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-            if idle.0.len() < cap && idle.1 + bytes <= IDLE_BYTES_MOST {
-                idle.0.push(Idle(host, bytes));
-                idle.1 += bytes;
-                IDLE_COUNT.store(idle.0.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                None
-            } else {
-                Some(host)
+        current_idle += 1;
+        to_reset.push(Idle(host, 0));
+    }
+    recycle_collected(to_reset, cap);
+}
+
+/// Batch variant of [`recycle`] for `host::land`: combines multiple settled
+/// flights into one parallel reset wave and a single `IDLE` lock push.
+#[cfg(windows)]
+pub(crate) fn recycle_many(batches: Vec<(Vec<Detached>, Vec<usize>)>) {
+    if !pools() {
+        return;
+    }
+    let cap = crate::host::current_allocator_caps().0;
+    let mut to_reset = Vec::new();
+    let mut current_idle = IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    for (lists, ran) in batches {
+        for (i, Detached { host, _uploads, tables }) in lists.into_iter().enumerate() {
+            drop(tables);
+            drop(_uploads);
+            if !ran.contains(&i) || cap == 0 || current_idle >= cap {
+                host.release_prelude();
+                continue;
             }
-        };
-        drop(excess);
+            current_idle += 1;
+            to_reset.push(Idle(host, 0));
+        }
     }
-    if IDLE_COUNT.load(std::sync::atomic::Ordering::Relaxed) > cap as u64 {
-        trim_idle();
-    }
+    recycle_collected(to_reset, cap);
 }
 
 /// A wait for a memory value recorded into list `this`, with waits cut
@@ -731,8 +876,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
-        if let Some(host) = list.host.as_ref() {
-            host.reset();
+        if let Some(host) = list.host.as_mut() {
+            host.reset_mut();
         } else if !list.is_thin {
             list.host = fresh_list();
         }

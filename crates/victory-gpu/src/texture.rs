@@ -2824,6 +2824,7 @@ mod prelude_upload_tests {
     }
 
     #[test]
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn gpu_detile_end_to_end_and_partial_mip_upload_match_cpu() {
         use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
         use windows::Win32::Graphics::Direct3D12::*;

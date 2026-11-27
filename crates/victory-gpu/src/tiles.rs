@@ -2235,6 +2235,7 @@ void look() {
     }
 
     #[test]
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn card_wrote_failure_does_not_poison_card_mask() {
         let Some(host) = host() else {
             return;

@@ -371,6 +371,7 @@ mod tests {
     /// them, and what waits for them is called then; a second asking finds the
     /// first on its way, and a later one is the list's.
     #[test]
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn a_placed_texture_is_filled_ahead_of_the_lists() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let Some(host) = crate::host::host() else { return };
@@ -448,6 +449,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn drain_waits_until_then_callbacks_have_run() {
         use std::sync::atomic::AtomicBool;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};

@@ -29,5 +29,10 @@ jobs:
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
+      # This step asserts compile, clippy and every test that can run without a
+      # GPU. The nine adapter-dependent victory-gpu tests are marked
+      # `#[ignore = "needs a D3D12 adapter"]`, because a GitHub runner loses its
+      # virtual device mid-run (HRESULT 0x887A0005) and they cannot pass here.
+      # They are run by the owner: `cargo test -p victory-gpu -- --ignored`.
       - name: Tests
         run: cargo test --workspace --locked

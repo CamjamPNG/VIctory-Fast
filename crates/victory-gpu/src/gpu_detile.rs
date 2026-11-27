@@ -1122,6 +1122,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn gpu_detile_batched_prelude_layout_and_zero_subresources() {
         let Some(host) = host() else {
             return;

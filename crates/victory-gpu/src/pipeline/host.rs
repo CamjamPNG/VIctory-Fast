@@ -446,6 +446,9 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    /// Precomputed per-root-table spans across `stages`: `(root slot, max slots
+    /// among stages with a CBV in that table, max slots among all stages)`.
+    pub(crate) stage_spans: Vec<(u8, u32, u32)>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -703,12 +706,14 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let stage_spans = crate::draw::stage_spans(&bound);
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
                 root,
                 stages: bound,
+                stage_spans,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -758,12 +763,14 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
+            let stage_spans = crate::draw::stage_spans(&bound);
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
                 root,
                 stages: bound,
+                stage_spans,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -876,12 +883,14 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        let stage_spans = crate::draw::stage_spans(&bound);
         Some(HostPipeline {
             compute: false,
             mesh: false,
             pso,
             root,
             stages: bound,
+            stage_spans,
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),

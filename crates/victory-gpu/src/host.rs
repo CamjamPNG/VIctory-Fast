@@ -4057,7 +4057,10 @@ fn joins_asked() -> (usize, usize) {
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+    if next
+        .iter()
+        .any(|l| l.has_coming() || l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_))))
+    {
         return false;
     }
     let ahead: Vec<&HostList> = ahead.collect();
@@ -6723,6 +6726,10 @@ impl Host {
             (runs, parts)
         };
         submitting(1, runs.len());
+        // Splice any asynchronous heap-pass refreshes before scanning deferred steps.
+        for list in runs {
+            list.take_coming();
+        }
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -7675,7 +7682,6 @@ impl HostList {
         }
         self.batches_common();
         self.card_budget_out();
-        self.take_coming();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -7700,6 +7706,11 @@ impl HostList {
         let at = self.deferred().copies.len();
         let coming = aside::begin(work);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((at, coming));
+    }
+
+    /// Whether asynchronous refreshes are still pending for this list.
+    fn has_coming(&self) -> bool {
+        self.coming.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
     /// The refreshes that were still to come are put among the steps.

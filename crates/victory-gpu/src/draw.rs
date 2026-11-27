@@ -1123,7 +1123,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
                 return (picked_on && *prev_uav).then_some(SlotUpdate::KeepUav);
             }
         }
-        let Some(view) = host.mirror(index, handle, true) else {
+        let Some(view) = host.mirror_heap_pass(index, handle) else {
             return cached.get(index).is_some().then_some(SlotUpdate::Set(None));
         };
         // The copy the slot shows (`buffer_copy`), not the one the
@@ -1599,11 +1599,7 @@ impl State {
             // (`root_uav`, `root_srv_table`).
             // shortcut: found again here, not taken from the list's slot.
             return match self.roots_ref(compute).get(usize::from(slot)) {
-                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| {
-                    // SAFETY: a live buffer.
-                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                    ((s.gpu(address) - base) & 15) as u32
-                }),
+                Some(&Root::View(address)) => crate::shadow::find(address, 1).map_or(0, |s| (s.offset(address) & 15) as u32),
                 _ => 0,
             };
         }
@@ -1891,7 +1887,7 @@ impl State {
         // With `table_stages`: what the stages of this draw read of each
         // table, and the tables its earlier stages made afresh (address,
         // slots).
-        let spans = if table_stages() { stage_spans(p) } else { Vec::new() };
+        let spans: &[(u8, u32, u32)] = if table_stages() { &p.stage_spans } else { &[] };
         let mut staged: Vec<(u64, u32)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
@@ -1899,7 +1895,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.tables, &t.host.half_views, compute, &spans, &mut staged);
+            let made = self.tables(list, &t.tables, &t.host.half_views, compute, spans, &mut staged);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -2155,9 +2151,7 @@ impl State {
             };
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
-            // SAFETY: a live buffer.
-            let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-            let gpu = base + ((s.gpu(a) - base) & !15);
+            let gpu = s.gpu(a) - (s.offset(a) & 15);
             // SAFETY: an open list; the address is in a live buffer.
             unsafe {
                 if compute {
@@ -2191,9 +2185,7 @@ impl State {
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
-                    // SAFETY: a live buffer.
-                    let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                    let offset = s.gpu(*a) - base;
+                    let offset = s.offset(*a);
                     // Raw views start on 16 bytes: from the 16 bytes
                     // below, and the shader adds the rest to its offsets
                     // (`victory_shader::emit::USER_VIEW_BIAS`). (An address
@@ -2270,9 +2262,7 @@ impl State {
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
                     Some((a, s)) => {
-                        // SAFETY: a live buffer.
-                        let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                        let offset = s.gpu(*a) - base;
+                        let offset = s.offset(*a);
                         if biased {
                             // From the 16 bytes below; the shader adds the
                             // rest (`victory_shader::emit::USER_VIEW_BIAS`).
@@ -5710,11 +5700,11 @@ fn table_stages() -> bool {
     }
 }
 
-/// Per root table the stages of `p` read: `(root parameter, max slots among
-/// stages with a CBV in that table, max slots among all stages)`.
-fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
+/// Precomputes per-root-table spans across a pipeline's stages:
+/// `(root slot, max slots among stages with a CBV in that table, max slots among all stages)`.
+pub(crate) fn stage_spans(stages: &[crate::pipeline::host::Stage]) -> Vec<(u8, u32, u32)> {
     let mut spans: Vec<(u8, u32, u32)> = Vec::new();
-    for stage in &p.stages {
+    for stage in stages {
         for group in &stage.translated().tables.groups {
             let n = group.max_dword / 8 + 1;
             let with = if group.has_cbv { n } else { 0 };

@@ -1332,10 +1332,19 @@ mod tests {
 
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
+    ///
+    /// Ignored with [`depth_bounds_pipeline_loads_and_filters_draws`] and the
+    /// other tests that make a pipeline: a runner has no adapter to make one
+    /// on that stays. What it proves is that the library answers a second
+    /// `mesh_pipeline` of the same description, which is the whole point of
+    /// it, so it wants a machine with a GPU:
+    /// `cargo test -p victory-gpu -- --ignored`.
+    #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     #[test]
     fn a_mesh_pipeline_loads_from_the_library() {
         let Some(host) = host() else {
-            return; // no host GPU here
+            eprintln!("no host GPU here; skipped");
+            return;
         };
         if !host.mesh_shaders() {
             eprintln!("no host mesh shader support; skipped");

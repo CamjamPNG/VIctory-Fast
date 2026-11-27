@@ -642,6 +642,16 @@ mod tests {
                     for i in (0..len).step_by(step) {
                         now[i] ^= 0x5A;
                     }
+                    // The dwords a difference falls in, once: the scan below
+                    // asks it of each byte it reads, and asking every byte of
+                    // the region for each was a len² pass (16 million steps of
+                    // it at 4 KiB, in a debug build).
+                    let mut apart = vec![false; (at + len).div_ceil(4) + 1];
+                    for (i, (&a, &b)) in was.iter().zip(&now).enumerate() {
+                        if a != b {
+                            apart[(at + i) / 4] = true;
+                        }
+                    }
                     // Other threads changed everything meanwhile.
                     // SAFETY: inside the allocation.
                     unsafe {
@@ -651,9 +661,10 @@ mod tests {
                         let base = pages.0.addr();
                         for (k, &byte) in there.iter().enumerate() {
                             let expect = if (at..at + len).contains(&k) {
-                                let dword = (base + k) / 4;
-                                let changed = (0..len).any(|i| now[i] != was[i] && (base + at + i) / 4 == dword);
-                                if changed { now[k - at] } else { 0xC3 }
+                                // (The allocation is page-aligned: a dword's
+                                // number in it is its number from `0`.)
+                                debug_assert_eq!((base + k) / 4 - base / 4, k / 4);
+                                if apart[k / 4] { now[k - at] } else { 0xC3 }
                             } else {
                                 0xC3
                             };

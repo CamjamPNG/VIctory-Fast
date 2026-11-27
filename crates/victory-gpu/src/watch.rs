@@ -2523,10 +2523,27 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
 
 /// The guards, alone.
 fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
-    if let Ok(g) = GUARDS.try_write() {
-        return g;
-    }
-    waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner()))
+    let g = match GUARDS.try_write() {
+        Ok(g) => g,
+        Err(_) => waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner())),
+    };
+    #[cfg(test)]
+    ALONE.with(|taken| taken.set(taken.get() + 1));
+    g
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread took [`GUARDS`] alone. Counted rather than
+    /// compared by how long a caller waited: `try_write` first, so a wait
+    /// says nothing about whether the lock was wanted.
+    static ALONE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`ALONE`], this thread's.
+#[cfg(test)]
+fn taken_alone() -> u64 {
+    ALONE.with(std::cell::Cell::get)
 }
 
 /// The guards, shared (renderer port #6): what changes a block's state holds
@@ -3600,6 +3617,11 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
+///
+/// Taken before [`GUARDS`], never after it: held alone, the runtime asks the
+/// guards (shared, and alone for what is guarded). A caller that holds the
+/// guards and then asks for this one deadlocks against any other thread that
+/// is changing a mapping, and does it only under the scheduler's timing.
 ///
 /// The runtime does not change a mapping in one step. To unmap one page of
 /// a view it unmaps the whole view and maps what stays again
@@ -6139,9 +6161,15 @@ mod port7_tests {
     #[test]
     fn cold_unmap_and_remap_fast_path_avoid_exclusive_guards_lock() {
         let cold = 0x3000_0000_0000usize;
-        // Hold GUARDS shared while unmapping and remapping an unwatched range:
-        // if either tried to take GUARDS exclusively, this would deadlock.
-        let _shared = super::guards_shared();
+        // Unmapping and remapping an unwatched range reads the guards'
+        // lock shared and never takes it alone, which is counted here
+        // rather than shown by holding it shared across the change of
+        // mapping. Holding it there is this file's two locks the wrong way
+        // round: [`MAPPING`] is taken, then [`GUARDS`]. Held the other way,
+        // this test deadlocks against any thread that is changing a
+        // mapping (the view tests beside it are), and the whole binary
+        // stops with nothing said — which is what CI did for an hour.
+        let before = super::taken_alone();
         {
             let _remapping = super::title_memory_remapping();
             super::title_memory_unmapping(cold, 4 * PAGE);
@@ -6151,6 +6179,7 @@ mod port7_tests {
             super::title_memory_remapped(cold, 4 * PAGE);
         }
         assert!(!super::is_changing(cold / BLOCK));
+        assert_eq!(super::taken_alone(), before, "the cold range took the guards' lock alone");
     }
 
     #[test]

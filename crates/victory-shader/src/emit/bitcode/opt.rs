@@ -64,10 +64,9 @@ pub const WIDE: u32 = 64;
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// The passes that run when nothing says which: all passes including bit-exact
+/// [`WIDE`] loads (`127`; `VICTORY_SHADER_OPT=63` restores the pre-wide default).
+pub const DEFAULT: u32 = ALL;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -79,6 +78,8 @@ pub(crate) struct Usage {
     pub rovs: bool,
     /// A 64-bit integer, as a result or an operand.
     pub int64: bool,
+    /// `dx.op.tertiary.i32(50)` (`Msad` / D3D11.1 shader extensions).
+    pub msad: bool,
     /// A typed load of several components from a UAV.
     pub typed_uav_loads: bool,
     /// A handle from the view heap.
@@ -213,9 +214,13 @@ pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
-        // A shader cannot write a constant buffer or resize a resource.
+        // A shader cannot write a constant buffer or resize a resource;
+        // `lower.rs` only emits `discard` at shader exit so `isHelperLane` is
+        // invariant across the entire shader body.
         Some(Attr::ReadOnly)
-            if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
+            if name.starts_with("cbufferLoadLegacy")
+                || name.starts_with("getDimensions")
+                || (super::super::rdna_fp16_opt_on() && name.starts_with("isHelperLane")) =>
         {
             Effect::Pure
         }
@@ -437,55 +442,414 @@ impl Module {
     /// For a float that is a number and not an infinity whatever the program
     /// reads: a power of two its magnitude does not pass.
     pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        self.bounded_ext(v, depth, true)
+    }
+
+    /// As [`Module::bounded`]; when `extended` is `false`, restricts analysis
+    /// to the original pre-N3 rules (`VICTORY_LEGACY_MUL_OPT=0`).
+    pub(crate) fn bounded_ext(&self, v: V, depth: u32, extended: bool) -> Option<f32> {
+        let mut budget = if extended { 128u32 } else { u32::MAX };
+        self.bounded_inner(v, depth, extended, &mut budget)
+    }
+
+    fn sign_bit_only(&self, v: V, depth: u32) -> bool {
+        if let Some((32, k)) = self.int_k(v) {
+            return k & 0x7FFF_FFFF == 0;
+        }
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        let V::Inst(i) = v else { return false };
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::And, a, b) => {
+                self.int_k(a).is_some_and(|(w, k)| w == 32 && k & 0x7FFF_FFFF == 0)
+                    || self.int_k(b).is_some_and(|(w, k)| w == 32 && k & 0x7FFF_FFFF == 0)
+            }
+            Op::Select(_, a, b) => {
+                self.sign_bit_only(a, depth) && self.sign_bit_only(b, depth)
+            }
+            _ => false,
+        }
+    }
+
+    /// Peels any `bitcast f32 <-> i32` roundtrips around a float value.
+    fn peel_float_bitcasts(&self, mut v: V) -> V {
+        for _ in 0..4 {
+            let V::Inst(i) = v else { break };
+            let Op::Cast(Cast::Bitcast, x) = self.insts[i as usize].op else {
+                break;
+            };
+            let V::Inst(j) = x else { break };
+            let Op::Cast(Cast::Bitcast, y) = self.insts[j as usize].op else {
+                break;
+            };
+            if self.type_of(y) != self.type_of(v) {
+                break;
+            }
+            v = y;
+        }
+        v
+    }
+
+    /// Bound on an `i32` value interpreted as IEEE-754 `f32` bits.
+    fn bounded_bits(&self, v: V, depth: u32, budget: &mut u32) -> Option<f32> {
+        if let Some((32, k)) = self.int_k(v) {
+            let f = f32::from_bits(k as u32);
+            return f.is_finite().then(|| f.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        if self.unit_floats.contains(&i) {
+            return Some(0.0);
+        }
+        *budget = budget.checked_sub(1)?;
+        let depth = depth.checked_sub(1)?;
+        match self.insts[i as usize].op {
+            Op::Cast(Cast::Bitcast, y)
+                if matches!(self.types[self.type_of(y).0 as usize], TypeDef::Float) =>
+            {
+                self.bounded_inner(y, depth, true, budget)
+            }
+            Op::Select(_, a, b) => {
+                Some(self.bounded_bits(a, depth, budget)?.max(self.bounded_bits(b, depth, budget)?))
+            }
+            Op::Bin(Bin::And, a, b) => {
+                let check = |mask_v: V, other: V, budget: &mut u32| -> Option<f32> {
+                    let (32, m) = self.int_k(mask_v)? else {
+                        return None;
+                    };
+                    let m = m as u32;
+                    if m == 0x7FFF_FFFF {
+                        return self.bounded_bits(other, depth, budget);
+                    }
+                    // If at least one exponent bit is cleared, the exponent can never reach 255.
+                    if m & 0x7F80_0000 != 0x7F80_0000 {
+                        let max_exp = ((m >> 23) & 0xFF) as i32 - 127 + 1;
+                        return Some(max_exp.max(-100) as f32);
+                    }
+                    None
+                };
+                check(b, a, budget).or_else(|| check(a, b, budget))
+            }
+            Op::Bin(Bin::Or | Bin::Xor, a, b) => {
+                if self.sign_bit_only(b, 3) {
+                    self.bounded_bits(a, depth, budget)
+                } else if self.sign_bit_only(a, 3) {
+                    self.bounded_bits(b, depth, budget)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn bounded_inner(&self, v: V, depth: u32, extended: bool, budget: &mut u32) -> Option<f32> {
         if let Some(k) = self.float_k(v) {
             return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
         }
         let V::Inst(i) = v else { return None };
+        if extended && self.unit_floats.contains(&i) {
+            return Some(0.0);
+        }
+        if extended {
+            *budget = budget.checked_sub(1)?;
+        }
         let depth = depth.checked_sub(1)?;
-        let of = |v: V| self.bounded(v, depth);
         // (A power that overflows, or might with rounding, is no bound.)
         let held = |b: f32| (b < 126.0).then_some(b);
         match &self.insts[i as usize].op {
-            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
-            Op::Cast(Cast::Bitcast, x) => match *x {
-                V::Inst(j) => match self.insts[j as usize].op {
-                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
-                    _ => None,
-                },
-                _ => None,
-            },
-            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
-            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
-            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Cast(Cast::UiToFp, x) => {
+                if extended
+                    && let V::Inst(j) = *x
+                    && let Op::Bin(Bin::And, a, b) = self.insts[j as usize].op
+                {
+                    let mask = self
+                        .int_k(b)
+                        .or_else(|| self.int_k(a))
+                        .filter(|&(w, _)| w == 32)
+                        .map(|(_, k)| k as u32);
+                    if let Some(m) = mask {
+                        return Some(if m == 0 {
+                            -100.0
+                        } else {
+                            (32 - m.leading_zeros()) as f32
+                        });
+                    }
+                }
+                Some(32.0)
+            }
+            Op::Cast(Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => {
+                if extended {
+                    self.bounded_bits(*x, depth, budget)
+                } else {
+                    match *x {
+                        V::Inst(j) => match self.insts[j as usize].op {
+                            Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => {
+                                self.bounded_inner(y, depth, extended, budget)
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+            }
+            Op::Bin(Bin::Mul, a, b) => {
+                let ba = self.bounded_inner(*a, depth, extended, budget)?;
+                let bb = self.bounded_inner(*b, depth, extended, budget)?;
+                held(ba + bb)
+            }
+            Op::Bin(Bin::Sub, a, b)
+                if extended && self.float_k(*a).is_some_and(|k| k == 0.0) =>
+            {
+                self.bounded_inner(*b, depth, extended, budget)
+            }
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => {
+                let ba = self.bounded_inner(*a, depth, extended, budget)?;
+                let bb = self.bounded_inner(*b, depth, extended, budget)?;
+                held(ba.max(bb) + 1.0)
+            }
+            Op::Select(_, a, b) => {
+                let ba = self.bounded_inner(*a, depth, extended, budget)?;
+                let bb = self.bounded_inner(*b, depth, extended, budget)?;
+                Some(ba.max(bb))
+            }
             Op::Call(_, args) => {
                 let (_, code) = self.int_k(*args.first()?)?;
                 match (code, &args[1..]) {
                     // Saturated, a fraction, a cosine or sine (of a number).
                     (7, [_]) => Some(0.0),
-                    (6, [x]) => of(*x),
-                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
-                    (26..=29, [x]) => held(of(*x)? + 1.0),
+                    (6, [x]) => self.bounded_inner(*x, depth, extended, budget),
+                    (22 | 12 | 13, [x]) => {
+                        self.bounded_inner(*x, depth, extended, budget).map(|_| 0.0)
+                    }
+                    (26..=29, [x]) => held(self.bounded_inner(*x, depth, extended, budget)? + 1.0),
                     // Of two numbers; or one of them the other way round: the
-                    // minimum (36) of a constant and a maximum of another.
-                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
-                        (Some(x), Some(y)) => Some(x.max(y)),
-                        _ => {
-                            let other = if code == 35 { 36 } else { 35 };
-                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
-                            let k = self.float_k(k).and_then(|_| of(k))?;
-                            let V::Inst(j) = inner else { return None };
-                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
-                            let (_, code) = self.int_k(*inner.first()?)?;
-                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
-                            (code == other).then_some(())?;
-                            Some(k.max(of(*low)?))
+                    // minimum (36) of a finite bound and a maximum (35) of another.
+                    (35 | 36, [a, b]) => {
+                        let ba = self.bounded_inner(*a, depth, extended, budget);
+                        let bb = self.bounded_inner(*b, depth, extended, budget);
+                        match (ba, bb) {
+                            (Some(x), Some(y)) => Some(x.max(y)),
+                            _ if extended => {
+                                let other = if code == 35 { 36 } else { 35 };
+                                let (inner, kb) = match (ba, bb) {
+                                    (None, Some(y)) => (*a, y),
+                                    (Some(x), None) => (*b, x),
+                                    _ => return None,
+                                };
+                                let inner = self.peel_float_bitcasts(inner);
+                                let V::Inst(j) = inner else { return None };
+                                let Op::Call(_, inner_args) = &self.insts[j as usize].op else {
+                                    return None;
+                                };
+                                let (_, inner_code) = self.int_k(*inner_args.first()?)?;
+                                (inner_code == other && inner_args.len() == 3).then_some(())?;
+                                let kl = self
+                                    .bounded_inner(inner_args[1], depth, extended, budget)
+                                    .or_else(|| {
+                                        self.bounded_inner(inner_args[2], depth, extended, budget)
+                                    })?;
+                                Some(kb.max(kl))
+                            }
+                            _ => {
+                                let other = if code == 35 { 36 } else { 35 };
+                                let (inner, k) =
+                                    if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                                let k = self
+                                    .float_k(k)
+                                    .and_then(|_| self.bounded_inner(k, depth, extended, budget))?;
+                                let V::Inst(j) = inner else { return None };
+                                let Op::Call(_, inner) = &self.insts[j as usize].op else {
+                                    return None;
+                                };
+                                let (_, code) = self.int_k(*inner.first()?)?;
+                                let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                                (code == other).then_some(())?;
+                                Some(k.max(self.bounded_inner(*low, depth, extended, budget)?))
+                            }
                         }
-                    },
-                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
+                    }
+                    (46, [a, b, c]) => {
+                        let ba = self.bounded_inner(*a, depth, extended, budget)?;
+                        let bb = self.bounded_inner(*b, depth, extended, budget)?;
+                        let bc = self.bounded_inner(*c, depth, extended, budget)?;
+                        held((ba + bb).max(bc) + 1.0)
+                    }
                     _ => None,
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Post-folding pass for AMD RDNA `rdna::LEGACY` zero-guards on
+    /// `v_mul_legacy_f32` and `v_mac/mad_legacy_f32`. Collapses the 5-op or
+    /// 2-op zero-guard to plain `Bin::Mul` / `FMad` whenever extended
+    /// [`Module::bounded`] proves no Inf/NaN can meet `0.0`, and narrows a
+    /// 5-op guard to a 2-op guard when one operand is now bounded.
+    pub(crate) fn elide_legacy_mul_guards(&mut self) -> bool {
+        let mut any_changed = false;
+        let is_dx_op = |m: &Module, f: u32, prefix: &str, args: &[V], want: u64| -> bool {
+            m.funcs[f as usize].name == prefix
+                && args.first().is_some_and(|&v| m.int_k(v) == Some((32, want)))
+        };
+        let fabs_arg = |m: &Module, v: V| -> Option<V> {
+            let V::Inst(i) = v else { return None };
+            let Op::Call(f, args) = &m.insts[i as usize].op else {
+                return None;
+            };
+            if m.funcs[*f as usize].name == "dx.op.unary.f32"
+                && args.len() == 2
+                && m.int_k(args[0]) == Some((32, 6))
+            {
+                Some(args[1])
+            } else {
+                None
+            }
+        };
+        let fmin_fabs_pair = |m: &Module, v: V| -> Option<(V, V)> {
+            let V::Inst(i) = v else { return None };
+            let Op::Call(f, args) = &m.insts[i as usize].op else {
+                return None;
+            };
+            if m.funcs[*f as usize].name == "dx.op.binary.f32"
+                && args.len() == 3
+                && m.int_k(args[0]) == Some((32, 36))
+            {
+                Some((fabs_arg(m, args[1])?, fabs_arg(m, args[2])?))
+            } else {
+                None
+            }
+        };
+        for _ in 0..3 {
+            let reached = self.reached();
+            let mut uses = vec![0u32; self.insts.len()];
+            for (b, blk) in self.blocks.iter().enumerate() {
+                if !reached[b] {
+                    continue;
+                }
+                for &i in blk.phis.iter().chain(&blk.body) {
+                    for_each_operand(&self.insts[i as usize].op, |v| {
+                        if let V::Inst(u) = v {
+                            uses[u as usize] = uses[u as usize].saturating_add(1);
+                        }
+                    });
+                }
+                if let Some(Term::CondBr(c, ..)) = blk.term
+                    && let V::Inst(u) = c
+                {
+                    uses[u as usize] = uses[u as usize].saturating_add(1);
+                }
+            }
+            let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
+            let mut narrow: Vec<(u32, V, V)> = Vec::new();
+            let mut round_changed = false;
+            for (b, blk) in self.blocks.iter().enumerate() {
+                if !reached[b] {
+                    continue;
+                }
+                for &i in &blk.body {
+                    let Op::Select(z, true_v, false_v) = self.insts[i as usize].op else {
+                        continue;
+                    };
+                    if !matches!(self.types[self.insts[i as usize].ty.0 as usize], TypeDef::Float) {
+                        continue;
+                    }
+                    let V::Inst(z_id) = z else { continue };
+                    let Op::Cmp(pred::OEQ, asked, z_zero) = self.insts[z_id as usize].op else {
+                        continue;
+                    };
+                    if self.float_k(z_zero) != Some(0.0) {
+                        continue;
+                    }
+                    let V::Inst(f_id) = false_v else { continue };
+                    let pair = match &self.insts[f_id as usize].op {
+                        // legacy_mul: Select(OEQ(asked, 0.0), 0.0, Mul(a, b))
+                        Op::Bin(Bin::Mul, a, b)
+                            if self.float_k(true_v).is_some_and(|k| k == 0.0) =>
+                        {
+                            Some((*a, *b))
+                        }
+                        // legacy_fmad: Select(OEQ(asked, 0.0), Add(0.0, c), FMad(a, b, c))
+                        Op::Call(f, args)
+                            if args.len() == 4
+                                && is_dx_op(self, *f, "dx.op.tertiary.f32", args, 46) =>
+                        {
+                            let (a, b, add_c) = (args[1], args[2], args[3]);
+                            let addend_ok = match true_v {
+                                V::Inst(t_id) => match self.insts[t_id as usize].op {
+                                    Op::Bin(Bin::Add, z1, c2) => {
+                                        self.float_k(z1).is_some_and(|k| k == 0.0) && c2 == add_c
+                                    }
+                                    _ => false,
+                                },
+                                _ => false,
+                            };
+                            addend_ok.then_some((a, b))
+                        }
+                        _ => None,
+                    };
+                    let Some((a, b)) = pair else { continue };
+                    let is_five_op = fmin_fabs_pair(self, asked)
+                        .is_some_and(|(x, y)| (x == a && y == b) || (x == b && y == a));
+                    let is_two_op = asked == a || asked == b;
+                    if !is_five_op && !is_two_op {
+                        continue;
+                    }
+                    let fa = self.bounded(a, 20).is_some();
+                    let fb = self.bounded(b, 20).is_some();
+                    let not_zero =
+                        |x: V| self.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite());
+                    if a == b || (fa && fb) || not_zero(a) || not_zero(b) {
+                        repl[i as usize] = Some(false_v);
+                        round_changed = true;
+                    } else if is_five_op && (fa ^ fb) && uses[z_id as usize] == 1 {
+                        narrow.push((z_id, if fa { a } else { b }, z_zero));
+                        round_changed = true;
+                    }
+                }
+            }
+            if !round_changed {
+                break;
+            }
+            any_changed = true;
+            for (z_id, op, z_zero) in narrow {
+                self.insts[z_id as usize].op = Op::Cmp(pred::OEQ, op, z_zero);
+            }
+            for blk in &mut self.blocks {
+                blk.body.retain(|&i| repl[i as usize].is_none());
+                if let Some(Term::CondBr(c, t, f)) = blk.term {
+                    blk.term = Some(Term::CondBr(resolve(&repl, c), t, f));
+                }
+            }
+            let (blocks, insts) = (&self.blocks, &mut self.insts);
+            for blk in blocks {
+                for &i in blk.phis.iter().chain(&blk.body) {
+                    map_operands(&mut insts[i as usize].op, |v| resolve(&repl, v));
+                }
+            }
+        }
+        any_changed
+    }
+
+    /// Whether an `i32` value is guaranteed even (bit 0 is 0).
+    pub(crate) fn is_even_i32(&self, v: V, depth: u32) -> bool {
+        if let Some((_, k)) = self.int_k(v) {
+            return k & 1 == 0;
+        }
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        let V::Inst(i) = v else { return false };
+        match self.insts[i as usize].op {
+            Op::Bin(Bin::Shl, _, sh) => self.int_k(sh).is_some_and(|(_, k)| k >= 1),
+            Op::Bin(Bin::And, a, b) | Op::Bin(Bin::Mul, a, b) => {
+                self.is_even_i32(a, depth) || self.is_even_i32(b, depth)
+            }
+            Op::Bin(Bin::Add | Bin::Sub | Bin::Or | Bin::Xor, a, b)
+            | Op::Select(_, a, b) => self.is_even_i32(a, depth) && self.is_even_i32(b, depth),
+            _ => false,
         }
     }
 
@@ -689,6 +1053,52 @@ impl Module {
                         }
                         None
                     }
+                    _ => None,
+                }
+            }
+            Op::Call(f, ref args)
+                if super::super::rdna_fp16_opt_on()
+                    && self.funcs[f as usize].name == "dx.op.binary.i32"
+                    && args.len() == 3 =>
+            {
+                let (op_v, a, b) = (args[0], args[1], args[2]);
+                let Some((32, op)) = self.int_k(op_v) else {
+                    return None;
+                };
+                if !(37..=40).contains(&op) {
+                    return None;
+                }
+                if a == b {
+                    return Some(a);
+                }
+                let ka = self.int_k(a).filter(|&(w, _)| w == 32).map(|(_, k)| k as u32);
+                let kb = self.int_k(b).filter(|&(w, _)| w == 32).map(|(_, k)| k as u32);
+                if let (Some(x), Some(y)) = (ka, kb) {
+                    let r = match op {
+                        37 => (x as i32).max(y as i32) as u32, // IMax
+                        38 => (x as i32).min(y as i32) as u32, // IMin
+                        39 => x.max(y),                        // UMax
+                        _ => x.min(y),                         // UMin
+                    };
+                    return Some(self.k(ty, 32, u64::from(r)));
+                }
+                match (op, ka, kb) {
+                    (37, Some(x), _) if x == i32::MIN as u32 => Some(b),
+                    (37, _, Some(y)) if y == i32::MIN as u32 => Some(a),
+                    (37, Some(x), _) if x == i32::MAX as u32 => Some(a),
+                    (37, _, Some(y)) if y == i32::MAX as u32 => Some(b),
+                    (38, Some(x), _) if x == i32::MAX as u32 => Some(b),
+                    (38, _, Some(y)) if y == i32::MAX as u32 => Some(a),
+                    (38, Some(x), _) if x == i32::MIN as u32 => Some(a),
+                    (38, _, Some(y)) if y == i32::MIN as u32 => Some(b),
+                    (39, Some(0), _) => Some(b),
+                    (39, _, Some(0)) => Some(a),
+                    (39, Some(u32::MAX), _) => Some(a),
+                    (39, _, Some(u32::MAX)) => Some(b),
+                    (40, Some(u32::MAX), _) => Some(b),
+                    (40, _, Some(u32::MAX)) => Some(a),
+                    (40, Some(0), _) => Some(a),
+                    (40, _, Some(0)) => Some(b),
                     _ => None,
                 }
             }
@@ -1111,6 +1521,10 @@ impl Module {
                     }
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
+                } else if name == "tertiary.i32"
+                    && args.first().is_some_and(|&op| self.int_k(op) == Some((32, 50)))
+                {
+                    u.msad = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
                         |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
@@ -2291,6 +2705,185 @@ mod tests {
             "identical state reads before proceed merge"
         );
         assert_ne!(s[0][1], s_before, "proceed invalidates cached state reads");
+        m.write();
+    }
+
+    #[test]
+    fn extended_bounded_and_post_fold_legacy_mul_elision() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i32t = m.int(32);
+        let f32t = m.float();
+        let u1_ty = m.func_ty(f32t, vec![i32t, f32t]);
+        let b2_ty = m.func_ty(f32t, vec![i32t, f32t, f32t]);
+        let rd_ty = m.func_ty(f32t, vec![i32t, i32t]);
+        let st_ty = m.func_ty(void, vec![f32t, f32t]);
+        let main_ty = m.func_ty(void, vec![]);
+        for ty in [u1_ty, b2_ty, rd_ty, st_ty, main_ty] {
+            m.ptr(ty);
+        }
+        let unary = m.function("dx.op.unary.f32", u1_ty, Some(Attr::ReadNone), false);
+        let binary = m.function("dx.op.binary.f32", b2_ty, Some(Attr::ReadNone), false);
+        let read = m.function("dx.op.loadInput.f32", rd_ty, Some(Attr::ReadNone), false);
+        let store = m.function("dx.op.bufferStore.f32", st_ty, Some(Attr::NoUnwind), false);
+        m.function("main", main_ty, None, true);
+
+        let entry = m.new_block();
+        let body_blk = m.new_block();
+        let (k0, k1, k6, k7, k35, k36) = (
+            m.i32(0),
+            m.i32(1),
+            m.i32(6),
+            m.i32(7),
+            m.i32(35),
+            m.i32(36),
+        );
+        let zero = m.f32(0);
+        let one = m.f32(1.0f32.to_bits());
+        let neg_two = m.f32((-2.0f32).to_bits());
+        let sign_bit = m.i32(0x8000_0000);
+        let c_true = m.bool(true);
+
+        // Unbounded input x, plus a norm_quotient-marked value through sign-bit Or + bitcast + Select.
+        let x = m.call(entry, read, vec![k0, k0]);
+        let y_unk = m.call(entry, read, vec![k0, k1]);
+        let norm_i = m.cast(entry, Cast::Bitcast, x, i32t);
+        m.mark_unit_float(norm_i);
+        let signed_i = m.bin(entry, Bin::Or, norm_i, sign_bit);
+        let one_i = m.i32(1.0f32.to_bits());
+        let sel_i = m.select(entry, c_true, signed_i, one_i);
+        let from_norm = m.cast(entry, Cast::Bitcast, sel_i, f32t);
+        assert!(m.bounded_ext(from_norm, 20, true).is_some());
+        assert!(m.bounded_ext(from_norm, 12, false).is_none());
+
+        // Clamped FMin(bitcast(bitcast(FMax(x, -2.0))), 1.0) and saturate(x).
+        let fmax = m.call(entry, binary, vec![k35, x, neg_two]);
+        let fmax_i = m.cast(entry, Cast::Bitcast, fmax, i32t);
+        let fmax_f = m.cast(entry, Cast::Bitcast, fmax_i, f32t);
+        let clamped = m.call(entry, binary, vec![k36, fmax_f, one]);
+        let sat = m.call(entry, unary, vec![k7, x]);
+        assert!(m.bounded_ext(clamped, 20, true).is_some());
+        assert!(m.bounded_ext(sat, 20, true).is_some());
+
+        // Pass `from_norm` through a 1-incoming phi so pre-fold `bounded()` misses it,
+        // then emit the full 5-op legacy_mul guard in `body_blk`.
+        m.terminate(entry, Term::Br(body_blk));
+        let phi_a = m.phi(body_blk, f32t);
+        let phi_b = m.phi(body_blk, f32t);
+        m.set_phi(phi_a, vec![(from_norm, entry)]);
+        m.set_phi(phi_b, vec![(clamped, entry)]);
+
+        // Guard 1: both operands become bounded after phi folding -> collapses to plain Mul!
+        let prod1 = m.bin(body_blk, Bin::Mul, phi_a, phi_b);
+        let abs1a = m.call(body_blk, unary, vec![k6, phi_a]);
+        let abs1b = m.call(body_blk, unary, vec![k6, phi_b]);
+        let fmin1 = m.call(body_blk, binary, vec![k36, abs1a, abs1b]);
+        let cmp1 = m.cmp(body_blk, pred::OEQ, fmin1, zero);
+        let guard1 = m.select(body_blk, cmp1, zero, prod1);
+
+        // Guard 2: one operand becomes bounded (phi_a), one stays unknown (y_unk) -> narrows to 2-op!
+        let prod2 = m.bin(body_blk, Bin::Mul, phi_a, y_unk);
+        let abs2a = m.call(body_blk, unary, vec![k6, phi_a]);
+        let abs2b = m.call(body_blk, unary, vec![k6, y_unk]);
+        let fmin2 = m.call(body_blk, binary, vec![k36, abs2a, abs2b]);
+        let cmp2 = m.cmp(body_blk, pred::OEQ, fmin2, zero);
+        let guard2 = m.select(body_blk, cmp2, zero, prod2);
+
+        m.call(body_blk, store, vec![guard1, guard2]);
+        m.terminate(body_blk, Term::Ret);
+
+        m.optimise(MODULE);
+        assert!(m.elide_legacy_mul_guards(), "post-fold pass must simplify both guards");
+        m.optimise(MODULE);
+
+        let st = stores(&m, body_blk);
+        // Guard 1 collapsed directly to Mul(from_norm, clamped).
+        let V::Inst(g1) = st[0][0] else { panic!() };
+        assert!(
+            matches!(m.insts[g1 as usize].op, Op::Bin(Bin::Mul, _, _)),
+            "guard1 must collapse to plain Bin::Mul, got {:?}",
+            m.insts[g1 as usize].op
+        );
+        // Guard 2 narrowed its Cmp to OEQ(from_norm, 0.0) without FAbs/FMin.
+        let V::Inst(g2) = st[0][1] else { panic!() };
+        let Op::Select(V::Inst(c2), _, _) = m.insts[g2 as usize].op else {
+            panic!("guard2 should remain a 2-op select");
+        };
+        assert!(
+            matches!(m.insts[c2 as usize].op, Op::Cmp(pred::OEQ, op, _) if op != fmin2),
+            "guard2 cmp must narrow away FMin(FAbs, FAbs), got {:?}",
+            m.insts[c2 as usize].op
+        );
+        // No FAbs calls should remain in body_blk.
+        let has_fabs = m.blocks[body_blk].body.iter().any(|&i| {
+            matches!(&m.insts[i as usize].op, Op::Call(f, args) if m.funcs[*f as usize].name == "dx.op.unary.f32" && m.int_k(args[0]) == Some((32, 6)))
+        });
+        assert!(!has_fabs, "all FAbs calls in body_blk should be dead and removed");
+        m.write();
+    }
+
+    #[test]
+    fn binary_i32_minmax_folds_and_is_helper_lane_is_pure() {
+        let mut m = Module::default();
+        let void = m.void();
+        let i1t = m.int(1);
+        let i32t = m.int(32);
+        let b2_ty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+        let rd_ty = m.func_ty(i32t, vec![i32t, i32t]);
+        let hl_ty = m.func_ty(i1t, vec![i32t]);
+        let st_ty = m.func_ty(void, vec![i32t, i32t]);
+        let main_ty = m.func_ty(void, vec![]);
+        for ty in [b2_ty, rd_ty, hl_ty, st_ty, main_ty] {
+            m.ptr(ty);
+        }
+        let binary = m.function("dx.op.binary.i32", b2_ty, Some(Attr::ReadNone), false);
+        let read = m.function("dx.op.bufferLoad.i32", rd_ty, Some(Attr::ReadOnly), false);
+        let helper = m.function("dx.op.isHelperLane.i1", hl_ty, Some(Attr::ReadOnly), false);
+        let store = m.function("dx.op.bufferStore.i32", st_ty, Some(Attr::NoUnwind), false);
+        m.function("main", main_ty, None, true);
+
+        let b = m.new_block();
+        let (k37, k38, k39, k40) = (m.i32(37), m.i32(38), m.i32(39), m.i32(40));
+        let (k0, k5, k10, k221) = (m.i32(0), m.i32(5), m.i32(10), m.i32(221));
+        let neg1 = m.i32(u32::MAX);
+        let x = m.call(b, read, vec![k0, k5]);
+
+        // Constant UMin(5, 10) -> 5; IMax(-1, 5) -> 5; UMax(-1, 5) -> -1; IMin(-1, 5) -> -1.
+        let c_umin = m.call(b, binary, vec![k40, k5, k10]);
+        let c_imax = m.call(b, binary, vec![k37, neg1, k5]);
+        let c_umax = m.call(b, binary, vec![k39, neg1, k5]);
+        let c_imin = m.call(b, binary, vec![k38, neg1, k5]);
+        // Idempotent UMin(x, x) -> x, and bound UMin(x, u32::MAX) -> x.
+        let idem = m.call(b, binary, vec![k40, x, x]);
+        let bound = m.call(b, binary, vec![k40, idem, neg1]);
+
+        // Two isHelperLane calls separated by a store: Effect::Pure merges them!
+        let h1 = m.call(b, helper, vec![k221]);
+        let h1_i = m.cast(b, Cast::ZExt, h1, i32t);
+        m.call(b, store, vec![c_umin, c_imax]);
+        m.call(b, store, vec![c_umax, c_imin]);
+        let h2 = m.call(b, helper, vec![k221]);
+        let h2_i = m.cast(b, Cast::ZExt, h2, i32t);
+        let hsum = m.bin(b, Bin::Add, h1_i, h2_i);
+        m.call(b, store, vec![bound, hsum]);
+        m.terminate(b, Term::Ret);
+
+        let prev = crate::emit::lower::TEST_RDNA_FP16_OPT.replace(Some(true));
+        m.optimise(MODULE);
+        crate::emit::lower::TEST_RDNA_FP16_OPT.set(prev);
+
+        let st = stores(&m, b);
+        assert_eq!(st[0], vec![k5, k5]);
+        assert_eq!(st[1], vec![neg1, neg1]);
+        assert_eq!(st[2][0], x, "idempotent and max-bound UMin must fold to x");
+        let helper_calls = m.blocks[b]
+            .body
+            .iter()
+            .filter(|&&i| {
+                matches!(&m.insts[i as usize].op, Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.isHelperLane.i1")
+            })
+            .count();
+        assert_eq!(helper_calls, 1, "isHelperLane must deduplicate across stores as Effect::Pure");
         m.write();
     }
 }

@@ -295,6 +295,10 @@ struct Lower<'a> {
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
     floats: HashMap<Value, V>,
+    /// Per-block cache of unpacked f16 halves `(lo_f32, hi_f32)` for a packed
+    /// `i32` value `V` in DXIL block `cur`. Strictly local to one basic block
+    /// so VGPR live ranges never extend across blocks.
+    fp16_halves: HashMap<(usize, V), (Option<V>, Option<V>)>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
@@ -1280,7 +1284,8 @@ fn lane_constant_masks(st: &Structured) -> bool {
 /// Whether constant identity LDS accumulator inits are hoisted to entry
 /// (`VICTORY_LDS_INIT_HOIST=0` turns it off).
 pub fn lds_init_hoist_on() -> bool {
-    std::env::var_os("VICTORY_LDS_INIT_HOIST").is_none_or(|v| v != "0")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_INIT_HOIST").is_none_or(|v| v != "0"))
 }
 
 fn accumulator_identity(name: &str) -> Option<u32> {
@@ -1481,7 +1486,11 @@ pub fn host_settings() -> [u32; 5] {
     let opt_flags = u32::from(super::narrow_barrier_on())
         | (u32::from(super::mesh_alloc_counts_on()) << 1)
         | (u32::from(super::fast_rcp_on()) << 2)
-        | (u32::from(super::rdna_opt_on()) << 3);
+        | (u32::from(super::rdna_opt_on()) << 3)
+        | (u32::from(super::legacy_mul_opt_on()) << 4)
+        | (u32::from(super::legacy_mul_plain_on()) << 5)
+        | (u32::from(super::rdna_valu_opt_on()) << 6)
+        | (u32::from(super::rdna_fp16_opt_on()) << 7);
     [
         host_max_wave(),
         super::shader::view_heap_limit(),
@@ -1517,6 +1526,14 @@ thread_local! {
     pub(super) static TEST_FAST_RCP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Test hook for [`super::rdna_opt_on`], for its thread only.
     pub(super) static TEST_RDNA_OPT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::legacy_mul_opt_on`], for its thread only.
+    pub(super) static TEST_LEGACY_MUL_OPT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::legacy_mul_plain_on`], for its thread only.
+    pub(super) static TEST_LEGACY_MUL_PLAIN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::rdna_valu_opt_on`], for its thread only.
+    pub(super) static TEST_RDNA_VALU_OPT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::rdna_fp16_opt_on`], for its thread only.
+    pub(super) static TEST_RDNA_FP16_OPT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -1547,6 +1564,26 @@ pub(super) fn test_fast_rcp() -> Option<bool> {
 #[cfg(test)]
 pub(super) fn test_rdna_opt() -> Option<bool> {
     TEST_RDNA_OPT.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_legacy_mul_opt() -> Option<bool> {
+    TEST_LEGACY_MUL_OPT.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_legacy_mul_plain() -> Option<bool> {
+    TEST_LEGACY_MUL_PLAIN.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_rdna_valu_opt() -> Option<bool> {
+    TEST_RDNA_VALU_OPT.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_rdna_fp16_opt() -> Option<bool> {
+    TEST_RDNA_FP16_OPT.get()
 }
 
 /// The bits of [`super::rdna`] that count on this host.
@@ -2074,7 +2111,9 @@ impl<'a> Lower<'a> {
         // do not run, and all of them in a program with a loop closed by a
         // plain jump (a lane still in it at the iteration limit leaves the
         // program there, `abort_block`).
-        let fence_only: HashSet<usize> = if insts().any(|i| i.name() == "s_barrier") {
+        let fence_only: HashSet<usize> = if super::group_sync() == 1
+            && insts().any(|i| i.name() == "s_barrier")
+        {
             let order = crate::ir::reverse_postorder(&p.blocks);
             let mut place = vec![usize::MAX; p.blocks.len()];
             for (n, &b) in order.iter().enumerate() {
@@ -2156,6 +2195,7 @@ impl<'a> Lower<'a> {
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
             floats: HashMap::new(),
+            fp16_halves: HashMap::new(),
             block: vec![None; p.blocks.len()],
             cur: 0,
             body_entry: entry,
@@ -4112,8 +4152,12 @@ impl<'a> Lower<'a> {
         let mut state_in = vec![0u8; n];
         let mut state_out = vec![0u8; n];
         let step = |b: usize, mut st: u8, mut record: Option<&mut HashMap<Site, u8>>| -> u8 {
-            let full_sync_block =
-                group_sync != 0 && !self.no_barrier.contains(&b) && !self.fence_only.contains(&b);
+            let full_sync_block = !self.no_barrier.contains(&b)
+                && match group_sync {
+                    0 => false,
+                    1 => !self.fence_only.contains(&b),
+                    _ => true,
+                };
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 if (st & BIT_WRITTEN) != 0 && is_vmem_wait(inst) {
                     st |= BIT_WAITED;
@@ -4919,6 +4963,17 @@ impl<'a> Lower<'a> {
         )
     }
 
+    fn ibinary(&mut self, op: u32, a: V, b: V) -> V {
+        self.s.op(
+            self.cur,
+            "binary.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            op,
+            &[a, b],
+        )
+    }
+
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
     /// the compare and select DXIL specifies gives either zero.
@@ -5011,11 +5066,41 @@ impl<'a> Lower<'a> {
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
-    /// top bit when `signed`; widths from 32 on take every bit. A signed
-    /// field that runs past bit 31 extends from bit 31, as the hardware
-    /// does: the shift is arithmetic then.
-    fn bfe(&mut self, a: V, off: V, width: V, signed: bool) -> V {
+    /// top bit when `signed`; widths from 32 on take every bit (when
+    /// `!width_5bit`, as in `s_bfe_*`; `v_bfe_*` masks width to 5 bits so 32
+    /// wraps to 0). A signed field that runs past bit 31 extends from bit 31,
+    /// as the hardware does: the shift is arithmetic then.
+    fn bfe(&mut self, a: V, off: V, width: V, signed: bool, width_5bit: bool) -> V {
         let c = self.cur;
+        if super::rdna_valu_opt_on() {
+            let i32t = self.s.t.i32;
+            let op = if signed { 51 } else { 52 }; // Ibfe (51) / Ubfe (52)
+            if width_5bit {
+                return self
+                    .s
+                    .op(c, "tertiary.i32", Attr::ReadNone, i32t, op, &[width, off, a]);
+            }
+            if let Some((_, w)) = self.s.m.int_k(width) {
+                if w < 32 {
+                    return self
+                        .s
+                        .op(c, "tertiary.i32", Attr::ReadNone, i32t, op, &[width, off, a]);
+                }
+                let k31 = self.s.m.i32(31);
+                let off5 = self.s.m.bin(c, Bin::And, off, k31);
+                let shift = if signed { Bin::AShr } else { Bin::LShr };
+                return self.s.m.bin(c, shift, a, off5);
+            }
+            let bfe_v = self
+                .s
+                .op(c, "tertiary.i32", Attr::ReadNone, i32t, op, &[width, off, a]);
+            let (k31, k32) = (self.s.m.i32(31), self.s.m.i32(32));
+            let full = self.s.m.cmp(c, pred::IUGE, width, k32);
+            let off5 = self.s.m.bin(c, Bin::And, off, k31);
+            let shift = if signed { Bin::AShr } else { Bin::LShr };
+            let shifted = self.s.m.bin(c, shift, a, off5);
+            return self.s.m.select(c, full, shifted, bfe_v);
+        }
         let (k31, k32, zero, one, ones) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -5084,6 +5169,32 @@ impl<'a> Lower<'a> {
         let hi = self.binary(35, a, b);
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
+        if host_rdna() & super::rdna::MED3 != 0 && super::rdna_valu_opt_on() {
+            // Skip NaN checks on operands proven finite (never NaN); on AMD RDNA
+            // use 1-op `fcmp uno` instead of the NVIDIA integer bit-masking sequence.
+            let mut maybe_nan = [a; 3];
+            let mut n = 0;
+            for x in [a, b, third] {
+                if self.s.m.bounded(x, 20).is_none() {
+                    maybe_nan[n] = x;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                return median;
+            }
+            let least = self.binary(36, lo, third);
+            let nan = match n {
+                1 => self.s.m.cmp(c, pred::UNO, maybe_nan[0], maybe_nan[0]),
+                2 => self.s.m.cmp(c, pred::UNO, maybe_nan[0], maybe_nan[1]),
+                _ => {
+                    let u01 = self.s.m.cmp(c, pred::UNO, maybe_nan[0], maybe_nan[1]);
+                    let u2 = self.s.m.cmp(c, pred::UNO, maybe_nan[2], maybe_nan[2]);
+                    self.s.m.bin(c, Bin::Or, u01, u2)
+                }
+            };
+            return self.s.m.select(c, nan, least, median);
+        }
         let least = self.binary(36, lo, third);
         let nan_a = self.is_nan_f32(a);
         let nan_b = self.is_nan_f32(b);
@@ -5165,13 +5276,21 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if host_rdna() != 0 && super::legacy_mul_plain_on() {
+            return self.s.m.bin(c, Bin::Mul, a, b);
+        }
         if host_rdna() & super::rdna::LEGACY != 0 {
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);
             // A product is not 0 only where one factor is 0 and the other an
             // infinity or no number: never of a value with itself, nor of two
             // finite ones, and only where the finite one of two is 0.
-            let (fa, fb) = (self.s.m.bounded(a, 12).is_some(), self.s.m.bounded(b, 12).is_some());
+            let opt = super::legacy_mul_opt_on();
+            let depth = if opt { 20 } else { 12 };
+            let (fa, fb) = (
+                self.s.m.bounded_ext(a, depth, opt).is_some(),
+                self.s.m.bounded_ext(b, depth, opt).is_some(),
+            );
             let not_zero = |l: &Self, x: V| l.s.m.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite());
             if a == b || fa && fb || not_zero(self, a) || not_zero(self, b) {
                 return m;
@@ -5214,15 +5333,20 @@ impl<'a> Lower<'a> {
     /// with the legacy rule that a zero factor makes the product a +0 rather
     /// than turning an infinite or NaN factor into a NaN.
     fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
+        if host_rdna() != 0 && super::legacy_mul_plain_on() {
+            return self.fmad(a, b, c);
+        }
         let cur = self.cur;
         if host_rdna() & super::rdna::LEGACY != 0 && super::fast_rcp_on() {
             // RDNA DXIL flushes f32 subnormals to zero in hardware; reuse the
             // same bounded/finite fast path as `legacy_mul`.
             let fused = self.fmad(a, b, c);
             let zero = self.s.m.f32(0);
+            let opt = super::legacy_mul_opt_on();
+            let depth = if opt { 20 } else { 12 };
             let (fa, fb) = (
-                self.s.m.bounded(a, 12).is_some(),
-                self.s.m.bounded(b, 12).is_some(),
+                self.s.m.bounded_ext(a, depth, opt).is_some(),
+                self.s.m.bounded_ext(b, depth, opt).is_some(),
             );
             let not_zero = |l: &Self, x: V| {
                 l.s.m.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite())
@@ -6080,7 +6204,9 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes
+            || (host_rdna() != 0 && self.halves.is_none() && super::rdna_fp16_opt_on())
+        {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
@@ -7832,7 +7958,7 @@ impl<'a> Lower<'a> {
                 let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
                 let w = self.s.m.bin(c, Bin::LShr, b, k16);
                 let w = self.s.m.bin(c, Bin::And, w, k127);
-                (self.bfe(a, b, w, name == "s_bfe_i32"), None)
+                (self.bfe(a, b, w, name == "s_bfe_i32", false), None)
             }
             "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
             | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
@@ -7871,14 +7997,25 @@ impl<'a> Lower<'a> {
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let p = match name {
-                    "s_min_u32" => pred::IULT,
-                    "s_max_u32" => pred::IUGT,
-                    "s_min_i32" => pred::SLT,
-                    _ => pred::SGT,
+                let r = if super::rdna_valu_opt_on() {
+                    let op = match name {
+                        "s_max_i32" => 37,
+                        "s_min_i32" => 38,
+                        "s_max_u32" => 39,
+                        _ => 40,
+                    };
+                    self.ibinary(op, a, b)
+                } else {
+                    let p = match name {
+                        "s_min_u32" => pred::IULT,
+                        "s_max_u32" => pred::IUGT,
+                        "s_min_i32" => pred::SLT,
+                        _ => pred::SGT,
+                    };
+                    let t = self.s.m.cmp(c, p, a, b);
+                    self.s.m.select(c, t, a, b)
                 };
-                let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (r, None)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -8909,6 +9046,11 @@ impl<'a> Lower<'a> {
                 })
                 .collect()
         };
+        let take = if super::rdna_fp16_opt_on() {
+            (channels as usize).min(bits.len())
+        } else {
+            bits.len()
+        };
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
             let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
@@ -8918,12 +9060,18 @@ impl<'a> Lower<'a> {
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             vec![self.s.m.bin(c, Bin::LShr, w, sh)]
         } else {
-            load(self, off, total / 32)
+            let need_bits: u32 = bits[..take].iter().sum();
+            let need_words = if super::rdna_fp16_opt_on() {
+                need_bits.div_ceil(32).max(1)
+            } else {
+                total / 32
+            };
+            load(self, off, need_words)
         };
         let float = |l: &mut Self, f: V| l.as_int(f);
         let mut out = Vec::new();
         let mut at = 0;
-        for &w in bits {
+        for &w in &bits[..take] {
             let word = words[(at / 32) as usize];
             let field = if w == 32 {
                 word
@@ -9055,6 +9203,27 @@ impl<'a> Lower<'a> {
             return self.exact_norm(a, w);
         }
         let c = self.cur;
+        // On AMD RDNA, full-width 32-bit `UiToFp` rounds to nearest even accurately:
+        // for w in {2, 4}, `UiToFp(a * K) * 2^-32` (3 ops) matches every code bit-for-bit;
+        // for w == 8, adding the sticky bit `UMin(a, 1)` (`Add(a * 0x01010101, UMin(a, 1))`,
+        // 5 ops) resolves all 8 power-of-two ties for 0/256 mismatches (format_load handles 255).
+        if host_rdna() != 0 && super::rdna_fp16_opt_on() && matches!(w, 2 | 4 | 8) {
+            let d = (1u64 << w) - 1;
+            let kv = self.s.m.i32(((1u64 << 32) / d) as u32);
+            let mut q = self.s.m.bin(c, Bin::Mul, a, kv);
+            if w == 8 {
+                let one = self.s.m.i32(1);
+                let nz = self.ibinary(40, a, one);
+                q = self.s.m.bin(c, Bin::Add, q, nz);
+            }
+            let f = self.s.m.cast(c, Cast::UiToFp, q, self.s.t.f32);
+            let scale = self.s.m.f32(2.0f32.powi(-32).to_bits());
+            let f = self.s.m.bin(c, Bin::Mul, f, scale);
+            self.s.m.mark_unit_float(f);
+            let out = self.as_int(f);
+            self.s.m.mark_unit_float(out);
+            return out;
+        }
         let d = (1u64 << w) - 1;
         let (kk, r) = ((1u64 << 32) / d, (1u64 << 32) % d);
         let k = |l: &mut Self, v: u64| l.s.m.i32(v as u32);
@@ -9093,7 +9262,10 @@ impl<'a> Lower<'a> {
         let scale = self.s.m.bin(c, Bin::Shl, scale, k23);
         let scale = self.as_float(scale);
         let f = self.s.m.bin(c, Bin::Mul, f, scale);
-        self.as_int(f)
+        self.s.m.mark_unit_float(f);
+        let out = self.as_int(f);
+        self.s.m.mark_unit_float(out);
+        out
     }
 
     /// [`Self::norm_quotient`] in integers only, for any width up to 16: `Q`
@@ -9166,7 +9338,9 @@ impl<'a> Lower<'a> {
         let m = self.s.m.bin(c, Bin::And, mant, fraction);
         let bits = self.s.m.bin(c, Bin::Or, e, m);
         let is_zero = self.s.m.cmp(c, pred::EQ, a, zero);
-        self.s.m.select(c, is_zero, zero, bits)
+        let out = self.s.m.select(c, is_zero, zero, bits);
+        self.s.m.mark_unit_float(out);
+        out
     }
 
     /// Channels of buffer format `format`, as [`Self::format_load`] gives
@@ -10848,10 +11022,14 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cvt_f32_u32" => {
+                let a = s(self, 0)?;
+                if host_rdna() != 0 && super::rdna_valu_opt_on() {
+                    let r = self.s.m.cast(c, Cast::UiToFp, a, self.s.t.f32);
+                    return float(self, r);
+                }
                 // WARP can misround a full-width uitofp. Each 16-bit
                 // half and the scaled high half are exact in f32, so the
                 // sum rounds just once, whether the host fuses FMad or not.
-                let a = s(self, 0)?;
                 let (shift, mask) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
                 let hi = self.s.m.bin(c, Bin::LShr, a, shift);
                 let lo = self.s.m.bin(c, Bin::And, a, mask);
@@ -11951,14 +12129,24 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, op, x, sh)
                 }
                 _ => {
-                    let p = match name {
-                        "v_max_u16" => pred::IUGT,
-                        "v_min_u16" => pred::IULT,
-                        "v_max_i16" => pred::SGT,
-                        _ => pred::SLT,
-                    };
-                    let t = self.s.m.cmp(c, p, a, b);
-                    self.s.m.select(c, t, a, b)
+                    if super::rdna_valu_opt_on() {
+                        let op = match name {
+                            "v_max_i16" => 37,
+                            "v_min_i16" => 38,
+                            "v_max_u16" => 39,
+                            _ => 40,
+                        };
+                        self.ibinary(op, a, b)
+                    } else {
+                        let p = match name {
+                            "v_max_u16" => pred::IUGT,
+                            "v_min_u16" => pred::IULT,
+                            "v_max_i16" => pred::SGT,
+                            _ => pred::SLT,
+                        };
+                        let t = self.s.m.cmp(c, p, a, b);
+                        self.s.m.select(c, t, a, b)
+                    }
                 }
             }
         };
@@ -12087,6 +12275,41 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.bin(c, Bin::And, x, m))
     }
 
+    /// Unpacks the low (`!high`) or high (`high`) f16 half of packed `i32`
+    /// value `x` to `f32`, caching the result per `(cur_block, x)` when
+    /// `VICTORY_RDNA_FP16_OPT=1` (and `!f16_nearest_on()`) so consecutive
+    /// `v_pk_*_f16` instructions avoid redundant unpack/repack roundtrips.
+    fn unpack_f16_half(&mut self, x: V, high: bool) -> V {
+        let c = self.cur;
+        let use_cache = super::rdna_fp16_opt_on() && !f16_nearest_on();
+        if use_cache && let Some(&(lo, hi)) = self.fp16_halves.get(&(c, x)) {
+            if let Some(f) = if high { hi } else { lo } {
+                return f;
+            }
+        }
+        let h = if high {
+            let k16 = self.s.m.i32(16);
+            self.s.m.bin(c, Bin::LShr, x, k16)
+        } else {
+            x
+        };
+        let m = self.s.m.i32(0xFFFF);
+        let h = self.s.m.bin(c, Bin::And, h, m);
+        let f32t = self.s.t.f32;
+        let f = self
+            .s
+            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        if use_cache {
+            let entry = self.fp16_halves.entry((c, x)).or_insert((None, None));
+            if high {
+                entry.1 = Some(f);
+            } else {
+                entry.0 = Some(f);
+            }
+        }
+        f
+    }
+
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
     /// 16-bit operation does, f16 through f32 as in [`Self::valu16`].
     fn packed16(&mut self, inst: &Inst, op: &str, guard: Option<V>) -> Result<(), Why> {
@@ -12106,19 +12329,26 @@ impl<'a> Lower<'a> {
         }
         let c = self.cur;
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let fp16_opt = super::rdna_fp16_opt_on();
         let mut halves = Vec::new();
-        for high in [false, true] {
+        let mut f32_halves = [None, None];
+        for (hi_idx, high) in [false, true].into_iter().enumerate() {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = if op == "fmac_f16" {
-                    self.fmac_half(inst, k, high)?
-                } else {
-                    self.packed_src(inst, k, high, float)?
-                };
-                if float {
-                    let mut f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                if float && fp16_opt {
+                    let (x, sel) = if op == "fmac_f16" {
+                        let opnd = if k == 2 { v.dst } else { v.src.get(k).copied() }
+                            .ok_or("a missing operand")?;
+                        if matches!(opnd, Operand::Const(_) | Operand::Literal(_)) {
+                            return Err("a constant operand of v_pk_fmac_f16");
+                        }
+                        (self.operand(inst, &opnd)?, high)
+                    } else {
+                        let opnd = *v.src.get(k).ok_or("a missing operand")?;
+                        let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
+                        (self.f16_operand(inst, &opnd)?, sel)
+                    };
+                    let mut f = self.unpack_f16_half(x, sel);
                     let neg = if high { v.neg_hi } else { v.neg };
                     if neg >> k & 1 != 0 {
                         let z = self.s.m.f32(0x8000_0000);
@@ -12126,7 +12356,24 @@ impl<'a> Lower<'a> {
                     }
                     xs.push(f);
                 } else {
-                    xs.push(h);
+                    let h = if op == "fmac_f16" {
+                        self.fmac_half(inst, k, high)?
+                    } else {
+                        self.packed_src(inst, k, high, float)?
+                    };
+                    if float {
+                        let mut f = self
+                            .s
+                            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                        let neg = if high { v.neg_hi } else { v.neg };
+                        if neg >> k & 1 != 0 {
+                            let z = self.s.m.f32(0x8000_0000);
+                            f = self.s.m.bin(c, Bin::Sub, z, f);
+                        }
+                        xs.push(f);
+                    } else {
+                        xs.push(h);
+                    }
                 }
             }
             let r = if float {
@@ -12141,6 +12388,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
+                f32_halves[hi_idx] = Some(f);
                 self.s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
             } else {
@@ -12178,23 +12426,41 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, o, x, sh)
                     }
                     _ => {
-                        let p = match op {
-                            "max_u16" => pred::IUGT,
-                            "min_u16" => pred::IULT,
-                            "max_i16" => pred::SGT,
-                            _ => pred::SLT,
-                        };
-                        let t = self.s.m.cmp(c, p, xs[0], xs[1]);
-                        self.s.m.select(c, t, xs[0], xs[1])
+                        if super::rdna_valu_opt_on() {
+                            let dxop = match op {
+                                "max_i16" => 37,
+                                "min_i16" => 38,
+                                "max_u16" => 39,
+                                _ => 40,
+                            };
+                            self.ibinary(dxop, xs[0], xs[1])
+                        } else {
+                            let p = match op {
+                                "max_u16" => pred::IUGT,
+                                "min_u16" => pred::IULT,
+                                "max_i16" => pred::SGT,
+                                _ => pred::SLT,
+                            };
+                            let t = self.s.m.cmp(c, p, xs[0], xs[1]);
+                            self.s.m.select(c, t, xs[0], xs[1])
+                        }
                     }
                 }
             };
-            let m = self.s.m.i32(0xFFFF);
-            halves.push(self.s.m.bin(c, Bin::And, r, m));
+            if float && fp16_opt {
+                // `legacyF32ToF16` already zero-extends its 16-bit result to `i32`.
+                halves.push(r);
+            } else {
+                let m = self.s.m.i32(0xFFFF);
+                halves.push(self.s.m.bin(c, Bin::And, r, m));
+            }
         }
         let k16 = self.s.m.i32(16);
         let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
         let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+        if float && fp16_opt && !f16_nearest_on() {
+            self.fp16_halves.insert((c, r), (f32_halves[0], f32_halves[1]));
+        }
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a packed result outside a VGPR");
         };
@@ -12280,18 +12546,27 @@ impl<'a> Lower<'a> {
             }
             "v_mul_u32_u24" | "v_mul_i32_i24" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mul_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let (a, b) = if name == "v_mul_u32_u24" && super::rdna_valu_opt_on() {
+                    let m = k(self, 0x00FF_FFFF);
+                    (
+                        self.s.m.bin(c, Bin::And, a, m),
+                        self.s.m.bin(c, Bin::And, b, m),
+                    )
+                } else {
+                    let (sh, op) = (
+                        k(self, 8),
+                        if name == "v_mul_i32_i24" {
+                            Bin::AShr
+                        } else {
+                            Bin::LShr
+                        },
+                    );
+                    let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                    let a = self.s.m.bin(c, op, a, sh);
+                    let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                    let b = self.s.m.bin(c, op, b, sh);
+                    (a, b)
+                };
                 self.s.m.bin(c, Bin::Mul, a, b)
             }
             "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
@@ -12299,17 +12574,26 @@ impl<'a> Lower<'a> {
                 // of each operand, zero- or sign-extended, multiplied.
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let signed = name == "v_mul_hi_i32_i24";
-                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let (a, b) = if !signed && super::rdna_valu_opt_on() {
+                    let m = k(self, 0x00FF_FFFF);
+                    (
+                        self.s.m.bin(c, Bin::And, a, m),
+                        self.s.m.bin(c, Bin::And, b, m),
+                    )
+                } else {
+                    let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
+                    let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                    let a = self.s.m.bin(c, op, a, sh);
+                    let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                    let b = self.s.m.bin(c, op, b, sh);
+                    (a, b)
+                };
                 self.mul_hi(a, b, signed)
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let w = m31(self, w);
-                self.bfe(a, off, w, name == "v_bfe_i32")
+                let w = if super::rdna_valu_opt_on() { w } else { m31(self, w) };
+                self.bfe(a, off, w, name == "v_bfe_i32", true)
             }
             "v_bfi_b32" => {
                 let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -12321,14 +12605,24 @@ impl<'a> Lower<'a> {
             }
             "v_max_i32" | "v_min_i32" | "v_max_u32" | "v_min_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let p = match name {
-                    "v_max_i32" => pred::SGT,
-                    "v_min_i32" => pred::SLT,
-                    "v_max_u32" => pred::IUGT,
-                    _ => pred::IULT,
-                };
-                let t = self.s.m.cmp(c, p, a, b);
-                self.s.m.select(c, t, a, b)
+                if super::rdna_valu_opt_on() {
+                    let op = match name {
+                        "v_max_i32" => 37,
+                        "v_min_i32" => 38,
+                        "v_max_u32" => 39,
+                        _ => 40,
+                    };
+                    self.ibinary(op, a, b)
+                } else {
+                    let p = match name {
+                        "v_max_i32" => pred::SGT,
+                        "v_min_i32" => pred::SLT,
+                        "v_max_u32" => pred::IUGT,
+                        _ => pred::IULT,
+                    };
+                    let t = self.s.m.cmp(c, p, a, b);
+                    self.s.m.select(c, t, a, b)
+                }
             }
             "v_mul_hi_u32" | "v_mul_hi_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -12369,18 +12663,27 @@ impl<'a> Lower<'a> {
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mad_i32_i24" {
-                        Bin::AShr
-                    } else {
-                        Bin::LShr
-                    },
-                );
-                let a = self.s.m.bin(c, Bin::Shl, a, sh);
-                let a = self.s.m.bin(c, op, a, sh);
-                let b = self.s.m.bin(c, Bin::Shl, b, sh);
-                let b = self.s.m.bin(c, op, b, sh);
+                let (a, b) = if name == "v_mad_u32_u24" && super::rdna_valu_opt_on() {
+                    let m = k(self, 0x00FF_FFFF);
+                    (
+                        self.s.m.bin(c, Bin::And, a, m),
+                        self.s.m.bin(c, Bin::And, b, m),
+                    )
+                } else {
+                    let (sh, op) = (
+                        k(self, 8),
+                        if name == "v_mad_i32_i24" {
+                            Bin::AShr
+                        } else {
+                            Bin::LShr
+                        },
+                    );
+                    let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                    let a = self.s.m.bin(c, op, a, sh);
+                    let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                    let b = self.s.m.bin(c, op, b, sh);
+                    (a, b)
+                };
                 let m = self.s.m.bin(c, Bin::Mul, a, b);
                 self.s.m.bin(c, Bin::Add, m, d)
             }
@@ -12390,6 +12693,15 @@ impl<'a> Lower<'a> {
                 // bits. v_sad_hi_u8 adds the sum shifted to the high half;
                 // v_msad_u8 leaves out a byte whose mask byte (src1) is 0.
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                if name == "v_msad_u8" && super::rdna_valu_opt_on() {
+                    // DXIL `Msad(ref, src, accum)` skips bytes where `ref` == 0;
+                    // GCN `v_msad_u8` skips bytes where `src1` (`b`) == 0.
+                    self.s.flags |= flags::MSAD;
+                    let i32t = self.s.t.i32;
+                    return Ok(self
+                        .s
+                        .op(c, "tertiary.i32", Attr::ReadNone, i32t, 50, &[b, a, d]));
+                }
                 let (width, parts) = match name {
                     "v_sad_u16" => (16, 2),
                     "v_sad_u32" => (32, 1),
@@ -12426,29 +12738,49 @@ impl<'a> Lower<'a> {
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let signed = name.ends_with("i32");
-                let (lt, gt) = if signed {
-                    (pred::SLT, pred::SGT)
+                if super::rdna_valu_opt_on() {
+                    let (min_op, max_op) = if signed { (38, 37) } else { (40, 39) };
+                    match &name[2..6] {
+                        "min3" => {
+                            let t = self.ibinary(min_op, a, b);
+                            self.ibinary(min_op, t, d)
+                        }
+                        "max3" => {
+                            let t = self.ibinary(max_op, a, b);
+                            self.ibinary(max_op, t, d)
+                        }
+                        _ => {
+                            let lo = self.ibinary(min_op, a, b);
+                            let hi = self.ibinary(max_op, a, b);
+                            let t = self.ibinary(min_op, hi, d);
+                            self.ibinary(max_op, lo, t)
+                        }
+                    }
                 } else {
-                    (pred::IULT, pred::IUGT)
-                };
-                let pick = |l: &mut Self, p, x, y| {
-                    let t = l.s.m.cmp(c, p, x, y);
-                    l.s.m.select(c, t, x, y)
-                };
-                match &name[2..6] {
-                    "min3" => {
-                        let t = pick(self, lt, a, b);
-                        pick(self, lt, t, d)
-                    }
-                    "max3" => {
-                        let t = pick(self, gt, a, b);
-                        pick(self, gt, t, d)
-                    }
-                    _ => {
-                        let lo = pick(self, lt, a, b);
-                        let hi = pick(self, gt, a, b);
-                        let t = pick(self, lt, hi, d);
-                        pick(self, gt, lo, t)
+                    let (lt, gt) = if signed {
+                        (pred::SLT, pred::SGT)
+                    } else {
+                        (pred::IULT, pred::IUGT)
+                    };
+                    let pick = |l: &mut Self, p, x, y| {
+                        let t = l.s.m.cmp(c, p, x, y);
+                        l.s.m.select(c, t, x, y)
+                    };
+                    match &name[2..6] {
+                        "min3" => {
+                            let t = pick(self, lt, a, b);
+                            pick(self, lt, t, d)
+                        }
+                        "max3" => {
+                            let t = pick(self, gt, a, b);
+                            pick(self, gt, t, d)
+                        }
+                        _ => {
+                            let lo = pick(self, lt, a, b);
+                            let hi = pick(self, gt, a, b);
+                            let t = pick(self, lt, hi, d);
+                            pick(self, gt, lo, t)
+                        }
                     }
                 }
             }
@@ -14241,25 +14573,43 @@ impl<'a> Lower<'a> {
                 let mask = self.s.m.i8(1);
                 let align = self.s.m.i32(4);
                 let dword = |l: &mut Self, at: V| {
+                    let cur = l.cur;
                     let r = l.s.op(
-                        c,
+                        cur,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         l.s.t.res_ret,
                         139,
                         &[h, at, iu, mask, align],
                     );
-                    let f = l.s.m.extract(c, r, 0);
+                    let f = l.s.m.extract(cur, r, 0);
                     l.as_int(f)
                 };
                 let low = dword(self, aligned);
                 let mut x = self.s.m.bin(c, Bin::LShr, low, shift);
                 if bits == 16 {
-                    let high = dword(self, next);
-                    let high = self.s.m.bin(c, Bin::Shl, high, k8);
-                    let high = self.s.m.select(c, straddles, high, zero);
-                    x = self.s.m.bin(c, Bin::Or, x, high);
+                    if super::rdna_fp16_opt_on() {
+                        let no_straddle = self
+                            .s
+                            .m
+                            .int_k(byte)
+                            .is_some_and(|(_, k)| (k & 3) <= 2)
+                            || self.s.m.is_even_i32(byte, 6);
+                        if !no_straddle {
+                            let second = self.begin_guarded(Some(straddles));
+                            let high = dword(self, next);
+                            let high = self.s.m.bin(self.cur, Bin::Shl, high, k8);
+                            let high = self.end_guarded(second, &[(high, zero)])[0];
+                            x = self.s.m.bin(self.cur, Bin::Or, x, high);
+                        }
+                    } else {
+                        let high = dword(self, next);
+                        let high = self.s.m.bin(c, Bin::Shl, high, k8);
+                        let high = self.s.m.select(c, straddles, high, zero);
+                        x = self.s.m.bin(c, Bin::Or, x, high);
+                    }
                 }
+                let c = self.cur;
                 x = self.s.m.bin(c, Bin::And, x, ones);
                 if signed {
                     let up = self.s.m.i32(32 - bits);
@@ -17923,5 +18273,157 @@ mod tests {
                 assert_eq!(out[0][2 * idx + 1], want_i, "{tag}: v_mul_hi_i32({a:#x}, {b:#x})");
             }
         }
+    }
+
+    #[test]
+    fn legacy_mul_opt_and_plain_toggles() {
+        let validate = |dxil: &mut Vec<u8>| {
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(None) {
+                v.validate(dxil).expect("N3 DXIL must pass dxil.dll validation");
+            }
+        };
+        let prev_rdna = super::TEST_RDNA.replace(Some(super::super::rdna::ALL));
+        let prev_opt = super::TEST_LEGACY_MUL_OPT.replace(Some(true));
+        let prev_plain = super::TEST_LEGACY_MUL_PLAIN.replace(Some(false));
+
+        // 1) host_settings()[4] bits 4 & 5 + translation_fingerprint() reflect both switches.
+        let hs_default = super::host_settings();
+        let fp_default = super::super::translation_fingerprint();
+        assert_ne!(hs_default[4] & (1 << 4), 0, "VICTORY_LEGACY_MUL_OPT default bit 4 must be 1");
+        assert_eq!(hs_default[4] & (1 << 5), 0, "VICTORY_LEGACY_MUL_PLAIN default bit 5 must be 0");
+
+        super::TEST_LEGACY_MUL_OPT.set(Some(false));
+        let hs_no_opt = super::host_settings();
+        let fp_no_opt = super::super::translation_fingerprint();
+        assert_eq!(hs_no_opt[4] & (1 << 4), 0);
+        assert_ne!(hs_default, hs_no_opt);
+        assert_ne!(fp_default, fp_no_opt);
+
+        super::TEST_LEGACY_MUL_OPT.set(Some(true));
+        super::TEST_LEGACY_MUL_PLAIN.set(Some(true));
+        let hs_plain = super::host_settings();
+        let fp_plain = super::super::translation_fingerprint();
+        assert_ne!(hs_plain[4] & (1 << 5), 0);
+        assert_ne!(hs_default, hs_plain);
+        assert_ne!(fp_default, fp_plain);
+
+        // 2) Exact OPT=1 elides legacy_mul guard on norm_quotient (tbuffer 16_UNORM) outputs,
+        //    and PLAIN=1 elides legacy_mul guard on unbounded raw buffer inputs.
+        // Shader A: two 16_UNORM tbuffer loads multiplied by v_mul_legacy_f32.
+        let norm_mul_cs = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000,    // s_load_dwordx4 s[8:11], s[4:5], null (SRV)
+            0xF408_0302,
+            0xFA00_0020,    // s_load_dwordx4 s[12:15], s[4:5], 0x20 (UAV)
+            0xE838_0000,
+            0x8002_0100,    // tbuffer_load_format_x v1, v0, s[8:11], 0 format:7 (16_UNORM)
+            0xE838_0004,
+            0x8002_0200,    // tbuffer_load_format_x v2, v0, s[8:11], 0 offset:4 format:7 (16_UNORM)
+            0x0E02_0501,    // v_mul_legacy_f32 v1, v1, v2
+            0xE070_0000,
+            0x8003_0100,    // buffer_store_dword v1, v0, s[12:15], 0
+            S_ENDPGM,
+        ];
+        // Shader B: two unbounded raw buffer loads multiplied by v_mul_legacy_f32.
+        let raw_mul_cs = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000,    // s_load_dwordx4 s[8:11], s[4:5], null (SRV)
+            0xF408_0302,
+            0xFA00_0020,    // s_load_dwordx4 s[12:15], s[4:5], 0x20 (UAV)
+            0xE034_0000,
+            0x8002_0100,    // buffer_load_dwordx2 v[1:2], v0, s[8:11], 0
+            0x0E02_0501,    // v_mul_legacy_f32 v1, v1, v2
+            0xE070_0000,
+            0x8003_0100,    // buffer_store_dword v1, v0, s[12:15], 0
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let compile = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: layout.clone(),
+                used: used.clone(),
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 1,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, native.vgprs).expect("ir");
+            let st = structure::structure(&p).expect("st");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("res");
+            let io = io::raise(&p, &native).expect("io");
+            let mut l = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .expect("lower");
+            validate(&mut l.dxil);
+            l
+        };
+
+        super::TEST_LEGACY_MUL_PLAIN.set(Some(false));
+        super::TEST_LEGACY_MUL_OPT.set(Some(true));
+        let norm_opt_on = compile(&norm_mul_cs);
+        super::TEST_LEGACY_MUL_OPT.set(Some(false));
+        let norm_opt_off = compile(&norm_mul_cs);
+        assert!(
+            norm_opt_on.dxil.len() < norm_opt_off.dxil.len(),
+            "VICTORY_LEGACY_MUL_OPT=1 must shrink norm_quotient legacy_mul ({} vs {})",
+            norm_opt_on.dxil.len(),
+            norm_opt_off.dxil.len(),
+        );
+
+        super::TEST_LEGACY_MUL_OPT.set(Some(true));
+        super::TEST_LEGACY_MUL_PLAIN.set(Some(false));
+        let raw_guarded = compile(&raw_mul_cs);
+        super::TEST_LEGACY_MUL_PLAIN.set(Some(true));
+        let raw_plain = compile(&raw_mul_cs);
+        assert!(
+            raw_plain.dxil.len() < raw_guarded.dxil.len(),
+            "VICTORY_LEGACY_MUL_PLAIN=1 must drop the 5-op guard ({} vs {})",
+            raw_plain.dxil.len(),
+            raw_guarded.dxil.len(),
+        );
+
+        super::TEST_LEGACY_MUL_PLAIN.set(prev_plain);
+        super::TEST_LEGACY_MUL_OPT.set(prev_opt);
+        super::TEST_RDNA.set(prev_rdna);
     }
 }

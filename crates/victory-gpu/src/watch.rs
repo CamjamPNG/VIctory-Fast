@@ -4509,14 +4509,6 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     if len == 0 {
         return KernelWrite(first, first);
     }
-    if light()
-        && !PROTECTED.any(first, last)
-        && !PUBLISHED.any(first, last)
-        && !VIEWS.any(first, last)
-    {
-        crate::descriptor::host::remapped(at, len);
-        return KernelWrite(first, first);
-    }
     {
         let mut g = guards_timed();
         open(&g, at, at.saturating_add(len));

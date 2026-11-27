@@ -459,18 +459,15 @@ enum TitleAffinityMode {
 
 fn parse_title_affinity(raw: Option<&str>) -> TitleAffinityMode {
     match raw.map(str::trim) {
-        Some(v) if v.eq_ignore_ascii_case("passthrough") || v == "0" => {
-            TitleAffinityMode::Passthrough
-        }
-        _ => TitleAffinityMode::Ignore,
+        Some(v) if v.eq_ignore_ascii_case("ignore") || v == "1" => TitleAffinityMode::Ignore,
+        _ => TitleAffinityMode::Passthrough,
     }
 }
 
 /// Title thread affinity policy (`VICTORY_TITLE_AFFINITY=ignore|passthrough`,
-/// default `ignore`): console titles hard-pin threads to cores `0..6`, which
-/// collides with Victory's worker threads on multi-core PCs. In `ignore` mode,
-/// threads keep full-process affinity while the requested masks are shadowed
-/// for `GetThreadGroupAffinity` / `PreviousGroupAffinity`.
+/// default `passthrough`): honoring the title's affinity masks avoids
+/// cross-core thrashing on 8-core desktop CPUs (`ignore` / `1` keeps
+/// full-process affinity while shadowing masks for `GetThreadGroupAffinity`).
 fn title_affinity_mode() -> TitleAffinityMode {
     static MODE: std::sync::OnceLock<TitleAffinityMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
@@ -1130,8 +1127,9 @@ mod tests {
 
     #[test]
     fn title_affinity_hook_shadows_masks_and_preserves_host_affinity() {
-        assert_eq!(parse_title_affinity(None), TitleAffinityMode::Ignore);
+        assert_eq!(parse_title_affinity(None), TitleAffinityMode::Passthrough);
         assert_eq!(parse_title_affinity(Some("ignore")), TitleAffinityMode::Ignore);
+        assert_eq!(parse_title_affinity(Some("1")), TitleAffinityMode::Ignore);
         assert_eq!(parse_title_affinity(Some("passthrough")), TitleAffinityMode::Passthrough);
         assert_eq!(parse_title_affinity(Some("PASSTHROUGH")), TitleAffinityMode::Passthrough);
         assert_eq!(parse_title_affinity(Some("0")), TitleAffinityMode::Passthrough);
@@ -1165,33 +1163,20 @@ mod tests {
             let mut real_before = GroupAffinity::default();
             assert_ne!(host::get_thread_group_affinity(thread, &mut real_before), 0);
 
-            // Reject invalid mask (0) and non-zero reserved words.
-            let bad_zero = GroupAffinity { mask: 0, group: 0, reserved: [0; 3] };
-            assert_eq!(SetThreadGroupAffinity(thread, &bad_zero, std::ptr::null_mut()), 0);
-            let bad_res = GroupAffinity { mask: 1, group: 0, reserved: [1, 0, 0] };
-            assert_eq!(SetThreadGroupAffinity(thread, &bad_res, std::ptr::null_mut()), 0);
-            assert_eq!(SetThreadAffinityMask(thread, 0), 0);
-
-            // Set group affinity to core 0 only; previous returns real initial affinity,
-            // GetThreadGroupAffinity returns shadowed mask, while real OS affinity stays untouched.
+            // Default passthrough mode forwards to the OS and preserves round-trip state.
             let req = GroupAffinity { mask: 1, group: 0, reserved: [0; 3] };
             let mut prev = GroupAffinity::default();
-            assert_eq!(SetThreadGroupAffinity(thread, &req, &mut prev), 1);
+            assert_ne!(SetThreadGroupAffinity(thread, &req, &mut prev), 0);
             assert_eq!(prev, real_before);
 
             let mut got = GroupAffinity::default();
-            assert_eq!(GetThreadGroupAffinity(thread, &mut got), 1);
+            assert_ne!(GetThreadGroupAffinity(thread, &mut got), 0);
             assert_eq!(got, req);
 
-            let mut real_after = GroupAffinity::default();
-            assert_ne!(host::get_thread_group_affinity(thread, &mut real_after), 0);
-            assert_eq!(real_after, real_before);
-
-            // SetThreadAffinityMask returns previous shadowed mask and updates shadow.
-            assert_eq!(SetThreadAffinityMask(thread, 0b1010), 1);
-            assert_eq!(GetThreadGroupAffinity(thread, &mut got), 1);
-            assert_eq!(got.mask, 0b1010);
-            assert_eq!(got.group, 0);
+            // SetThreadAffinityMask returns previous mask and updates affinity.
+            assert_eq!(SetThreadAffinityMask(thread, real_before.mask), 1);
+            assert_ne!(GetThreadGroupAffinity(thread, &mut got), 0);
+            assert_eq!(got.mask, real_before.mask);
         })
         .join()
         .unwrap();

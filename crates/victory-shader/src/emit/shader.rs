@@ -121,6 +121,7 @@ pub const USER_DISPATCH_THREADS: u32 = 0x108;
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    pub const MSAD: u64 = 1 << 7;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// Unordered views in a vertex, geometry or mesh program.
@@ -825,11 +826,19 @@ impl Shader {
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
         if passes != 0 {
             self.m.optimise(passes);
+            if passes & super::bitcode::opt::FOLD != 0
+                && super::legacy_mul_opt_on()
+                && super::lower::host_rdna() & super::rdna::LEGACY != 0
+                && self.m.elide_legacy_mul_guards()
+            {
+                self.m.optimise(passes);
+            }
             let used = self.m.usage();
             for (flag, used) in [
                 (flags::ROVS, used.rovs),
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
+                (flags::MSAD, used.msad),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
@@ -1204,6 +1213,9 @@ impl Shader {
         }
         if self.flags & flags::UAVS_EVERY_STAGE != 0 {
             features |= 0x4;
+        }
+        if self.flags & flags::MSAD != 0 {
+            features |= 0x40;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;

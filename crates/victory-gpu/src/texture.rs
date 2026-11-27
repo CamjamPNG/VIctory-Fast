@@ -1972,15 +1972,14 @@ impl Staging {
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
-        let mut guarded_dirty_mask: Option<u64> = None;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 120;
+            const HASH_EVERY: u64 = 8;
             let prev_asked = last.asked;
             let unwritten = prev_asked != 0 && written.iter().all(|&(_, w)| w <= prev_asked);
-            guarded_dirty_mask = if !unwritten && prev_asked != 0 && last.hash.is_some() {
+            let guarded_dirty_mask = if !unwritten && prev_asked != 0 && last.hash.is_some() {
                 Some(dirty_subs_from_pages(
                     &self.layout,
                     self.first,
@@ -2001,6 +2000,11 @@ impl Staging {
                 .wrapping_add((start >> 16) as u64)
                 .is_multiple_of(HASH_EVERY)
                 && !recent_ahead;
+            // A texture starts hot: one written through an alias view from its
+            // first frames on changes before the periodic hash catches it.
+            if last.hot_until == 0 {
+                last.hot_until = frame + HOT_FRAMES;
+            }
             let hot = hot_textures() && frame < last.hot_until && !recent_ahead;
             if !exact && (unwritten || guarded_dirty_mask == Some(0)) && !turn && !hot {
                 return 0;
@@ -2013,16 +2017,6 @@ impl Staging {
                 last.hot_until = crate::frame::current() + HOT_FRAMES;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
-            }
-        };
-        let pick_sub_mask = |tiled: &[u8], last: &mut Last, had_prev: bool| -> u64 {
-            if !exact
-                && let Some(mask) = guarded_dirty_mask.filter(|&m| m != 0)
-            {
-                last.sub_hashes.clear();
-                mask
-            } else {
-                self.changed_subs_by_hash(tiled, last, had_prev)
             }
         };
         // From here on the texture's memory may be read in place. Held until
@@ -2068,7 +2062,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                let sub_mask = pick_sub_mask(read, last, had_prev);
+                let sub_mask = self.changed_subs_by_hash(read, last, had_prev);
                 self.detile_masked(read, last, sub_mask);
                 true
             });
@@ -2092,7 +2086,7 @@ impl Staging {
                 let had_prev = last.hash.is_some();
                 last.hash = Some(hash);
                 found_blind(last);
-                let sub_mask = pick_sub_mask(tiled, last, had_prev);
+                let sub_mask = self.changed_subs_by_hash(tiled, last, had_prev);
                 self.detile_masked(tiled, last, sub_mask);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -2111,7 +2105,7 @@ impl Staging {
         let had_prev = last.hash.is_some();
         last.hash = Some(hash);
         found_blind(last);
-        let sub_mask = pick_sub_mask(tiled, last, had_prev);
+        let sub_mask = self.changed_subs_by_hash(tiled, last, had_prev);
         self.detile_masked(tiled, last, sub_mask);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);

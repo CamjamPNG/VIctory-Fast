@@ -24,6 +24,7 @@ if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    $settings.VICTORY_LEGACY_MUL_PLAIN = '1'
 }
 if ($RayTracing -or $NativeRT) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($NativeRT) { $settings.VICTORY_NATIVE_RT = '1' }

@@ -344,10 +344,14 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             // Between the rounds asked for, while submissions come.
             let mut last = std::time::Instant::now();
             let mut last_maint_frame: u64 = 0;
+            let mut maint_pending: Vec<(usize, Vec<u32>)> = Vec::new();
             loop {
                 // Brief bounded spin right after a round finishes so back-to-back
                 // submissions avoid OS condvar wakeup latency (~20-80 us each).
-                if last.elapsed().as_millis() < 500 && SYNC_ASKED.load(Acquire) <= SYNC_DONE.load(Acquire) {
+                if maint_pending.is_empty()
+                    && last.elapsed().as_millis() < 500
+                    && SYNC_ASKED.load(Acquire) <= SYNC_DONE.load(Acquire)
+                {
                     let spin_until = std::time::Instant::now() + std::time::Duration::from_micros(40);
                     while SYNC_ASKED.load(Acquire) <= SYNC_DONE.load(Acquire)
                         && std::time::Instant::now() < spin_until
@@ -355,25 +359,35 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                         std::hint::spin_loop();
                     }
                 }
-                let mut r = rounds();
-                let mut target = (r.0 > r.1).then_some(r.0);
-                while target.is_none() {
-                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
-                        r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                let target = if !maint_pending.is_empty() && SYNC_ASKED.load(Acquire) <= SYNC_DONE.load(Acquire) {
+                    // Drain remaining chunked maintenance while no submission is waiting.
+                    let _maint = crate::timeline::span("the heaps' records, maintenance chunk");
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sync_heaps_maintenance_step(&mut maint_pending, true);
+                    }));
+                    continue;
+                } else {
+                    let mut r = rounds();
+                    let mut target = (r.0 > r.1).then_some(r.0);
+                    while target.is_none() {
+                        let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
+                            r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                            target = (r.0 > r.1).then_some(r.0);
+                            continue;
+                        };
+                        let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
+                        r = back;
                         target = (r.0 > r.1).then_some(r.0);
-                        continue;
-                    };
-                    let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
-                    r = back;
-                    target = (r.0 > r.1).then_some(r.0);
-                    if over.timed_out() {
-                        break;
+                        if over.timed_out() {
+                            break;
+                        }
                     }
-                }
-                if let Some(t) = target {
-                    r.1 = t;
-                }
-                drop(r);
+                    if let Some(t) = target {
+                        r.1 = t;
+                    }
+                    drop(r);
+                    target
+                };
                 let _over = target.map(|t| {
                     last = std::time::Instant::now();
                     Over(t)
@@ -386,8 +400,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 let _ = std::panic::catch_unwind(sync_heaps_marked);
                 // Signal `SYNC_DONE` before aged-slot / fallback-page maintenance
                 // so `victory-submit` leaves `wait_heaps` immediately; maintenance
-                // still runs sequentially on this thread so it never races with
-                // the next `sync_heaps_marked` round.
+                // runs in small preemptible chunks that yield as soon as a new
+                // submission round arrives.
                 drop(_over);
                 drop(_round);
                 let frame = crate::frame::current();
@@ -396,7 +410,9 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 {
                     last_maint_frame = frame;
                     let _maint = crate::timeline::span("the heaps' records, maintenance");
-                    let _ = std::panic::catch_unwind(sync_heaps_maintenance);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        sync_heaps_maintenance_step(&mut maint_pending, true);
+                    }));
                 }
             }
         });
@@ -840,10 +856,23 @@ fn sync_heaps_marked() {
 /// after `SYNC_DONE` has already unblocked `victory-submit`.
 #[cfg(windows)]
 fn sync_heaps_maintenance() {
-    use std::sync::atomic::Ordering::Relaxed;
+    let mut pending = Vec::new();
+    sync_heaps_maintenance_step(&mut pending, false);
+}
+
+/// Chunked, optionally preemptible maintenance step. When `preemptible` is
+/// `true`, limits each aged-slot slice to `MAINT_CHUNK` slots and yields
+/// immediately when `SYNC_ASKED > SYNC_DONE` so `victory-submit` never stalls
+/// behind a multi-millisecond maintenance burst.
+#[cfg(windows)]
+fn sync_heaps_maintenance_step(pending: &mut Vec<(usize, Vec<u32>)>, preemptible: bool) {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     if !sync_on() {
+        pending.clear();
         return;
     }
+    const MAINT_CHUNK: usize = 512;
+    let demanded = || preemptible && SYNC_ASKED.load(Acquire) > SYNC_DONE.load(Acquire);
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
@@ -856,110 +885,172 @@ fn sync_heaps_maintenance() {
     let frame = crate::frame::current();
     let (pages_a_job, records_a_job) = sync_jobs();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    for &(start, end, at) in heaps.iter() {
-        // SAFETY: registered heaps are live (removed when dropped).
-        let heap = unsafe { &*(at as *const Heap) };
-        let (Some(Some(host)), Some(written), Some(step)) =
-            (heap.host.get(), &heap.written, increment(heap.desc.kind))
-        else {
-            continue;
-        };
-        let step = u64::from(step);
-        let mirrored_count = heap.desc.count.min(host.count());
-        // The records of some frames ago that no draw read through a table
-        // since: a shader may pick them by index.
-        let before = host.copied_before(frame);
-        if !before.is_empty() {
-            let of_tables = std::sync::atomic::AtomicU64::new(0);
-            let phase = crate::timeline::span("the heaps' records: those that waited");
-            crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
-                let chunk = before.chunks(records_a_job).nth(n).unwrap_or_default();
-                let mut to_mirror = Vec::with_capacity(chunk.len());
-                let mut tabled_n = 0u64;
-                for &index in chunk {
-                    if host.copied_tabled(index, frame) {
-                        tabled_n += 1;
-                    } else {
-                        to_mirror.push(index);
-                    }
+    let mirror_before_slice = |host: &host::HostHeap, start: u64, step: u64, slice: &[u32]| -> (u64, u64) {
+        if slice.is_empty() {
+            return (0, 0);
+        }
+        let of_tables = std::sync::atomic::AtomicU64::new(0);
+        let phase = crate::timeline::span("the heaps' records: those that waited");
+        crate::land::each_view(true, slice.len().div_ceil(records_a_job), &|n| {
+            let chunk = slice.chunks(records_a_job).nth(n).unwrap_or_default();
+            let mut to_mirror = Vec::with_capacity(chunk.len());
+            let mut tabled_n = 0u64;
+            for &index in chunk {
+                if host.copied_tabled(index, frame) {
+                    tabled_n += 1;
+                } else {
+                    to_mirror.push(index);
                 }
-                if tabled_n > 0 {
-                    of_tables.fetch_add(tabled_n, Relaxed);
-                }
-                if !to_mirror.is_empty() {
-                    host.mirror_batch(&to_mirror, start, step, false);
-                }
-            });
-            phase.end();
-            let of_tables = of_tables.into_inner();
-            tabled += of_tables;
-            mirrored += before.len() as u64 - of_tables;
-            kinds[4] += before.len() as u64 - of_tables;
-        }
-        let port = crate::port_descriptors::adopted(start);
-        if !port {
-            continue;
-        }
-        if crate::port_descriptors::ask_due(frame) {
-            let began = std::time::Instant::now();
-            let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
-            let taken = written.take(start as usize, end as usize);
-            phase.end();
-            spent[0] += since(began);
-            crate::port_descriptors::asked(&taken);
-        }
-        let mut check_parts: Vec<(usize, usize, bool)> = Vec::new();
-        for page in crate::port_descriptors::to_check(frame) {
-            check_parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
-        }
-        if check_parts.is_empty() {
-            continue;
-        }
-        let began = std::time::Instant::now();
-        let found = scan_heap_parts(
-            host,
-            start,
-            step,
-            mirrored_count,
-            heap.samplers(),
-            port,
-            frame,
-            &check_parts,
-            pages_a_job,
-        );
-        let mut make: Vec<u32> = Vec::new();
-        for mut part in found {
-            pages += part.pages;
-            views += part.views;
-            bytes += part.bytes;
-            looked += part.looked;
-            short += part.short;
-            tabled += part.tabled;
-            kinds[0] += part.nothing;
-            later += part.wait.len() as u64;
-            mirrored += part.make.len() as u64;
-            wait.append(&mut part.wait);
-            make.append(&mut part.make);
-            for (kind, n) in kinds.iter_mut().zip(part.kinds) {
-                *kind += n;
             }
-            for (ns, n) in job_ns.iter_mut().zip(part.ns) {
-                *ns += n;
+            if tabled_n > 0 {
+                of_tables.fetch_add(tabled_n, Relaxed);
             }
-        }
-        spent[1] += since(began);
-        let began = std::time::Instant::now();
-        let phase = crate::timeline::span("the heaps' records: made");
-        crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
-            let chunk = make.chunks(records_a_job).nth(n).unwrap_or_default();
-            if !chunk.is_empty() {
-                host.mirror_batch(chunk, start, step, false);
+            if !to_mirror.is_empty() {
+                host.mirror_batch(&to_mirror, start, step, false);
             }
         });
         phase.end();
-        spent[2] += since(began);
-        if !wait.is_empty() {
-            host.copied_wait(frame, std::mem::take(&mut wait));
+        let of_tables = of_tables.into_inner();
+        (of_tables, slice.len() as u64 - of_tables)
+    };
+
+    // First drain one chunk of any deferred aged-slot work carried over from an earlier yield.
+    if !pending.is_empty() {
+        while let Some((at, mut slots)) = pending.pop() {
+            let Some(&(start, _, _)) = heaps.iter().find(|&&(_, _, h)| h == at) else {
+                continue;
+            };
+            // SAFETY: registered heap found under `SHADER_HEAPS` read lock.
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+                continue;
+            };
+            let step = u64::from(step);
+            if preemptible && slots.len() > MAINT_CHUNK {
+                let take_at = slots.len() - MAINT_CHUNK;
+                let slice = slots.split_off(take_at);
+                pending.push((at, slots));
+                let (t, m) = mirror_before_slice(host, start, step, &slice);
+                tabled += t;
+                mirrored += m;
+                kinds[4] += m;
+                break;
+            }
+            let (t, m) = mirror_before_slice(host, start, step, &slots);
+            tabled += t;
+            mirrored += m;
+            kinds[4] += m;
+            if demanded() {
+                break;
+            }
+        }
+    } else {
+        for &(start, end, at) in heaps.iter() {
+            // SAFETY: registered heaps are live (removed when dropped).
+            let heap = unsafe { &*(at as *const Heap) };
+            let (Some(Some(host)), Some(written), Some(step)) =
+                (heap.host.get(), &heap.written, increment(heap.desc.kind))
+            else {
+                continue;
+            };
+            let step = u64::from(step);
+            let mirrored_count = heap.desc.count.min(host.count());
+            // The records of some frames ago that no draw read through a table
+            // since: a shader may pick them by index.
+            let mut before = host.copied_before(frame);
+            if !before.is_empty() {
+                if preemptible && before.len() > MAINT_CHUNK {
+                    let take_at = before.len() - MAINT_CHUNK;
+                    let slice = before.split_off(take_at);
+                    pending.push((at, before));
+                    let (t, m) = mirror_before_slice(host, start, step, &slice);
+                    tabled += t;
+                    mirrored += m;
+                    kinds[4] += m;
+                    if demanded() {
+                        break;
+                    }
+                } else {
+                    let (t, m) = mirror_before_slice(host, start, step, &before);
+                    tabled += t;
+                    mirrored += m;
+                    kinds[4] += m;
+                }
+            }
+            if demanded() {
+                break;
+            }
+            let port = crate::port_descriptors::adopted(start);
+            if !port {
+                continue;
+            }
+            if crate::port_descriptors::ask_due(frame) {
+                let began = std::time::Instant::now();
+                let phase = crate::timeline::span("the heaps' records: asking (renderer port 2's fallback)");
+                let taken = written.take(start as usize, end as usize);
+                phase.end();
+                spent[0] += since(began);
+                crate::port_descriptors::asked(&taken);
+            }
+            if demanded() {
+                break;
+            }
+            let mut check_parts: Vec<(usize, usize, bool)> = Vec::new();
+            for page in crate::port_descriptors::to_check(frame) {
+                check_parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+            }
+            if check_parts.is_empty() {
+                continue;
+            }
+            let began = std::time::Instant::now();
+            let found = scan_heap_parts(
+                host,
+                start,
+                step,
+                mirrored_count,
+                heap.samplers(),
+                port,
+                frame,
+                &check_parts,
+                pages_a_job,
+            );
+            let mut make: Vec<u32> = Vec::new();
+            for mut part in found {
+                pages += part.pages;
+                views += part.views;
+                bytes += part.bytes;
+                looked += part.looked;
+                short += part.short;
+                tabled += part.tabled;
+                kinds[0] += part.nothing;
+                later += part.wait.len() as u64;
+                mirrored += part.make.len() as u64;
+                wait.append(&mut part.wait);
+                make.append(&mut part.make);
+                for (kind, n) in kinds.iter_mut().zip(part.kinds) {
+                    *kind += n;
+                }
+                for (ns, n) in job_ns.iter_mut().zip(part.ns) {
+                    *ns += n;
+                }
+            }
+            spent[1] += since(began);
+            let began = std::time::Instant::now();
+            let phase = crate::timeline::span("the heaps' records: made");
+            crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+                let chunk = make.chunks(records_a_job).nth(n).unwrap_or_default();
+                if !chunk.is_empty() {
+                    host.mirror_batch(chunk, start, step, false);
+                }
+            });
+            phase.end();
+            spent[2] += since(began);
+            if !wait.is_empty() {
+                host.copied_wait(frame, std::mem::take(&mut wait));
+            }
+            if demanded() {
+                break;
+            }
         }
     }
     drop(heaps);
@@ -1851,34 +1942,58 @@ fn wait_for(resource: usize, handle: u64) {
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
-    for resource in made {
-        let handles = WAITING
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&resource);
-        for handle in handles.into_iter().flatten() {
-            // Only if the slot still holds a view of that texture: the
-            // title may have written it since (and a view of another
-            // texture without a host copy must go on waiting).
-            // (Looked up first: the handle is read only while its heap is
-            // there.)
-            // (The heap stays while the lock is held: `mirror`.)
-            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-            let Some(&(_, _, at)) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle)) else {
-                continue;
-            };
-            // SAFETY: a registered heap, live while the lock is held.
-            let heap = unsafe { &*(at as *const Heap) };
-            let Some(index) = heap.index(handle) else {
-                continue;
-            };
-            let same = match view(handle) {
-                Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
-                _ => false,
-            };
-            if same && let Some(Some(host)) = heap.host.get() {
-                host.mirror(index, handle, true);
+    if made.is_empty() {
+        return;
+    }
+    let pending: Vec<(usize, Vec<u64>)> = {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        made.into_iter()
+            .filter_map(|resource| waiting.remove(&resource).map(|h| (resource, h)))
+            .collect()
+    };
+    if pending.is_empty() {
+        return;
+    }
+    // Hold `SHADER_HEAPS` read lock while resolving and mirroring batches so
+    // registered heaps stay live throughout (`mirror` contract).
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut by_heap: Vec<(usize, Vec<(u32, u64, Option<[u32; 3]>)>)> = Vec::new();
+    {
+        let views = lock_views_read();
+        for (resource, handles) in pending {
+            for handle in handles {
+                let Some(&(_, _, at)) = heaps.iter().find(|&&(start, end, _)| (start..end).contains(&handle)) else {
+                    continue;
+                };
+                // SAFETY: a registered heap, live while `heaps` lock is held.
+                let heap = unsafe { &*(at as *const Heap) };
+                let Some(index) = heap.index(handle) else {
+                    continue;
+                };
+                // SAFETY: `handle` is a descriptor slot inside `heap`.
+                let rec = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                if rec[0] != VIEW_TAG {
+                    continue;
+                }
+                let same = match views.view_at(rec[1], rec[2]) {
+                    Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
+                    _ => false,
+                };
+                if same {
+                    if let Some((_, list)) = by_heap.iter_mut().find(|(h, _)| *h == at) {
+                        list.push((index, handle, Some(rec)));
+                    } else {
+                        by_heap.push((at, vec![(index, handle, Some(rec))]));
+                    }
+                }
             }
+        }
+    }
+    for (at, items) in by_heap {
+        // SAFETY: registered heap, live while `heaps` lock is held.
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.mirror_batch_handles(&items);
         }
     }
 }

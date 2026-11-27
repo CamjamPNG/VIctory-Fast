@@ -154,6 +154,69 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether FP16 half caching, constant/idempotent `IMin/IMax/UMin/UMax` folding,
+/// direct RDNA `threadIdInGroup`, RDNA 3/5-op `norm_quotient`, trimmed
+/// `format_load` masks, guarded `buffer_load_ushort/sshort`, and `Effect::Pure`
+/// `isHelperLane` are enabled (`VICTORY_RDNA_FP16_OPT=1` enables; off by
+/// default on RX 9070 XT to avoid extending f32 VGPR live ranges).
+/// Part of the translation: the shader cache keys on it.
+pub fn rdna_fp16_opt_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_rdna_fp16_opt() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_RDNA_FP16_OPT").is_some_and(|v| v == "1")
+    })
+}
+
+/// Whether native RDNA/DXIL VALU lowering is enabled: 1-op `UiToFp` for
+/// `v_cvt_f32_u32` on RDNA, native `IMin`/`IMax`/`UMin`/`UMax`, `Ubfe`/`Ibfe`,
+/// `Msad`, `And(0xFFFFFF)` for `u24` ops, and optimized `med3` on RDNA
+/// (`VICTORY_RDNA_VALU_OPT=1` enables; off by default because opaque DXIL
+/// intrinsics inhibit `bitcode::opt` folding and regressed RX 9070 XT GPU time).
+/// Part of the translation: the shader cache keys on it.
+pub fn rdna_valu_opt_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_rdna_valu_opt() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_RDNA_VALU_OPT").is_some_and(|v| v == "1")
+    })
+}
+
+/// Whether `legacy_mul` / `legacy_fmad` use extended `bounded()` analysis and
+/// post-folding zero-guard elision (`VICTORY_LEGACY_MUL_OPT=0` disables both;
+/// on by default). Part of the translation: the shader cache keys on it.
+pub fn legacy_mul_opt_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_legacy_mul_opt() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LEGACY_MUL_OPT").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether `v_mul_legacy_f32` and `v_mac/mad/fma_legacy_f32` lower directly to
+/// plain `Bin::Mul` / `FMad` on AMD RDNA without zero-guards
+/// (`VICTORY_LEGACY_MUL_PLAIN=1` enables; off by default to preserve exact
+/// `0 * Inf = 0` semantics). Part of the translation: the shader cache keys on it.
+pub fn legacy_mul_plain_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_legacy_mul_plain() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LEGACY_MUL_PLAIN").is_some_and(|v| v == "1")
+    })
+}
+
 /// Whether RDNA/DXIL optimizations are enabled: Wave32 `wave_base` LDS/barrier/atomic
 /// elision on AMD RDNA, barrier-separated multi-wave `lds_safe` Wave32 relaxation,
 /// bindless `SLOT_STRIDES` diamond skip under `VICTORY_PORT_CBV=1` + vector raw loads,
@@ -551,6 +614,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.push(u8::from(mesh_alloc_counts_on()));
     out.push(u8::from(fast_rcp_on()));
     out.push(u8::from(rdna_opt_on()));
+    out.push(u8::from(legacy_mul_opt_on()));
+    out.push(u8::from(legacy_mul_plain_on()));
+    out.push(u8::from(rdna_valu_opt_on()));
+    out.push(u8::from(rdna_fp16_opt_on()));
     out
 }
 
@@ -1536,7 +1603,7 @@ mod tests {
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
-        assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(usual, 127, "all passes including bit-exact wide loads");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);

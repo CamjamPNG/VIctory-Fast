@@ -442,12 +442,28 @@ impl PendingPublish {
                 host.texture_slots_flip();
             }
         }
+        let mut batch: Vec<(u32, u64, u64)> = Vec::new();
+        let mut cur_heap: Option<usize> = None;
+        let flush_heap = |heap_ptr: usize, batch: &mut Vec<(u32, u64, u64)>| {
+            if batch.is_empty() {
+                return;
+            }
+            if let Some(host) = crate::descriptor::heap(heap_ptr as This).host() {
+                let (shown, stale) = host.publish_batch(batch);
+                STATS[3].fetch_add(shown, Relaxed);
+                STATS[4].fetch_add(stale, Relaxed);
+            }
+            batch.clear();
+        };
         for p in self.publish.drain(..) {
-            let Some(host) = crate::descriptor::heap(p.heap as This).host() else {
-                continue;
-            };
-            let shown = host.publish(p.index, p.handle, p.key);
-            STATS[if shown { 3 } else { 4 }].fetch_add(1, Relaxed);
+            if cur_heap.is_some_and(|h| h != p.heap) {
+                flush_heap(cur_heap.unwrap(), &mut batch);
+            }
+            cur_heap = Some(p.heap);
+            batch.push((p.index, p.handle, p.key));
+        }
+        if let Some(h) = cur_heap {
+            flush_heap(h, &mut batch);
         }
     }
 }

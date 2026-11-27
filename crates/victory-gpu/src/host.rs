@@ -5380,7 +5380,6 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 pub(crate) mod send;
@@ -12722,7 +12721,6 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
 
@@ -12754,7 +12752,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -13188,14 +13185,13 @@ impl Host {
             let read_now = take_shot || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = take_shot;
-            // In release builds without a pending screenshot, nothing copies
-            // from/onto `back` after two-plane compositing, so transition
-            // `RENDER_TARGET -> PRESENT` directly. In diagnostics builds,
-            // `Panel::draw` can be toggled at runtime and expects `COPY_DEST`.
+            // In release builds without a pending screenshot or visible overlay,
+            // nothing copies from/onto `back` after two-plane compositing, so
+            // transition `RENDER_TARGET -> PRESENT` directly.
             #[cfg(feature = "diagnostics")]
             let needs_back_copy = true;
             #[cfg(not(feature = "diagnostics"))]
-            let needs_back_copy = take_shot;
+            let needs_back_copy = take_shot || p.panel.visible();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -13325,7 +13321,6 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
@@ -13383,7 +13378,6 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             PRESENT_NS.fetch_add(present_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
             p.meter.frame(p.hwnd);
             showing.end();
@@ -13421,7 +13415,6 @@ impl Host {
             hwnd,
             meter: Meter::new(),
             composer: None,
-            #[cfg(feature = "diagnostics")]
             panel: panel::Panel::new(),
         })
     }

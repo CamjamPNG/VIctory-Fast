@@ -35,6 +35,7 @@
 //! bounds what the air scatters by a multiple of the light around.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
@@ -109,12 +110,41 @@ fn parse(set: &str) -> Set {
     }
 }
 
-fn set() -> Set {
+/// Live override for the ambient estimate level (`u32::MAX` = use env default).
+static LIVE_LEVEL: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn env_set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
         Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
         set => set,
     })
+}
+
+fn set() -> Set {
+    let bits = LIVE_LEVEL.load(Ordering::Relaxed);
+    if bits != u32::MAX {
+        let level = f32::from_bits(bits);
+        return if level > 0.0 { Set::Estimate(level) } else { Set::Off };
+    }
+    env_set()
+}
+
+/// Active ambient level (`None` when off), reflecting any live HUD override.
+pub(crate) fn current_level() -> Option<f32> {
+    match set() {
+        Set::Off => None,
+        Set::Estimate(level) | Set::Constant(level) => Some(level),
+    }
+}
+
+/// Live override for the ambient estimate multiplier (clamped `0.0..=4.0`;
+/// `0.0` disables ambient immediately on the next frame).
+pub(crate) fn set_live_level(level: f32) {
+    if !level.is_finite() {
+        return;
+    }
+    LIVE_LEVEL.store(level.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
 }
 
 /// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
@@ -903,6 +933,20 @@ mod tests {
         assert!(!parse_reflect_alpha("0"));
         assert!(!parse_reflect_alpha("off"));
         assert!(!parse_reflect_alpha("false"));
+    }
+
+    #[test]
+    fn live_level_override() {
+        LIVE_LEVEL.store(u32::MAX, Ordering::Relaxed);
+        set_live_level(1.8);
+        assert_eq!(current_level(), Some(1.8));
+        set_live_level(9.0);
+        assert_eq!(current_level(), Some(4.0));
+        set_live_level(-2.0);
+        assert_eq!(current_level(), None);
+        set_live_level(f32::NAN);
+        assert_eq!(current_level(), None);
+        LIVE_LEVEL.store(u32::MAX, Ordering::Relaxed);
     }
 
     /// The passes compile with the system's compiler and the host takes them.

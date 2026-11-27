@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod census;
 pub mod opt;
@@ -235,6 +235,9 @@ pub(crate) struct Module {
     tags: HashMap<u32, Tag>,
     /// LLVM 3.7 fast-math flags (`fast_math::*`) by instruction index.
     fast_math: HashMap<u32, u8>,
+    /// Instructions whose result is proven to be a finite float in `[-1.0, 1.0]`
+    /// (as `f32` or its `i32` bit pattern), such as `norm_quotient` outputs.
+    unit_floats: HashSet<u32>,
 }
 
 impl Module {
@@ -332,6 +335,14 @@ impl Module {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// Marks `v` as a finite float in `[-1.0, 1.0]` (or its `i32` bit pattern)
+    /// for [`Module::bounded`].
+    pub(crate) fn mark_unit_float(&mut self, v: V) {
+        if let V::Inst(i) = v {
+            self.unit_floats.insert(i);
         }
     }
 

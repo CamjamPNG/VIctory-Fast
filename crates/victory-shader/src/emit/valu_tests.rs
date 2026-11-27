@@ -2013,13 +2013,22 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
     const ONE: u16 = 242;
     const MINUS_ONE: u16 = 243;
     let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
-    let saturated = vop3_mod(0x110, 5, vgpr(1), vgpr(1), 0, 0, 0, 0, true);
+    let sat_a = vop3_mod(0x110, 5, a, a, 0, 0, 0, 0, true);
+    let sat_b = vop3_mod(0x110, 6, b, b, 0, 0, 0, 0, true);
+    let sat_c = vop3_mod(0x110, 7, c, c, 0, 0, 0, 0, true);
     let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
-    let bodies: [(&str, Vec<u32>, bool); 14] = [
+    let bodies: [(&str, Vec<u32>, bool); 17] = [
         ("max", vop3(0x110, 0, a, b, 0).to_vec(), true),
         ("min", vop3(0x10F, 0, a, b, 0).to_vec(), true),
         ("max3", vop3(0x154, 0, a, b, c).to_vec(), true),
         ("min3", vop3(0x151, 0, a, b, c).to_vec(), true),
+        ("med3", vop3(0x157, 0, a, b, c).to_vec(), true),
+        ("med3 1 const", vop3(0x157, 0, a, b, ONE).to_vec(), true),
+        (
+            "med3 bounded",
+            [sat_a, sat_b, sat_c, vop3(0x157, 0, vgpr(5), vgpr(6), vgpr(7))].concat(),
+            true,
+        ),
         ("med3 0 1", vop3(0x157, 0, a, 128, ONE).to_vec(), true),
         ("med3 1 0", vop3(0x157, 0, ONE, a, 128).to_vec(), true),
         ("med3 1 -1", vop3(0x157, 0, ONE, MINUS_ONE, a).to_vec(), true),
@@ -2027,7 +2036,7 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
         ("mul_legacy", vop3(0x107, 0, a, b, 0).to_vec(), false),
         ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec(), false),
         ("mul_legacy by a constant", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec(), false),
-        ("mul_legacy of a saturated", two(saturated, vop3(0x107, 0, vgpr(5), b, 0)), false),
+        ("mul_legacy of a saturated", two(sat_a, vop3(0x107, 0, vgpr(5), b, 0)), false),
         ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec(), false),
         ("max of a mul_legacy", two(vop3(0x107, 5, a, b, 0), vop3(0x110, 0, vgpr(5), c, 0)), false),
     ];
@@ -3026,4 +3035,226 @@ fn v_cvt_f32_u32_rounds_full_width_inputs_once() {
             inp[0]
         );
     });
+}
+
+#[test]
+fn rdna_valu_opt_uitofp_msad_u24_and_toggle() {
+    // 1) host_settings()[4] bit 6 and translation_fingerprint() reflect VICTORY_RDNA_VALU_OPT.
+    let prev_opt = lower::TEST_RDNA_VALU_OPT.replace(Some(true));
+    let hs_on = lower::host_settings();
+    let fp_on = super::translation_fingerprint();
+    assert_ne!(hs_on[4] & (1 << 6), 0, "VICTORY_RDNA_VALU_OPT default bit 6 must be 1");
+    lower::TEST_RDNA_VALU_OPT.set(Some(false));
+    let hs_off = lower::host_settings();
+    let fp_off = super::translation_fingerprint();
+    assert_eq!(hs_off[4] & (1 << 6), 0);
+    assert_ne!(hs_on, hs_off);
+    assert_ne!(fp_on, fp_off);
+    lower::TEST_RDNA_VALU_OPT.set(Some(true));
+
+    // 2) v_msad_u8 v0, v1, v2, v3 (VOP3 0x171): src1 (v2) is the mask byte (0 skips byte).
+    let msad_on = build_valu_cs(&vop3(0x171, 0, vgpr(1), vgpr(2), vgpr(3)));
+    lower::TEST_RDNA_VALU_OPT.set(Some(false));
+    let msad_off = build_valu_cs(&vop3(0x171, 0, vgpr(1), vgpr(2), vgpr(3)));
+    lower::TEST_RDNA_VALU_OPT.set(Some(true));
+    assert!(
+        msad_on.dxil.len() < msad_off.dxil.len(),
+        "native Msad must shrink v_msad_u8 DXIL ({} vs {})",
+        msad_on.dxil.len(),
+        msad_off.dxil.len()
+    );
+    let msad_cases: &[([u32; 4], u32)] = &[
+        // Asymmetric zero bytes: byte 0 of src1 is 0 (skipped), byte 1 of src0 is 0 (NOT skipped!).
+        ([0x1020_0055, 0x0500_3000, 100, 0], 100 + (0x30 - 0x00) + (0x10 - 0x05)),
+        // All src1 bytes 0 -> returns accum unchanged.
+        ([0xFFFF_FFFF, 0x0000_0000, 0x1234, 0], 0x1234),
+        // All non-zero bytes with wrapping 32-bit add.
+        ([0xFF01_8040, 0x01FF_4080, 0xFFFF_FF00, 0], 0xFFFF_FF00u32.wrapping_add(254 + 254 + 64 + 64)),
+    ];
+    let msad_in: Vec<[u32; 4]> = msad_cases.iter().map(|c| c.0).collect();
+    run_cases(&msad_on, &msad_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, msad_cases[i].1,
+            "{backend}: v_msad_u8({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {:#010x}",
+            inp[0], inp[1], inp[2], msad_cases[i].1
+        );
+    });
+
+    // 3) v_mul_u32_u24 (VOP3 0x10B) & v_mad_u32_u24 (VOP3 0x143) with And(0xFFFFFF).
+    let mul_u24 = build_valu_cs(&vop3(0x10B, 0, vgpr(1), vgpr(2), 0));
+    let mad_u24 = build_valu_cs(&vop3(0x143, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let u24_cases = [
+        [0xFF00_0003, 0xAB00_0005, 7, 0],
+        [0xDEAD_BEEF, 0xCAFE_BABE, 0x1234_5678, 0],
+        [0xFF80_0000, 0xFF00_0002, 0xFFFF_FFFF, 0],
+    ];
+    run_cases(&mul_u24, &u24_cases, |backend, _, inp, got| {
+        let want = (inp[0] & 0x00FF_FFFF).wrapping_mul(inp[1] & 0x00FF_FFFF);
+        assert_eq!(got, want, "{backend}: v_mul_u32_u24({inp:08x?})");
+    });
+    run_cases(&mad_u24, &u24_cases, |backend, _, inp, got| {
+        let want = (inp[0] & 0x00FF_FFFF)
+            .wrapping_mul(inp[1] & 0x00FF_FFFF)
+            .wrapping_add(inp[2]);
+        assert_eq!(got, want, "{backend}: v_mad_u32_u24({inp:08x?})");
+    });
+
+    // 4) N13: 1-op UiToFp for v_cvt_f32_u32 on RDNA hardware (bit-exact across midpoints).
+    if rdna_card() {
+        let prev_rdna = lower::TEST_RDNA.replace(Some(super::rdna::ALL));
+        let cvt_on = build_valu_cs(&[vop1(0x06, 0, vgpr(1))]);
+        lower::TEST_RDNA_VALU_OPT.set(Some(false));
+        let cvt_off = build_valu_cs(&[vop1(0x06, 0, vgpr(1))]);
+        lower::TEST_RDNA_VALU_OPT.set(Some(true));
+        lower::TEST_RDNA.set(prev_rdna);
+        assert!(
+            cvt_on.dxil.len() < cvt_off.dxil.len(),
+            "RDNA 1-op UiToFp must shrink v_cvt_f32_u32 DXIL ({} vs {})",
+            cvt_on.dxil.len(),
+            cvt_off.dxil.len()
+        );
+        let mut unsigned = vec![0u32, 1, 0xFFFF, 0x1_0000, 0xDE84_975E, 0xFFFF_FF7F, u32::MAX];
+        for exponent in 24..32 {
+            let base = 1u32 << exponent;
+            let ulp = base >> 23;
+            for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+                unsigned.extend([midpoint - 1, midpoint, midpoint + 1]);
+            }
+        }
+        let inputs: Vec<[u32; 4]> = unsigned.iter().map(|&x| [x, 0, 0, 0]).collect();
+        run_cases_on(&cvt_on, &inputs, &[("hardware", false)], |backend, _, inp, got| {
+            let want = (inp[0] as f32).to_bits();
+            assert_eq!(
+                got, want,
+                "{backend}: RDNA v_cvt_f32_u32({:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0]
+            );
+        });
+    }
+
+    lower::TEST_RDNA_VALU_OPT.set(prev_opt);
+}
+
+#[test]
+fn rdna_fp16_opt_norm_quotient_packed_cache_and_toggle() {
+    let prev_fp16 = lower::TEST_RDNA_FP16_OPT.replace(Some(true));
+
+    // 1) host_settings()[4] bit 7 and translation_fingerprint() reflect VICTORY_RDNA_FP16_OPT.
+    let hs_on = lower::host_settings();
+    let fp_on = super::translation_fingerprint();
+    assert_ne!(hs_on[4] & (1 << 7), 0, "VICTORY_RDNA_FP16_OPT default bit 7 must be 1");
+    lower::TEST_RDNA_FP16_OPT.set(Some(false));
+    let hs_off = lower::host_settings();
+    let fp_off = super::translation_fingerprint();
+    assert_eq!(hs_off[4] & (1 << 7), 0);
+    assert_ne!(hs_on, hs_off);
+    assert_ne!(fp_on, fp_off);
+    lower::TEST_RDNA_FP16_OPT.set(Some(true));
+
+    // 2) N6: consecutive v_pk_add_f16 + v_pk_mul_f16 reuse cached unpacked f32 halves
+    //    and drop redundant And(0xFFFF) on legacyF32ToF16.
+    // v_pk_add_f16 v5, v1, v2 (VOP3P op 0x0F); v_pk_mul_f16 v0, v5, v3 (VOP3P op 0x10)
+    // op_sel_hi = [1, 1, 1] (0x18 << 24 | 0x02 << 24 = bits [59:61] -> word1 bits [27:29])
+    // In our existing test: 0xcc0f4000, 0x1a0202f8 has op_sel_hi=[1,1], src0=248, src1=v1.
+    // Word0: 0xCC << 24 | (op << 16) | (1 << 14) | vdst  (bit 14 is op_sel_hi[2]=1)
+    // Word1: (3 << 27) | (src1 << 9) | src0
+    let pk_chain = [
+        0xCC0F_4005u32,
+        (3 << 27) | (u32::from(vgpr(2)) << 9) | u32::from(vgpr(1)), // v_pk_add_f16 v5, v1, v2
+        0xCC10_4000u32,
+        (3 << 27) | (u32::from(vgpr(3)) << 9) | u32::from(vgpr(5)), // v_pk_mul_f16 v0, v5, v3
+    ];
+    let pk_on = build_valu_cs(&pk_chain);
+    lower::TEST_RDNA_FP16_OPT.set(Some(false));
+    let pk_off = build_valu_cs(&pk_chain);
+    lower::TEST_RDNA_FP16_OPT.set(Some(true));
+    assert!(
+        pk_on.dxil.len() < pk_off.dxil.len(),
+        "N6 half caching + And(0xFFFF) removal must shrink v_pk_*_f16 chain ({} vs {})",
+        pk_on.dxil.len(),
+        pk_off.dxil.len()
+    );
+    // (1.0, 2.0) + (0.5, 1.5) = (1.5, 3.5); * (2.0, -1.0) = (3.0, -3.5) -> (0x4200, 0xC300)
+    let pk_cases = [[0x4000_3C00u32, 0x3E00_3800, 0xBC00_4000, 0]];
+    run_cases(&pk_on, &pk_cases, |backend, _, _, got| {
+        assert_eq!(got, 0xC300_4200, "{backend}: v_pk_add_f16 -> v_pk_mul_f16");
+    });
+
+    // 3) T4#7: buffer_load_ushort at aligned (0, 2) and straddling (1, 3) dynamic offsets.
+    // Store v1 at offset 0 and v2 at offset 4, then buffer_load_ushort v0, v3, s[8:11], 0 offen.
+    let mut ushort_body = Vec::new();
+    ushort_body.extend_from_slice(&buffer_store_dword(1, 8, 0));
+    ushort_body.extend_from_slice(&buffer_store_dword(2, 8, 4));
+    // MUBUF buffer_load_ushort (op 0x0A) with offen (bit 12 of word0): vdata=v0, vaddr=v3, srsrc=s[8:11], soffset=0.
+    ushort_body.extend_from_slice(&[
+        0x38 << 26 | 0x0A << 18 | (1 << 12),
+        0x80 << 24 | (2 << 16) | 3,
+    ]);
+    let ushort_shader = build_valu_cs(&ushort_body);
+    let u_cases = [
+        ([0x4433_2211u32, 0x8877_6655, 0, 0], 0x2211u32),
+        ([0x4433_2211u32, 0x8877_6655, 1, 0], 0x3322u32),
+        ([0x4433_2211u32, 0x8877_6655, 2, 0], 0x4433u32),
+        ([0x4433_2211u32, 0x8877_6655, 3, 0], 0x5544u32),
+    ];
+    // Need 2 dwords in RawUav for offset 4!
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&ushort_shader).expect("ushort pso");
+        for &(inp, want) in &u_cases {
+            let mut ud = vec![0u32; ushort_shader.user_data_dwords().max(1) as usize];
+            for u in &ushort_shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inp[u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(2)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("ushort dispatch");
+            assert_eq!(out[0][0], want, "{label}: buffer_load_ushort offset {}", inp[2]);
+        }
+    }
+    drop(_one);
+
+    // 4) T4#7: RDNA 5-op norm_quotient (w=8) has 0/256 bit mismatches on real RDNA 4 hardware,
+    //    and 3-op norm_quotient (w=2) has 0/4 mismatches.
+    if rdna_card() {
+        let prev_rdna = lower::TEST_RDNA.replace(Some(super::rdna::ALL));
+        let norm8_on = tbuffer_load_of_v1(0, 1); // 8_UNORM
+        lower::TEST_RDNA_FP16_OPT.set(Some(false));
+        let norm8_off = tbuffer_load_of_v1(0, 1);
+        lower::TEST_RDNA_FP16_OPT.set(Some(true));
+        let norm2_on = tbuffer_load_of_v1(0, 44); // 10_10_10_2_UNORM (channel 0 is 2-bit!)
+        lower::TEST_RDNA.set(prev_rdna);
+        assert!(
+            norm8_on.dxil.len() < norm8_off.dxil.len(),
+            "RDNA 5-op norm_quotient must shrink 8_UNORM DXIL ({} vs {})",
+            norm8_on.dxil.len(),
+            norm8_off.dxil.len()
+        );
+        let cases8: Vec<[u32; 4]> = (0..256u32).map(|a| [a, 0, 0, 0]).collect();
+        run_cases_on(&norm8_on, &cases8, &[("hardware", false)], |backend, _, [a, ..], got| {
+            let want = (a as f32 / 255.0).to_bits();
+            assert_eq!(got, want, "{backend}: RDNA 5-op 8_UNORM({a}) = {got:#010x}, want {want:#010x}");
+        });
+        let cases2: Vec<[u32; 4]> = (0..4u32).map(|a| [a, 0, 0, 0]).collect();
+        run_cases_on(&norm2_on, &cases2, &[("hardware", false)], |backend, _, [a, ..], got| {
+            let want = (a as f32 / 3.0).to_bits();
+            assert_eq!(got, want, "{backend}: RDNA 3-op 2-bit UNORM({a}) = {got:#010x}, want {want:#010x}");
+        });
+    }
+
+    lower::TEST_RDNA_FP16_OPT.set(prev_fp16);
 }

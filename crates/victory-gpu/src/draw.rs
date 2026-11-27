@@ -833,7 +833,9 @@ pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// date, those found as they were, and those mirrored (the descriptor
 /// records read again). Of the frame line's "heap buffers N passes", these
 /// are what a pass costs in slots: 400,000 looked at and 40,000 mirrored a
-/// frame on the XTX, most of them empty (`docs/findings.md`).
+/// frame on the XTX, most of them empty (`docs/findings.md`). A slot a
+/// draw's table owns and the pass keeps nothing for is no longer among them
+/// ([`HEAP_SWEEP`] counts those).
 #[cfg(feature = "diagnostics")]
 static HEAP_SLOTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -841,6 +843,62 @@ static HEAP_SLOTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn heap_slots() -> [u64; 4] {
     std::array::from_fn(|i| HEAP_SLOTS[i].swap(0, Ordering::Relaxed))
+}
+
+/// Since the last frame line, of the slots the pass would have looked at
+/// ([`HEAP_SLOTS`]'s first): those left out before the list was made, because
+/// a draw reads them through a table and the pass keeps nothing for them; of
+/// those that were looked at, those answered from what was kept of them and
+/// those whose record was read again ([`heap_sweep_cached`]).
+static HEAP_SWEEP: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// [`HEAP_SWEEP`], from now on 0: left out, from the cache, read.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn heap_sweep() -> [u64; 3] {
+    std::array::from_fn(|i| HEAP_SWEEP[i].swap(0, Ordering::Relaxed))
+}
+
+/// Whether the look at a slot every [`HEAP_ROUND`] passes takes what was kept
+/// of it while the view it shows is still one of ours, in place of reading the
+/// title's record again (`VICTORY_HEAP_SWEEP_CACHED=1`; off by default: the
+/// record is read, as before).
+///
+/// What the kept entry says is what a read of the record said when it was
+/// kept: a record the title wrote since is in the pass's `changed` and is read
+/// whatever this says, so all that is left out is a record nothing wrote --
+/// which is what the look keeps finding, slot after slot. What it could miss
+/// is a slot the title stopped filling as a buffer view without a write of its
+/// record, which is what the periodic look is for; hence off until the owner's
+/// run says the counts are what this says they are.
+pub(crate) fn heap_sweep_cached() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_SWEEP_CACHED").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `kept` and `written` as one list, in order and each slot once: both ascend
+/// and hold no repeats, which is what the pass's two halves give (`Slots::all`
+/// of this pass's part of the buffer slots, and `Slots::take` of those written
+/// since the last pass). It was a sort of the two together -- some 400,000
+/// slots a pass -- for a union one pass over each gives.
+fn merged_ascending(kept: Vec<u32>, written: &[u32]) -> Vec<u32> {
+    if written.is_empty() {
+        return kept;
+    }
+    let mut out = Vec::with_capacity(kept.len() + written.len());
+    let (mut i, mut j) = (0, 0);
+    while i < kept.len() || j < written.len() {
+        let next = if i == kept.len() || (j < written.len() && written[j] < kept[i]) {
+            j += 1;
+            written[j - 1]
+        } else {
+            i += 1;
+            kept[i - 1]
+        };
+        if out.last() != Some(&next) {
+            out.push(next);
+        }
+    }
+    out
 }
 
 /// Passes after which every buffer slot of the heap was looked at again.
@@ -959,7 +1017,41 @@ impl<T> HeapRanges<T> {
 
 #[cfg(test)]
 mod heap_range_tests {
-    use super::{HEAP_ROUND, HeapRanges};
+    use super::{HEAP_ROUND, HeapRanges, merged_ascending};
+
+    /// The two halves of a pass's list, merged, are the two of them sorted
+    /// and deduplicated: every slot once, in order, whatever they share.
+    #[test]
+    fn the_two_halves_merge_into_what_a_sort_gave() {
+        let mut seed = 11u64;
+        let mut random = move || {
+            seed = seed.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(0x1405_7B7E_F767_814F);
+            (seed >> 33) as u32
+        };
+        for (kept_len, written_len, spread) in [(0usize, 0usize, 1u32), (0, 9, 5), (40, 0, 7), (400, 60, 13), (1, 1, 1), (256, 257, 3)] {
+            let mut kept: Vec<u32> = (0..kept_len as u32).map(|_| random() % (spread * 90)).collect();
+            let mut written: Vec<u32> = (0..written_len as u32).map(|_| random() % (spread * 90)).collect();
+            kept.sort_unstable();
+            kept.dedup();
+            written.sort_unstable();
+            written.dedup();
+            let mut sorted = kept.clone();
+            sorted.extend_from_slice(&written);
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(merged_ascending(kept, &written), sorted, "{kept_len} kept, {written_len} written");
+        }
+    }
+
+    /// A run of one alone comes back as it was, and an empty one adds nothing.
+    #[test]
+    fn one_half_alone_is_the_list() {
+        assert_eq!(merged_ascending(vec![], &[]), Vec::<u32>::new());
+        assert_eq!(merged_ascending(vec![3, 9], &[]), vec![3, 9]);
+        assert_eq!(merged_ascending(vec![], &[3, 9]), vec![3, 9]);
+        assert_eq!(merged_ascending(vec![3, 9], &[9]), vec![3, 9]);
+        assert_eq!(merged_ascending(vec![3, 9], &[1, 3]), vec![1, 3, 9]);
+    }
 
     /// Round by round every slot is looked at again once, whatever was
     /// written between, and what a slot holds is what was found last.
@@ -1196,6 +1288,14 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
+///
+/// What it looks at is the slots the title wrote since the last pass and, a
+/// sixteenth of them each pass, the others. Of the first, the slots a draw
+/// reads through a table are dropped before the list is made: the draw makes
+/// those, and the pass keeps nothing of them to clear ([`HEAP_SWEEP`] counts
+/// them). The two halves are merged, not sorted. The others are read from the
+/// title's record unless [`heap_sweep_cached`] is on, which takes what was
+/// kept of them instead.
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
     // Per host heap: the host copy and range each slot's buffer view
@@ -1206,23 +1306,41 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // before its memory had a host copy is only made then.
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
-    let changed = host.buffer_changes();
+    let mut changed = host.buffer_changes();
+    // A slot a draw reads through a table is the draw's to make, not this
+    // pass's: looked at below, `copied_tabled` passes it over and there is no
+    // kept entry of it to clear, so it comes to nothing either way. Most of
+    // what the title copies into its heap as bytes each frame is the records
+    // of those very tables, so they are dropped here, before the list is
+    // merged and handed to the threads, rather than there one at a time.
+    let from_tables = changed.len();
+    changed.retain(|&index| !host.copied_tabled(index, frame) || ranges.get(index).is_some());
+    HEAP_SWEEP[0].fetch_add((from_tables - changed.len()) as u64, Ordering::Relaxed);
+    // [`heap_sweep_cached`]: which of the slots looked at the title wrote
+    // since the last pass, whose record is read whatever is kept of it.
+    let cached_on = heap_sweep_cached();
+    let mut written: Vec<u64> = Vec::new();
+    if cached_on {
+        for &index in &changed {
+            let at = index as usize / 64;
+            if written.len() <= at {
+                written.resize(at + 1, 0);
+            }
+            written[at] |= 1 << (index % 64);
+        }
+    }
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
-    let mut slots = if all {
+    let slots = if all {
         ranges.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others (validated in
         // place against cached keys/liveness instead of blindly clearing `part`).
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        let mut slots = host.buffer_slots_of(part, parts);
-        slots.extend(changed);
-        slots
+        merged_ascending(host.buffer_slots_of(part, parts), &changed)
     } else {
         changed
     };
-    slots.sort_unstable();
-    slots.dedup();
     *passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.
@@ -1280,6 +1398,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let mut misses: Vec<(u32, u64, Option<[u32; 3]>)> = Vec::new();
         #[cfg(feature = "diagnostics")]
         let (mut loc_tabled, mut loc_hits) = (0u64, 0u64);
+        #[cfg(feature = "diagnostics")]
+        let (mut loc_cached, mut loc_record) = (0u64, 0u64);
         {
             // Acquire `VIEWS.read()` once per 256-slot chunk for cached liveness checks.
             let views = crate::descriptor::lock_views_read();
@@ -1295,12 +1415,37 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
                     }
                     continue;
                 }
+                // What is kept of the slot names the view it shows and the
+                // host copy of it, and that view is still one of ours: the
+                // record is the one a read would find, since a record the
+                // title wrote since the last pass is above. Neither the
+                // title's slot table nor the title's memory is read.
+                if cached_on
+                    && !written.get(index as usize / 64).is_some_and(|w| w & (1 << (index % 64)) != 0)
+                    && let Some((_, (shadow, prev_key, prev_uav), _, _)) = cached.get(index)
+                    && *prev_key != 0
+                    && !shadow.is_dead()
+                    && views.view_alive(*prev_key as u32, (*prev_key >> 32) as u32)
+                {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        loc_cached += 1;
+                    }
+                    if picked_on && *prev_uav {
+                        looked.push((index, SlotUpdate::KeepUav));
+                    }
+                    continue;
+                }
                 let Some(handle) = heap.handle(index) else {
                     if cached.get(index).is_some() {
                         looked.push((index, SlotUpdate::Set(None)));
                     }
                     continue;
                 };
+                #[cfg(feature = "diagnostics")]
+                {
+                    loc_record += 1;
+                }
                 let record = crate::descriptor::record_at(handle);
                 if let Some([_, i, generation]) = record {
                     let key = u64::from(generation) << 32 | u64::from(i);
@@ -1328,6 +1473,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             diag_tabled.fetch_add(loc_tabled, Ordering::Relaxed);
             diag_hits.fetch_add(loc_hits, Ordering::Relaxed);
             diag_mirrors.fetch_add(misses.len() as u64, Ordering::Relaxed);
+            HEAP_SWEEP[1].fetch_add(loc_cached, Ordering::Relaxed);
+            HEAP_SWEEP[2].fetch_add(loc_record, Ordering::Relaxed);
         }
         for (index, handle, record) in misses {
             if let Some(update) = mirror_slot(index, handle, record) {

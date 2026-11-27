@@ -1305,13 +1305,15 @@ fn memory_summary_line(frames: f64) {
     let target = crate::resource::vram_target(local_budget);
     let (lists_live, lists_pooled, preludes_live, preludes_pooled) = allocator_counts();
     let frames = frames.max(1.0);
+    let (tier, tier_level0) = crate::resource::texture_tier();
     tracing::info!(
         "memory summary: RAM private {:.0} MB, working set {:.0} MB; \
          VRAM local {:.0}/{:.0} MB, SHR {:.0}/{:.0} MB (holding to {} MB, peak {} MB); \
          buffers: shadows {:.0} MB (bar {:.0} MB, card {:.0} MB), tex_stage {:.0} MB, scratch {:.0} MB; \
          allocators: lists {lists_live} live ({lists_pooled} pooled), \
          preludes {preludes_live} live ({preludes_pooled} pooled); \
-         OS page faults {:.1}/frame",
+         OS page faults {:.1}/frame; texture tier {tier} \
+         (level 0 of {} KiB and up not stored: {} host copies, {} MB)",
         mb(private),
         mb(working),
         mb(local_used),
@@ -1326,6 +1328,9 @@ fn memory_summary_line(frames: f64) {
         mb(crate::texture::live_staging_bytes()),
         mb(ALIVE[2].load(Ordering::Relaxed)),
         faults_delta as f64 / frames,
+        tier_level0 >> 10,
+        crate::resource::TIERED[0].load(Ordering::Relaxed),
+        crate::resource::TIERED[1].load(Ordering::Relaxed) >> 20,
     );
     crate::resource::log_vram_target();
     #[cfg(feature = "diagnostics")]
@@ -11878,12 +11883,16 @@ impl Meter {
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                 let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
+                let [tiered, tiered_bytes] = [0, 1].map(|i| crate::resource::TIERED[i].load(Ordering::Relaxed));
+                let (tier, tier_level0) = crate::resource::texture_tier();
                 tracing::info!(
                     "textures from the first level viewed (VICTORY_HELD_LEVELS=0: whole), since the start: {copies} host copies of the \
                      levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
                      {flipped} slots made from their new view after its upload had run ({missed} written again first); {} uploads left \
                      out as the host copy held those bytes (VICTORY_TEXTURE_SAME=0: made); {} MB of texture blocks free; \
-                     {} looks for textures to let go, {:.2} ms each, the longest {:.1}",
+                     {} looks for textures to let go, {:.2} ms each, the longest {:.1}; \
+                     the texture quality tier (VICTORY_TEXTURE_TIER: {tier}, level 0 of {} KiB and up not stored) started \
+                     {tiered} of them at level 1 that no view or VICTORY_TEXTURE_MAX asked for, {} MB of level 0 not stored",
                     bytes >> 20,
                     whole >> 20,
                     crate::draw::HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
@@ -11892,7 +11901,9 @@ impl Meter {
                     crate::resource::SWEPT_US[1].load(Ordering::Relaxed) as f64
                         / 1e3
                         / crate::resource::SWEPT_US[0].load(Ordering::Relaxed).max(1) as f64,
-                    crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
+                    crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3,
+                    tier_level0 >> 10,
+                    tiered_bytes >> 20
                 );
             }
             {

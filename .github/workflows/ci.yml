@@ -36,12 +36,16 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # Includes xtask's repository_passes_policy, the asset-policy check.
       # This step asserts compile, clippy and every test that can run without a
-      # GPU. Three groups are `#[ignore]`d because a runner cannot satisfy them:
-      # ten victory-gpu tests, where the runner loses its virtual device
-      # mid-run (HRESULT 0x887A0005), and two victory-shader record-count tests,
-      # where the WARP software adapter returns 0 and there is no SM 6.6
-      # hardware branch to fall back on. All of them are run by the owner on
-      # real hardware: `cargo test -p victory-gpu -p victory-shader -- --ignored`.
+      # GPU. Some are `#[ignore]`d because a runner cannot satisfy them: in
+      # victory-gpu the ones that want a real adapter, a switch, or a process
+      # of their own (a runner loses its virtual device mid-run, HRESULT
+      # 0x887A0005), and two victory-shader record-count tests, where the WARP
+      # software adapter returns 0 and there is no SM 6.6 hardware branch to
+      # fall back on. victory-gpu's are grouped by the configuration each one
+      # needs, and the owner runs them as `docs/device-suite.md` says — not
+      # `--ignored`, which was several configurations in one binary and read as
+      # eleven bugs. victory-shader's two are run by the owner on real
+      # hardware: `cargo test -p victory-shader -- --ignored`.
       #
       # Every test runs in a process of its own (nextest), so one test's
       # global state cannot stop or slow another, and no test can hold a lock

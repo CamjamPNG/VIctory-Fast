@@ -232,6 +232,9 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+The tests that want a real adapter are `#[ignore]`d, and grouped by the
+configuration each one needs: `docs/device-suite.md`.
+
 Run the title:
 
 ```powershell

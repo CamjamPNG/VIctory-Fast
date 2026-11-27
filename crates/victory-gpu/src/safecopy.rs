@@ -861,7 +861,7 @@ mod tests {
     /// What the copies cost (ignored: a measurement): 64 KiB pieces of
     /// scattered memory into a buffer the card reads, by the kernel and here.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement, not a check: wants a D3D12 adapter, prints what copies cost"]
     fn copy_costs() {
         use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
         use windows_sys::Win32::System::Threading::GetCurrentProcess;

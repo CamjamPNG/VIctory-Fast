@@ -2219,7 +2219,7 @@ void main() {
     /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another
     /// source of the shader.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement on the card, not a check: prints what the passes over copies cost"]
     fn card_compare_costs() {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
@@ -2275,7 +2275,7 @@ void main() {
     /// buffer of 1 MiB whose every dword says where it lies: zeros past the
     /// view, or the bytes there (whatever the card has in that place).
     #[test]
-    #[ignore]
+    #[ignore = "a measurement on the card, not a check: what a raw load past its view gives"]
     fn raw_loads_past_views() {
         let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
             return;
@@ -2445,7 +2445,7 @@ void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
     /// of two textures are one descriptor half written. (Both lie in one heap
     /// that is there as a whole: a read past the small one finds memory.)
     #[test]
-    #[ignore]
+    #[ignore = "a measurement on the card, not a check: a descriptor half written under its readers"]
     fn descriptors_written_under_readers() {
         let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
             return;
@@ -2688,7 +2688,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// far out. The texture lies at the start of a heap whose other megabytes
     /// hold other bytes: a texel of those is a read past the texture.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement on the card, not a check: what a texture read in another dimension gives"]
     fn textures_read_in_another_dimension() {
         let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
             return;
@@ -2850,7 +2850,7 @@ void main(uint3 t : SV_DispatchThreadID) {
     /// levels and gradients that are no numbers. Each way is a submission of
     /// its own.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement on the card, not a check: loads outside their views, and may lose the device"]
     fn loads_far_outside_views() {
         let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
             return;
@@ -3022,7 +3022,7 @@ void main(uint3 t : SV_DispatchThreadID) {
     /// view, and copies the view into a slot; long dispatches that read all
     /// the slots are always on the card.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement on the card, not a check: blocks made under readers, which may lose the device, so each way runs in a process of its own"]
     fn new_blocks_under_readers() {
         if let Ok(way) = std::env::var("VICTORY_BLOCK_WAY") {
             return new_blocks(&way);
@@ -4584,7 +4584,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     /// (ignored: a measurement): 2,355 executions of an empty dispatch, in
     /// 49 lists' worth of runs, as in the captured frame.
     #[test]
-    #[ignore]
+    #[ignore = "a measurement on the card, not a check: prints what a frame's clamps cost"]
     fn batch_costs() {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;

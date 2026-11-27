@@ -1080,10 +1080,9 @@ mod heap_range_tests {
     }
 
     /// The spans of 4,400 copies from the ranges of 72,000 slots, as a pass
-    /// makes them, by slot and from the table they were in. Run with
-    /// `--ignored --nocapture`.
+    /// makes them, by slot and from the table they were in. Both ways must
+    /// find the same 4,400; what each costs is printed (`--nocapture`).
     #[test]
-    #[ignore]
     fn spans_of_a_pass() {
         use std::collections::HashMap;
         use std::sync::Arc;

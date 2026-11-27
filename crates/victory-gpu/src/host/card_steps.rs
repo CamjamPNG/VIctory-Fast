@@ -1256,7 +1256,7 @@ mod tests {
         let Some(host) = host() else {
             return;
         };
-        assert!(relay_exact() && stage() == 2, "set VICTORY_RELAY=2 VICTORY_CARD_STEPS=2");
+        crate::device_suite::require(&crate::device_suite::check::card_steps::GROUP, relay_exact() && stage() == 2);
         // Two title buffers: in the first a copy within it, from it into the
         // second, and back.
         let (title, start) = {

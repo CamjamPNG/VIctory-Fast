@@ -863,10 +863,29 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Placeholders that are some view's own, left by its unmapping: address
     /// and length. The title may have joined one with others since.
-    holes: HashMap<usize, usize>,
+    holes: BTreeMap<usize, usize>,
 }
 
 impl Physical {
+    /// Removes any tracked hole overlapping `[start, end)`.
+    fn clear_holes(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let first = self
+            .holes
+            .range(..=start)
+            .next_back()
+            .filter(|&(&base, &len)| base + len > start)
+            .map(|(&base, _)| base);
+        let hit: Vec<usize> = first
+            .into_iter()
+            .chain(self.holes.range(start + 1..end).map(|(&base, _)| base))
+            .collect();
+        for base in hit {
+            self.holes.remove(&base);
+        }
+    }
     /// What the page at `at` shows.
     fn slice_at(&self, at: usize) -> Option<Slice> {
         self.views
@@ -2143,6 +2162,12 @@ impl Op {
                 )
             });
             if gone == 0 {
+                tracing::warn!(
+                    address = format_args!("{:#x}", self.at),
+                    len = self.len,
+                    error = %std::io::Error::last_os_error(),
+                    "unmapping physical pages failed"
+                );
                 return false;
             }
         }
@@ -2190,17 +2215,21 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 to_forget.push((op.at, size, slice));
             }
             victory_gpu::title_memory_unmapping(op.at, op.len);
-            physical.holes.remove(&op.at);
+            physical.clear_holes(op.at, op.at + op.len);
             (op.had, op.own) = (true, lean());
             continue;
         }
-        op.own = physical.holes.remove(&op.at) == Some(op.len) && lean();
-        if op.slice.is_some() && !op.own {
-            // Cut out of (or coalesce within) placeholders here, not side by
-            // side: a thread that maps a piece while others cut the same one
-            // can fail.
-            prepare_placeholder(op.at, op.len);
-            op.own = true;
+        if op.slice.is_some() {
+            let exact_hole = physical.holes.get(&op.at) == Some(&op.len);
+            physical.clear_holes(op.at, op.at + op.len);
+            op.own = exact_hole && lean();
+            if !op.own {
+                // Cut out of (or coalesce within) placeholders here, not side by
+                // side: a thread that maps a piece while others cut the same one
+                // can fail.
+                prepare_placeholder(op.at, op.len);
+                op.own = true;
+            }
         }
     }
     if !to_forget.is_empty() {
@@ -2222,6 +2251,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 to_note.push((op.at, op.len, slice));
             }
             None if op.had && done => {
+                physical.clear_holes(op.at, op.at + op.len);
                 physical.holes.insert(op.at, op.len);
             }
             _ => ok &= done,
@@ -2379,7 +2409,9 @@ mod pool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder (or adjacent placeholders of one reservation).
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    let own = physical.holes.remove(&base) == Some(len) && lean();
+    let exact_hole = physical.holes.get(&base) == Some(&len);
+    physical.clear_holes(base, base + len);
+    let own = exact_hole && lean();
     if !show(base, len, &slice, own) {
         return false;
     }
@@ -2466,10 +2498,26 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
         view = map_view();
     }
     if view.Value as usize != base {
+        let error = std::io::Error::last_os_error();
+        let mut mbi = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: querying our own address space into an initialized struct.
+        let queried = unsafe {
+            VirtualQueryEx(
+                GetCurrentProcess(),
+                base as *const c_void,
+                &mut mbi,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        } != 0;
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,
-            error = %std::io::Error::last_os_error(),
+            own,
+            %error,
+            mbi_state = format_args!("{:#x}", if queried { mbi.State } else { 0 }),
+            mbi_type = format_args!("{:#x}", if queried { mbi.Type } else { 0 }),
+            mbi_region = if queried { mbi.RegionSize } else { 0 },
+            mbi_protect = format_args!("{:#x}", if queried { mbi.Protect } else { 0 }),
             "mapping physical pages failed (not a placeholder?)"
         );
         return false;
@@ -2588,6 +2636,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         });
+        physical.clear_holes(at, at + size);
         if gone != 0 && at >= base && at + size <= end {
             physical.holes.insert(at, size);
         }
@@ -3652,5 +3701,23 @@ mod tests {
             (rat as *mut u64).write(42);
             assert_eq!((rat as *const u64).read(), 42);
         }
+    }
+
+    #[test]
+    fn clear_holes_removes_overlapping_and_interior_holes() {
+        let mut phys = Physical::default();
+        phys.holes.insert(0x1000 * PAGE, PAGE);
+        phys.holes.insert(0x1001 * PAGE, PAGE);
+        phys.holes.insert(0x1002 * PAGE, PAGE);
+        phys.holes.insert(0x1004 * PAGE, 3 * PAGE);
+        phys.holes.insert(0x1008 * PAGE, PAGE);
+
+        // Coalesced range covering 0x1000..0x1003 and overhanging into 0x1004..0x1007.
+        phys.clear_holes(0x1000 * PAGE, 0x1005 * PAGE);
+        assert!(!phys.holes.contains_key(&(0x1000 * PAGE)));
+        assert!(!phys.holes.contains_key(&(0x1001 * PAGE)));
+        assert!(!phys.holes.contains_key(&(0x1002 * PAGE)));
+        assert!(!phys.holes.contains_key(&(0x1004 * PAGE)));
+        assert_eq!(phys.holes.get(&(0x1008 * PAGE)), Some(&PAGE));
     }
 }

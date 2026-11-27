@@ -44,7 +44,7 @@ Measured on **AMD Ryzen 7 7800X3D · AMD Radeon RX 9070 XT (16 GB, RDNA 4) · 32
 | **Series S — Native DXR 1.1 RT** | `--release` (measured, `6a4ee3c`, parity default) | **~11.6 fps** settled (`10.9` med; `13.5` opt-in FBT) | **17.9 fps** (`25.1` peak `c9de853`) | Visual-parity default: `86.6 ms/f`, `36.9 ms` prep, `36.1 ms` GPU wait, `20.9 ms` copyback, **`13.4 GB`** max VRAM, `0` faults |
 | **Series S — Software RT** | `--release` (measured, `d1686f1`, 165s) | **~11.7 fps** settled (`12.0 fps` overall med) | **18.8 fps** | `1.4 ms` med / `4.7 ms` settled GPU wait, `54.4 ms` prep, `11.3 GB` max VRAM (`128.6 ms` timed `diag`) |
 | **Series X (1440p) — Software RT** | `--release` (measured) | **~8.2 fps** | **19.9 fps** | Software BVH emulation (`175.8 ms` GPU in timed `diag`) |
-| **Series X (1440p) — Native DXR 1.1 RT** | `--release` (measured, `14d91db`, VRAM-fit) | **~7.5 fps** settled (`7.3` mean / `6.4` med) | **19.0 fps** | `133.8 ms/frame`, `46.0 ms` prep, `55.1 ms` GPU wait, `25.4 ms` copyback, strictly inside 16 GB local VRAM (`0` faults with `VICTORY_TEXTURE_BUDGET_MB=3072`) |
+| **Series X (1440p, FSR 4.1.2) — Native DXR 1.1 RT** | `diag` (measured, `29a0b31`, warm cache) | **~14.5 fps** settled (`14.5` med / `14.7` steady) | **25.4 fps** | `1080p → 1440p` PC FSR 4.1.2 + full `CS_RaytracingResolve` (`0` dropped pipelines): **`69.2 ms/f`** (`68.1 ms` steady), **`18.4 ms`** prep, **`27.6 ms`** GPU wait, **`15.9 ms`** copyback, **`11.95 GB`** VRAM / `2.80 GB` SHR, `0` faults (`--release` expected higher) |
 
 ### Native DXR 1.1 vs. Software BVH (Head-to-Head `VICTORY_GPU_TIMING=1` + `DRED`, Series S Profile)
 

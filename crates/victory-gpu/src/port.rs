@@ -632,19 +632,25 @@ fn touches(at: usize, len: usize) -> bool {
 /// A fill of upload memory read `len` bytes at `src` on the CPU.
 #[allow(dead_code)]
 pub(crate) fn filled(src: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
     if touches(src, len) {
         STATS[9].fetch_add(1, Ordering::Relaxed);
         STATS[10].fetch_add(len as u64, Ordering::Relaxed);
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (src, len);
 }
 
 /// A title buffer copy was done on the CPU.
 #[allow(dead_code)]
 pub(crate) fn copied(dst: usize, src: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
     if touches(dst, len) || touches(src, len) {
         STATS[11].fetch_add(1, Ordering::Relaxed);
         STATS[12].fetch_add(len as u64, Ordering::Relaxed);
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (dst, src, len);
 }
 
 /// For the frame-rate line: what is in place, and what of ours read or

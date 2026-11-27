@@ -71,6 +71,81 @@ fn clamp_enabled_for(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_none_or(|v| v != "0")
 }
 
+/// How indirect-clamp passes emit UAV barriers (`VICTORY_SCOPED_CLAMP_BARRIERS`):
+/// - `0`: legacy global `NULL` UAV barrier before and after single clamps
+/// - `1` (default): resource-scoped UAV barriers on non-in-place inputs + budget,
+///   skipping input UAV barriers when `HostList` already has a clean UAV barrier
+///   state, and omitting the redundant post-clamp global `NULL` UAV barrier
+/// - `2` / `all`: always resource-scoped even for placed in-place buffers.
+pub(crate) fn scoped_clamp_barriers() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        scoped_clamp_barriers_for(std::env::var_os("VICTORY_SCOPED_CLAMP_BARRIERS").as_deref())
+    })
+}
+
+fn scoped_clamp_barriers_for(value: Option<&std::ffi::OsStr>) -> u8 {
+    match value.and_then(|v| v.to_str()) {
+        Some("0") => 0,
+        Some("2" | "all") => 2,
+        _ => 1,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreInputUav {
+    None,
+    Scoped,
+    Global,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClampBarrierPlan {
+    pub(crate) pre_inputs: PreInputUav,
+    pub(crate) pre_budget: bool,
+    pub(crate) post_global_uav: bool,
+    pub(crate) marks_uav_clean: bool,
+}
+
+pub(crate) fn plan_clamp_barriers(
+    scoped_mode: u8,
+    waits: bool,
+    uav_clean: bool,
+    any_in_place: bool,
+    budget_dirty: bool,
+    legacy_post_uav: bool,
+) -> ClampBarrierPlan {
+    if !waits {
+        return ClampBarrierPlan {
+            pre_inputs: PreInputUav::None,
+            pre_budget: false,
+            post_global_uav: false,
+            marks_uav_clean: false,
+        };
+    }
+    if scoped_mode == 0 {
+        return ClampBarrierPlan {
+            pre_inputs: PreInputUav::Global,
+            pre_budget: false,
+            post_global_uav: legacy_post_uav,
+            marks_uav_clean: true,
+        };
+    }
+    let pre_inputs = if uav_clean {
+        PreInputUav::None
+    } else if any_in_place && scoped_mode == 1 {
+        PreInputUav::Global
+    } else {
+        PreInputUav::Scoped
+    };
+    ClampBarrierPlan {
+        pre_inputs,
+        pre_budget: budget_dirty && pre_inputs != PreInputUav::Global,
+        post_global_uav: false,
+        marks_uav_clean: pre_inputs == PreInputUav::Global,
+    }
+}
+
 /// Whether a plain single-argument indirect execution can safely bypass the
 /// clamp pass under `VICTORY_INDIRECT_CLAMP=0` (only native PC record layouts
 /// whose stride and offsets are valid).
@@ -509,11 +584,25 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     spread: bool,
+    any_in_place: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let dst_bytes = bytes.max(scratch_bytes(spec, spread)?);
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
+    let (c, (budget_res, budget, budget_dirty), dst) =
+        (clamp()?, list.budget_resource()?, list.indirect_scratch(dst_bytes)?);
+    clamp_into(
+        list,
+        c,
+        &dst,
+        (&budget_res, budget, budget_dirty),
+        src,
+        count,
+        spec,
+        false,
+        spread,
+        any_in_place,
+    )
+    .then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -530,11 +619,25 @@ pub(crate) fn bound_ahead(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
+    any_in_place: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let dst_bytes = bytes.max(scratch_bytes(spec, false)?);
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true, false).then_some(dst)
+    let (c, (budget_res, budget, budget_dirty), dst) =
+        (clamp()?, list.budget_resource()?, list.indirect_scratch(dst_bytes)?);
+    clamp_into(
+        list,
+        c,
+        &dst,
+        (&budget_res, budget, budget_dirty),
+        src,
+        None,
+        spec,
+        true,
+        false,
+        any_in_place,
+    )
+    .then_some(dst)
 }
 
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
@@ -545,17 +648,44 @@ fn clamp_into(
     list: &HostList,
     c: &Clamp,
     dst: &ID3D12Resource,
-    budget: u64,
+    (budget_res, budget, budget_dirty): (&ID3D12Resource, u64, bool),
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
     ahead: bool,
     spread: bool,
+    any_in_place: bool,
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_with(c, &list.list, (dst, before), budget, src, count, spec, ahead, spread);
+    #[cfg(feature = "diagnostics")]
+    let waits = crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let waits = true;
+    let plan = plan_clamp_barriers(
+        scoped_clamp_barriers(),
+        waits,
+        list.is_uav_clean(),
+        any_in_place,
+        budget_dirty,
+        true,
+    );
+    let recorded = record_clamp_with(
+        c,
+        &list.list,
+        (dst, before),
+        (Some(budget_res), budget),
+        src,
+        count,
+        spec,
+        ahead,
+        spread,
+        plan,
+    );
     if recorded {
         list.indirect_readable(dst);
+        if plan.marks_uav_clean {
+            list.mark_uav_clean();
+        }
     }
     recorded
 }
@@ -577,7 +707,8 @@ fn record_clamp_as(
     spec: (u32, u32, u32),
     ahead: bool,
 ) -> bool {
-    record_clamp_with(c, l, dst, budget, src, count, spec, ahead, false)
+    let plan = plan_clamp_barriers(0, true, false, false, false, true);
+    record_clamp_with(c, l, dst, (None, budget), src, count, spec, ahead, false, plan)
 }
 
 /// [`record_clamp_as`]; `spread`: dispatch records past 65,535 groups in x
@@ -588,12 +719,13 @@ fn record_clamp_with(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    budget: u64,
+    (budget_res, budget): (Option<&ID3D12Resource>, u64),
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
     spread: bool,
+    barrier_plan: ClampBarrierPlan,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -672,14 +804,36 @@ fn record_clamp_with(
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
-    let first = [
-        uav_barrier(),
-        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    ];
+    let mut first: [D3D12_RESOURCE_BARRIER; 4] =
+        std::array::from_fn(|_| D3D12_RESOURCE_BARRIER::default());
+    let mut first_len = 0usize;
+    match barrier_plan.pre_inputs {
+        PreInputUav::None => {}
+        PreInputUav::Global => {
+            first[first_len] = uav_barrier();
+            first_len += 1;
+        }
+        PreInputUav::Scoped => {
+            first[first_len] = uav_barrier_for(src);
+            first_len += 1;
+            if let Some((count_res, _)) = count
+                && windows::core::Interface::as_raw(count_res)
+                    != windows::core::Interface::as_raw(src)
+            {
+                first[first_len] = uav_barrier_for(count_res);
+                first_len += 1;
+            }
+        }
+    }
+    if barrier_plan.pre_budget {
+        first[first_len] = match budget_res {
+            Some(res) => uav_barrier_for(res),
+            None => uav_barrier(),
+        };
+        first_len += 1;
+    }
+    first[first_len] = transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    first_len += 1;
     let second = [
         uav_barrier(),
         transition(
@@ -688,10 +842,14 @@ fn record_clamp_with(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    let second_slice = if barrier_plan.post_global_uav {
+        &second[..]
+    } else {
+        &second[1..]
+    };
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[..first_len]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -702,7 +860,7 @@ fn record_clamp_with(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(second_slice);
     }
     true
 }
@@ -725,18 +883,18 @@ fn batch_clamp() -> Option<&'static Clamp> {
 }
 
 /// Opens a batch in `list` ([`batch`]): a pass that clamps the records of
-/// the executions recorded after it, of `source` (a host copy's number and
-/// buffer) and of the `recent` ones after it. The table to add them to,
-/// and the scratch buffer its places are in. Replaces the list's compute
-/// root signature and pipeline (callers bind theirs after). `None` if the
-/// clamp is not available.
+/// the executions recorded after it, of `source` (a host copy's number,
+/// buffer, and whether it is placed in place) and of the `recent` ones after
+/// it. The table to add them to, and the scratch buffer its places are in.
+/// Replaces the list's compute root signature and pipeline (callers bind
+/// theirs after). `None` if the clamp is not available.
 pub(crate) fn open_batch(
     list: &HostList,
-    source: (u64, &ID3D12Resource),
-    recent: &[(u64, ID3D12Resource)],
+    source: (u64, &ID3D12Resource, bool),
+    recent: &[(u64, ID3D12Resource, bool)],
 ) -> Option<(batch::Table, ID3D12Resource)> {
     let c = batch_clamp()?;
-    let budget = list.budget()?;
+    let (budget_res, budget, budget_dirty) = list.budget_resource()?;
     let (jobs, at) = list.scratch(batch::TABLE)?;
     let (dst, base, before) = list.batch_place()?;
     let gpu = |b: &ID3D12Resource| {
@@ -746,20 +904,56 @@ pub(crate) fn open_batch(
     // A source there is none of is the first again, which no job names.
     let mut ids = [0u64; batch::SOURCES];
     let mut sources = [gpu(source.1)?; batch::SOURCES];
+    let mut unique_sources: [&ID3D12Resource; batch::SOURCES] = [source.1; batch::SOURCES];
+    let mut unique_len = 1usize;
+    let mut any_in_place = source.2;
     list.keep(source.1);
     ids[0] = source.0;
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
-    for (i, (id, buffer)) in others.enumerate() {
+    for (i, (id, buffer, in_place)) in others.enumerate() {
         if let Some(at) = gpu(buffer) {
             // Bound, and read only if a job names it: kept alive like the
             // copies draws read (`Shadow::refresh`).
             list.keep(buffer);
             (ids[i + 1], sources[i + 1]) = (*id, at);
+            let raw = windows::core::Interface::as_raw(buffer);
+            if !unique_sources[..unique_len]
+                .iter()
+                .any(|s| windows::core::Interface::as_raw(*s) == raw)
+            {
+                unique_sources[unique_len] = buffer;
+                unique_len += 1;
+            }
+            any_in_place |= *in_place;
         }
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    #[cfg(feature = "diagnostics")]
+    let waits = crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let waits = true;
+    let plan = plan_clamp_barriers(
+        scoped_clamp_barriers(),
+        waits,
+        list.is_uav_clean(),
+        any_in_place,
+        budget_dirty,
+        false,
+    );
+    batch::record(
+        c,
+        &list.list,
+        (&dst, before),
+        (Some(&budget_res), budget),
+        sources,
+        &unique_sources[..unique_len],
+        jobs,
+        plan,
+    );
+    if plan.marks_uav_clean {
+        list.mark_uav_clean();
+    }
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
@@ -779,6 +973,19 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
                 pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
+}
+
+pub(crate) fn uav_barrier_for(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: borrowed pointer; the barrier never releases it.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
             }),
         },
     }
@@ -1441,6 +1648,7 @@ pub(crate) fn repack(
     plan: &MultiArgPlan,
     rebase: &[[u32; 8]],
     records: u32,
+    any_in_place: bool,
 ) -> Option<ID3D12Resource> {
     if !src.1.is_multiple_of(4) || count.is_some_and(|(_, off)| !off.is_multiple_of(4)) {
         return None;
@@ -1451,7 +1659,8 @@ pub(crate) fn repack(
     let dst_bytes = u64::from(plan.dst_stride)
         .checked_mul(u64::from(records))
         .filter(|&b| b <= u64::from(u32::MAX))?;
-    let (c, budget, dst) = (repack_clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
+    let (c, (budget_res, budget, budget_dirty), dst) =
+        (repack_clamp()?, list.budget_resource()?, list.indirect_scratch(dst_bytes)?);
     let ops_bytes = ((plan.ops.len().max(1)) * 16) as u64;
     let (ops_gpu, ops_ptr) = list.scratch(ops_bytes)?;
     // SAFETY: `ops_ptr` is freshly allocated mapped upload memory of `ops_bytes`.
@@ -1481,11 +1690,23 @@ pub(crate) fn repack(
         }
     }
     let before = list.indirect_state(&dst);
+    #[cfg(feature = "diagnostics")]
+    let waits = crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let waits = true;
+    let barrier_plan = plan_clamp_barriers(
+        scoped_clamp_barriers(),
+        waits,
+        list.is_uav_clean(),
+        any_in_place,
+        budget_dirty,
+        true,
+    );
     let recorded = record_repack_with(
         c,
         &list.list,
         (&dst, before),
-        budget,
+        (Some(&budget_res), budget),
         src,
         src_bytes,
         count,
@@ -1493,9 +1714,13 @@ pub(crate) fn repack(
         (ops_gpu, plan.ops.len() as u32),
         (rebase_gpu, rebase.len() as u32),
         records,
+        barrier_plan,
     );
     if recorded {
         list.indirect_readable(&dst);
+        if barrier_plan.marks_uav_clean {
+            list.mark_uav_clean();
+        }
         Some(dst)
     } else {
         None
@@ -1507,7 +1732,7 @@ fn record_repack_with(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    budget: u64,
+    (budget_res, budget): (Option<&ID3D12Resource>, u64),
     (src, src_offset): (&ID3D12Resource, u64),
     src_bytes: u64,
     count: Option<(&ID3D12Resource, u64)>,
@@ -1515,6 +1740,7 @@ fn record_repack_with(
     (ops_gpu, op_count): (u64, u32),
     (rebase_gpu, rebase_count): (u64, u32),
     records: u32,
+    barrier_plan: ClampBarrierPlan,
 ) -> bool {
     if !src_offset.is_multiple_of(4) || count.is_some_and(|(_, off)| !off.is_multiple_of(4)) {
         return false;
@@ -1592,14 +1818,36 @@ fn record_repack_with(
     ];
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
-    #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
-    let first = [
-        uav_barrier(),
-        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    ];
+    let mut first: [D3D12_RESOURCE_BARRIER; 4] =
+        std::array::from_fn(|_| D3D12_RESOURCE_BARRIER::default());
+    let mut first_len = 0usize;
+    match barrier_plan.pre_inputs {
+        PreInputUav::None => {}
+        PreInputUav::Global => {
+            first[first_len] = uav_barrier();
+            first_len += 1;
+        }
+        PreInputUav::Scoped => {
+            first[first_len] = uav_barrier_for(src);
+            first_len += 1;
+            if let Some((count_res, _)) = count
+                && windows::core::Interface::as_raw(count_res)
+                    != windows::core::Interface::as_raw(src)
+            {
+                first[first_len] = uav_barrier_for(count_res);
+                first_len += 1;
+            }
+        }
+    }
+    if barrier_plan.pre_budget {
+        first[first_len] = match budget_res {
+            Some(res) => uav_barrier_for(res),
+            None => uav_barrier(),
+        };
+        first_len += 1;
+    }
+    first[first_len] = transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    first_len += 1;
     let second = [
         uav_barrier(),
         transition(
@@ -1608,10 +1856,14 @@ fn record_repack_with(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    let second_slice = if barrier_plan.post_global_uav {
+        &second[..]
+    } else {
+        &second[1..]
+    };
     // SAFETY: an open list, live resources, matching root signature & pipeline.
     unsafe {
-        l.ResourceBarrier(&first[skip..]);
+        l.ResourceBarrier(&first[..first_len]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
@@ -1622,7 +1874,7 @@ fn record_repack_with(
         l.SetComputeRootUnorderedAccessView(5, dst_gpu);
         l.SetComputeRootUnorderedAccessView(6, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(second_slice);
     }
     true
 }
@@ -1921,6 +2173,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootShaderResourceView(4, differs_gpu);
                 warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
@@ -1989,6 +2242,7 @@ void main() {
                     gpu.list.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
                     gpu.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
                     gpu.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootShaderResourceView(4, differs.GetGPUVirtualAddress());
                     for _ in 0..rounds {
                         for pass in 0..passes {
                             let first = if pieces * passes < 4096 { pass * pieces } else { 0 };
@@ -3118,12 +3372,13 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             &warp.clamp,
             &warp.list,
             (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            (None, budget_gpu),
             (&src_buf, 0),
             None,
             (KIND_DISPATCH, STRIDE, records.len() as u32),
             false,
             true,
+            plan_clamp_barriers(0, true, false, false, false, true),
         ));
         // SAFETY: open command list; the clamp left `dst_buf` in `INDIRECT_ARGUMENT`.
         unsafe {
@@ -3564,13 +3819,13 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`, which stays readable
         // as arguments between them.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), false).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), false, false).unwrap();
         assert_eq!(
             list.indirect_state(&b1),
             args,
             "a clamp leaves the scratch readable as arguments"
         );
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), false).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), false, false).unwrap();
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -3586,7 +3841,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             D3D12_RESOURCE_STATE_COMMON,
             "a new scratch buffer is common"
         );
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), false).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), false, false).unwrap();
         assert_eq!(b3.as_raw(), grown.as_raw());
         assert_ne!(
             b3.as_raw(),
@@ -3616,7 +3871,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             D3D12_RESOURCE_STATE_COMMON,
             "a reset list starts with a common scratch buffer"
         );
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), false).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), false, false).unwrap();
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
@@ -3780,8 +4035,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3), false).unwrap();
-            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3), false, false).unwrap();
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false, false).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
@@ -3802,7 +4057,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
+        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false, false).unwrap();
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
@@ -3969,7 +4224,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
             for (groups, src) in windows.iter().zip(&sources) {
                 let spec = (KIND_DISPATCH, STEP, groups.len() as u32);
-                let scratch = bound_ahead(&list, (src, 0), spec).unwrap();
+                let scratch = bound_ahead(&list, (src, 0), spec, false).unwrap();
                 assert_eq!(list.indirect_state(&scratch), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
                 // SAFETY: an open list; the worker's root signature and
                 // pipeline; buffers the test holds until the list has run.
@@ -4060,7 +4315,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         src_ptr.cast::<u32>().add(w).write_volatile(word);
                     }
                     if batched {
-                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), (None, budget_gpu), [src_gpu; 4], &[], table_gpu, plan_clamp_barriers(0, true, false, false, false, false));
                         assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
                     } else {
                         let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
@@ -4170,7 +4425,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 // SAFETY: mapped buffers; nothing runs.
                 unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
                 if batched {
-                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu);
+                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), (None, budget_gpu), [src_gpu, other_gpu, src_gpu, src_gpu], &[], table_gpu, plan_clamp_barriers(0, true, false, false, false, false));
                     // SAFETY: the mapped table; the list has not run.
                     let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
                     assert_eq!(table.place(1 + i as u64 % 2, offset, *kind), Some(0));
@@ -4218,7 +4473,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let (back, back_ptr, _) = warp.shared_buffer(1024);
             let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
             let dst = warp.default_uav(64 << 10);
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), (None, budget_gpu), [src_gpu; 4], &[], table_gpu, plan_clamp_barriers(0, true, false, false, false, false));
             // SAFETY: mapped buffers, which the list has not read yet.
             let mut table = unsafe {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
@@ -4293,8 +4548,12 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let mut expected = 0;
             // More batches than one scratch buffer holds.
             for k in 0..12u32 {
-                let (mut table, scratch) =
-                    open_batch(&list, (1, &sources[0]), &[(1, sources[0].clone()), (2, sources[1].clone())]).unwrap();
+                let (mut table, scratch) = open_batch(
+                    &list,
+                    (1, &sources[0], false),
+                    &[(1, sources[0].clone(), false), (2, sources[1].clone(), false)],
+                )
+                .unwrap();
                 // SAFETY: an open list; the worker's root signature and
                 // pipeline; buffers the test holds until the list has run.
                 unsafe {
@@ -4351,7 +4610,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), budget_gpu, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false));
                     } else if i % run == 0 {
                         let k = u64::from(i / run) * batch::TABLE;
-                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k);
+                        batch::record(&pass, &gpu.list, (&dst, state), (None, budget_gpu), [src_gpu; 4], &[], tables_gpu + k, plan_clamp_barriers(0, true, false, false, false, false));
                         // SAFETY: the mapped table; the list has not run.
                         table = unsafe { batch::Table::new(tables_ptr.add(k as usize), 0, [1, 0, 0, 0]) };
                     }
@@ -4636,9 +4895,11 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             &batch_pass,
             &warp.list,
             (&dst, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            (None, budget_gpu),
             [src_gpu; batch::SOURCES],
+            &[],
             table_gpu,
+            plan_clamp_barriers(0, true, false, false, false, false),
         );
         // SAFETY: mapped table before submission.
         let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
@@ -4804,7 +5065,7 @@ void main(uint3 gid : SV_GroupID) {
             &repack,
             &warp.list,
             (&dst, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            (None, budget_gpu),
             (&src, 0),
             96,
             None,
@@ -4812,6 +5073,7 @@ void main(uint3 gid : SV_GroupID) {
             (ops_gpu, plan.ops.len() as u32),
             (rebase_gpu, 0),
             3,
+            plan_clamp_barriers(0, true, false, false, false, true),
         ));
         // Bind static constant index 3 (`static_magic = 0xCAFE_BABE`) before ExecuteIndirect;
         // ExecuteIndirect must overwrite only 0..3 and preserve index 3!
@@ -4928,7 +5190,7 @@ void main(uint3 gid : SV_GroupID) {
             &repack,
             &warp.list,
             (&dst, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            (None, budget_gpu),
             (&src, 0),
             src_bytes.len() as u64,
             None,
@@ -4936,6 +5198,7 @@ void main(uint3 gid : SV_GroupID) {
             (ops_gpu, plan.ops.len() as u32),
             (rebase_gpu, rebase.len() as u32),
             4,
+            plan_clamp_barriers(0, true, false, false, false, true),
         ));
         // SAFETY: open list, live buffers.
         unsafe {
@@ -5013,9 +5276,11 @@ void main(uint3 gid : SV_GroupID) {
             &batch_pass,
             &warp.list,
             (&dst, D3D12_RESOURCE_STATE_COMMON),
-            budget_gpu,
+            (None, budget_gpu),
             [src_gpu; batch::SOURCES],
+            &[],
             table_gpu,
+            plan_clamp_barriers(0, true, false, false, false, false),
         );
         // SAFETY: mapped table.
         let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
@@ -5648,5 +5913,94 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
+    }
+}
+
+#[cfg(test)]
+mod clamp_barrier_tests {
+    use std::ffi::OsStr;
+    use super::{ClampBarrierPlan, PreInputUav, plan_clamp_barriers, scoped_clamp_barriers_for};
+
+    #[test]
+    fn scoped_clamp_mode_parses_defaults_and_overrides() {
+        assert_eq!(scoped_clamp_barriers_for(None), 1);
+        assert_eq!(scoped_clamp_barriers_for(Some(OsStr::new("1"))), 1);
+        assert_eq!(scoped_clamp_barriers_for(Some(OsStr::new("0"))), 0);
+        assert_eq!(scoped_clamp_barriers_for(Some(OsStr::new("2"))), 2);
+        assert_eq!(scoped_clamp_barriers_for(Some(OsStr::new("all"))), 2);
+    }
+
+    #[test]
+    fn plan_clamp_barriers_scopes_and_coalesces_safely() {
+        // Barrier experiment off: zero UAV barriers.
+        assert_eq!(
+            plan_clamp_barriers(1, false, false, false, true, true),
+            ClampBarrierPlan {
+                pre_inputs: PreInputUav::None,
+                pre_budget: false,
+                post_global_uav: false,
+                marks_uav_clean: false,
+            }
+        );
+        // Legacy mode (VICTORY_SCOPED_CLAMP_BARRIERS=0): global before and after single clamps.
+        assert_eq!(
+            plan_clamp_barriers(0, true, true, false, true, true),
+            ClampBarrierPlan {
+                pre_inputs: PreInputUav::Global,
+                pre_budget: false,
+                post_global_uav: true,
+                marks_uav_clean: true,
+            }
+        );
+        // Default mode (1), non-in-place, dirty UAVs: resource-scoped inputs, no post global UAV.
+        assert_eq!(
+            plan_clamp_barriers(1, true, false, false, false, true),
+            ClampBarrierPlan {
+                pre_inputs: PreInputUav::Scoped,
+                pre_budget: false,
+                post_global_uav: false,
+                marks_uav_clean: false,
+            }
+        );
+        // Second clamp on same list: adds scoped budget UAV barrier when pre is not global.
+        assert_eq!(
+            plan_clamp_barriers(1, true, false, false, true, true),
+            ClampBarrierPlan {
+                pre_inputs: PreInputUav::Scoped,
+                pre_budget: true,
+                post_global_uav: false,
+                marks_uav_clean: false,
+            }
+        );
+        // Clean UAV state (e.g. immediately after title barrier_groups): skips input UAVs even for in-place.
+        assert_eq!(
+            plan_clamp_barriers(1, true, true, true, true, true),
+            ClampBarrierPlan {
+                pre_inputs: PreInputUav::None,
+                pre_budget: true,
+                post_global_uav: false,
+                marks_uav_clean: false,
+            }
+        );
+        // Dirty UAV state with placed in-place buffer in default mode (1): conservative global pre, no post.
+        assert_eq!(
+            plan_clamp_barriers(1, true, false, true, true, true),
+            ClampBarrierPlan {
+                pre_inputs: PreInputUav::Global,
+                pre_budget: false,
+                post_global_uav: false,
+                marks_uav_clean: true,
+            }
+        );
+        // Mode 2 ("all"): scopes even placed in-place buffers.
+        assert_eq!(
+            plan_clamp_barriers(2, true, false, true, true, true),
+            ClampBarrierPlan {
+                pre_inputs: PreInputUav::Scoped,
+                pre_budget: true,
+                post_global_uav: false,
+                marks_uav_clean: false,
+            }
+        );
     }
 }

@@ -918,6 +918,10 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
+        if crate::host::coalesce_uav_barriers() && list.is_uav_clean() {
+            host.retain(|b| !(b.kind == 2 && b.first.is_null()));
+        }
+        let emits_global_uav = host.iter().any(|b| b.kind == 2 && b.first.is_null());
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -931,6 +935,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             };
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
+            if emits_global_uav {
+                list.mark_uav_clean();
+            }
         }
     }
     0
@@ -974,6 +981,7 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
         return;
     }
     if list.place_copy(to as usize, from as usize, len) {
+        list.mark_uav_dirty();
         with_state(this, |_, state| state.copied());
     } else {
         list.defer_copy(to, from, len);
@@ -1566,6 +1574,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     {
         let len = len as usize;
         if list.place_copy(dst as usize, src as usize, len) {
+            list.mark_uav_dirty();
             with_state(this, |_, state| state.copied());
             return;
         }
@@ -1648,6 +1657,8 @@ extern "system" fn resolve_queries(
     if let Some(list) = host_list(this)
         && crate::query::resolve_query_data(list, heap, kind, first, count, buffer, offset)
     {
+        list.mark_uav_dirty();
+        with_state(this, |_, state| state.copied());
         return;
     }
     #[cfg(not(windows))]
@@ -1771,7 +1782,6 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
         }
         with_state(this, |_, state| state.synced());
         if let Some(list) = host_list(this) {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
             {
                 // The shapes of the title's calls, each once.
@@ -1788,12 +1798,11 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                         "a pipeline sync"
                     );
                 }
+            }
+            if list.emit_global_uav_barrier() {
+                #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            // SAFETY: the same layout; no resource named.
-            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-            // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2391,24 +2400,21 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
+    // Diagnostics: left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if count > 0 {
+    if count > 0 && crate::copystat::barrier_test() & 1 != 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
-            return;
-        }
+        return;
     }
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        if list.emit_global_uav_barrier() {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, count);

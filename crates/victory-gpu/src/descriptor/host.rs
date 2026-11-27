@@ -2919,11 +2919,25 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
-            None => null_view(self.at(index)),
+        let put_done = match view_at(key as u32, (key >> 32) as u32) {
+            Some(view) => {
+                if let Some(kind) = cached_null_kind(&view)
+                    && self.copy_cached_null(index, kind)
+                {
+                    true
+                } else {
+                    null_for(&view, self.at(index));
+                    false
+                }
+            }
+            None => self.copy_cached_null(index, 0) || {
+                null_view(self.at(index));
+                false
+            },
+        };
+        if !put_done {
+            self.put(index);
         }
-        self.put(index);
         self.clear_twin(index);
         self.write_stride(index, 0, 0);
         self.keep(index, None);
@@ -3242,10 +3256,19 @@ impl HostHeap {
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make_twinned(view, self.at(index), self.twin(index));
+        let mut put_done = false;
         if kept.is_none() {
-            null_for(view, self.at(index));
+            if let Some(kind) = cached_null_kind(view)
+                && self.copy_cached_null(index, kind)
+            {
+                put_done = true;
+            } else {
+                null_for(view, self.at(index));
+            }
         }
-        self.put(index);
+        if !put_done {
+            self.put(index);
+        }
         self.twin_made(index, kept.is_some() && twinned(view));
         let (word, count) = if kept.is_some() {
             (view_stride_word(view), view_count(view))
@@ -3407,12 +3430,18 @@ impl HostHeap {
         }
     }
 
-    /// Returns the immutable CPU-only handle for a pre-built null descriptor
-    /// (`0` = 2D SRV, `1` = raw-buffer SRV, `2` = CBV).
+    /// Returns the immutable CPU-only handle for a pre-built null descriptor:
+    /// `0` = 2D SRV, `1` = raw-buffer SRV, `2` = CBV, `3..=10` = SRV texture dims
+    /// (`1D`, `1DArray`, `2DArray`, `2DMS`, `2DMSArray`, `3D`, `Cube`, `CubeArray`),
+    /// `11` = buffer UAV, `12..=16` = texture UAV dims (`1D`, `1DArray`, `2D`, `2DArray`, `3D`).
     fn cached_null_handle(kind: usize) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        const COUNT: usize = 17;
+        if kind >= COUNT {
+            return None;
+        }
         struct CachedNulls {
             _heap: ID3D12DescriptorHeap,
-            handles: [usize; 3],
+            handles: [usize; COUNT],
         }
         // SAFETY: CPU-only read-only descriptor heap with immutable descriptors.
         unsafe impl Send for CachedNulls {}
@@ -3422,22 +3451,40 @@ impl HostHeap {
         let cache = CACHE.get_or_init(|| {
             let desc = D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 3,
+                NumDescriptors: COUNT as u32,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                 NodeMask: 0,
             };
-            // SAFETY: creates a tiny 3-slot CPU-only descriptor heap once.
+            // SAFETY: creates a tiny 17-slot CPU-only descriptor heap once.
             let heap: ID3D12DescriptorHeap = unsafe { host.device.CreateDescriptorHeap(&desc).ok()? };
             let step = unsafe { host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) } as usize;
             let base = unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr;
-            let handles = [base, base + step, base + 2 * step];
-            null_view(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: handles[0] });
-            null_buffer_view(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: handles[1] });
+            let handles = std::array::from_fn(|i| base + i * step);
+            let h = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: handles[i] };
+            null_view(h(0));
+            null_buffer_view(h(1));
             let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: null CBV in slot 2 of our CPU-only heap.
             unsafe {
-                host.device
-                    .CreateConstantBufferView(Some(&cbv), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: handles[2] });
+                host.device.CreateConstantBufferView(Some(&cbv), h(2));
+            }
+            for (slot, dim) in [(3, 2u32), (4, 3), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9), (10, 10)] {
+                let mut words = [0u32; 10];
+                words[1] = dim;
+                null_like(&words, h(slot));
+            }
+            let buf_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            };
+            // SAFETY: immutable null UAV descriptors in slots 11..17 of our CPU-only heap.
+            unsafe {
+                host.device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&buf_uav), h(11));
+                for (slot, dim) in [(12, Some(2u32)), (13, Some(3)), (14, None), (15, Some(5)), (16, Some(8))] {
+                    let uav = null_uav_desc(dim);
+                    host.device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&uav), h(slot));
+                }
             }
             Some(CachedNulls { _heap: heap, handles })
         })
@@ -5756,20 +5803,63 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
-/// Returns cached null descriptor index (`1` = raw-buffer SRV, `2` = CBV) for
-/// views whose null descriptor is constant, or `None` for texture/UAV views
-/// that need exact format/dimension matching via `null_for`.
+/// Maps a constant null texture SRV dimension to its `CachedNulls` index, or
+/// `None` when DXR requires a dynamic empty-TLAS acceleration-structure view.
+fn cached_null_srv_dim(dim: u32) -> Option<usize> {
+    if dim == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 && crate::dxr::enabled() {
+        return None;
+    }
+    Some(match dim {
+        2 => 3,
+        3 => 4,
+        4 => 0,
+        5 => 5,
+        6 => 6,
+        7 => 7,
+        8 => 8,
+        9 => 9,
+        10 => 10,
+        _ => 0,
+    })
+}
+
+/// Maps a null texture UAV dimension to its `CachedNulls` index.
+fn cached_null_uav_dim(dim: Option<u32>) -> usize {
+    match dim.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => 12,
+        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => 13,
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => 15,
+        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => 16,
+        _ => 14,
+    }
+}
+
+/// Returns the `CachedNulls` index matching `null_for(view, ..)`, or `None`
+/// only for DXR acceleration-structure views whose null descriptor points at
+/// the live empty TLAS.
 fn cached_null_kind(view: &View) -> Option<usize> {
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     match view {
-        View::Constant(_, _) => Some(2),
-        View::Placed(false, resource, _) if resource[0] == 1 => Some(1),
-        View::Shader(r, desc)
-            if crate::resource::buffer_bytes(*r as crate::object::This).is_some()
-                || desc.is_some_and(|d| d[1] == 1) =>
-        {
-            Some(1)
+        View::Unordered(r, _, desc) => {
+            if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) {
+                Some(11)
+            } else {
+                Some(cached_null_uav_dim(desc.map(|d| d[1])))
+            }
         }
-        _ => None,
+        View::Placed(true, resource, desc) => {
+            if resource[0] == 1 {
+                Some(11)
+            } else {
+                Some(cached_null_uav_dim(Some(desc[1])))
+            }
+        }
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => Some(1),
+        View::Placed(false, resource, _) if resource[0] == 1 => Some(1),
+        View::Shader(_, Some(desc)) => cached_null_srv_dim(desc[1]),
+        View::Placed(false, _, desc) => cached_null_srv_dim(desc[1]),
+        View::Constant(_, _) => Some(2),
+        _ => Some(0),
     }
 }
 
@@ -7393,5 +7483,33 @@ mod dynamic_pool_tests {
         assert_eq!(tail_pool.mark_free(20, 44), 44);
         tail_pool.rewind_if_tail(20, 44);
         assert_eq!(tail_pool.find(16), Some(20));
+    }
+
+    #[test]
+    fn cached_null_kind_maps_all_static_srv_uav_and_cbv_dims() {
+        use super::{View, cached_null_kind};
+        let srv_desc = |dim: u32| {
+            let mut w = [0u32; 10];
+            w[1] = dim;
+            w
+        };
+        assert_eq!(cached_null_kind(&View::Constant(0, 256)), Some(2));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(1)))), Some(1));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(4)))), Some(0));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(2)))), Some(3));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(3)))), Some(4));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(5)))), Some(5));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(6)))), Some(6));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(7)))), Some(7));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(8)))), Some(8));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(9)))), Some(9));
+        assert_eq!(cached_null_kind(&View::Shader(0, Some(srv_desc(10)))), Some(10));
+        assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(1)))), Some(11));
+        assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(2)))), Some(12));
+        assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(3)))), Some(13));
+        assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(4)))), Some(14));
+        assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(5)))), Some(15));
+        assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(8)))), Some(16));
+        assert_eq!(cached_null_kind(&View::Unordered(0, 0, None)), Some(14));
     }
 }

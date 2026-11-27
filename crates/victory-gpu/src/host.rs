@@ -1809,6 +1809,10 @@ pub(crate) struct HostList {
     /// True only while at least one entry in `twins` has `writing == true`,
     /// avoiding a `twins` mutex lock and scan on every `State::bind`.
     twins_writing: std::sync::atomic::AtomicBool,
+    /// Format-aliased texture views read by this list (`crate::texture::alias`),
+    /// keyed by the placed `HostTexture` pointer so cross-list copies run only
+    /// when `source.write_gen` advanced since the last sync.
+    aliases: Mutex<ByCopy<AliasUse>>,
     /// The list that runs those transitions just before this one, borrowed from
     /// [`IDLE_PRELUDES`] when needed and returned on [`HostList::reset`].
     prelude: Mutex<Option<TrackedPrelude>>,
@@ -1857,6 +1861,11 @@ pub(crate) type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 /// `HostList` prelude so the D3D12 command recording can run in parallel.
 struct PreludePlan {
     syncs: Vec<(std::sync::Arc<crate::resource::HostTexture>, std::sync::Arc<crate::resource::Twin>, bool)>,
+    alias_syncs: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::texture::Through>,
+    )>,
     aliasing: Vec<D3D12_RESOURCE_BARRIER>,
     to_copy: Vec<D3D12_RESOURCE_BARRIER>,
     barriers: Vec<D3D12_RESOURCE_BARRIER>,
@@ -2034,7 +2043,41 @@ const STAMPS: u32 = 4096;
 #[cfg(feature = "diagnostics")]
 type Note = (String, Option<(u64, u64)>);
 
-type States = ByCopy<(u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+/// `(first_state, last_state, local_writes, copy)` per `HostTexture` used by a list.
+type States = ByCopy<(u32, u32, u32, std::sync::Arc<crate::resource::HostTexture>)>;
+
+/// Whether a D3D12 resource state mask grants GPU write access to a texture.
+const fn is_texture_write_state(state: u32) -> bool {
+    const WRITE_STATES: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+    state & WRITE_STATES != 0
+}
+
+/// What a list does with a format-aliased placed texture view
+/// (`crate::texture::alias`). Mirrors [`TwinUse`]: if the list reads `placed`
+/// before any local write to `source`, `plan_prelude` copies once in submission
+/// order only when `source.write_gen != through.synced_gen`.
+struct AliasUse {
+    source: std::sync::Arc<crate::resource::HostTexture>,
+    placed: std::sync::Arc<crate::resource::HostTexture>,
+    through: std::sync::Arc<crate::texture::Through>,
+    needs_prelude: bool,
+    synced_local_write: u32,
+}
+
+/// Pure state step for [`HostList::alias_use`]: returns `true` if the list must
+/// record an inline alias copy right now because `source` was written earlier
+/// in this same list since the last inline sync.
+fn alias_use_step(src_writes: u32, needs_prelude: &mut bool, synced_local_write: &mut u32) -> bool {
+    if src_writes == 0 {
+        *needs_prelude = true;
+        false
+    } else if src_writes > *synced_local_write {
+        *synced_local_write = src_writes;
+        true
+    } else {
+        false
+    }
+}
 
 /// What a list does with a depth texture that has a colour twin
 /// ([`crate::resource::Twin`]). Lists are recorded on many threads and run
@@ -2886,25 +2929,26 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// 82 on the card (capture replay1, 405 of them), most of it waiting for
 /// those steps.
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1), SRV(t1)"
 cbuffer Span : register(b0) {
-    uint first;    // the first piece
+    uint first;    // contiguous: first piece; indexed (compare >= 3): byte offset in `piece_table`
     uint skew;     // where the copy starts in its piece 0
     uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
     uint pieces;
-    uint out_at;   // the first piece's dword in `differs` (or piece-index table for compare==3), in bytes
-    uint compare;  // 0: contiguous rehash; 1: compare; 2: compare & store; 3: indexed rehash via `differs`
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: rehash; 1: compare; 2: compare & store; 3: indexed rehash; 4: indexed compare; 5: indexed compare & store
 };
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+ByteAddressBuffer piece_table : register(t1);
 groupshared uint4 parts[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
-    uint piece = (compare == 3u) ? differs.Load(out_at + id.x * 4u) : (first + id.x);
+    uint piece = (compare >= 3u) ? piece_table.Load(first + id.x * 4u) : (first + id.x);
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
@@ -2957,13 +3001,13 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     if (thread != 0u) return;
     h = parts[0];
-    if (compare == 1u || compare == 2u) {
+    if (compare == 1u || compare == 2u || compare == 4u || compare == 5u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
         differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u || compare == 5u) hashes.Store4(piece * 16u, h);
     } else {
         hashes.Store4(piece * 16u, h);
     }
@@ -2973,27 +3017,28 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
 /// Alternate 64-thread-per-piece card compare with sequential lane fold in
 /// thread 0 (`VICTORY_CARD_HASH_WIDE=1|alt`; off by default: [`CARD_COMPARE`]'s
 /// 8x-unrolled 6-step parallel tree reduction runs instead). Supports the same
-/// root signature, `compare == 3` indexed rehash, and `torn` flag bit layout.
+/// root signature, indexed modes (`compare >= 3`), and `torn` flag bit layout.
 pub(crate) const CARD_COMPARE_WIDE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1), SRV(t1)"
 cbuffer Span : register(b0) {
-    uint first;    // the first piece
+    uint first;    // contiguous: first piece; indexed (compare >= 3): byte offset in `piece_table`
     uint skew;     // where the copy starts in its piece 0
     uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
     uint pieces;
-    uint out_at;   // the first piece's dword in `differs` (or piece-index table for compare==3), in bytes
-    uint compare;  // 0: contiguous rehash; 1: compare; 2: compare & store; 3: indexed rehash via `differs`
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: rehash; 1: compare; 2: compare & store; 3: indexed rehash; 4: indexed compare; 5: indexed compare & store
 };
 ByteAddressBuffer now : register(t0);
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+ByteAddressBuffer piece_table : register(t1);
 groupshared uint4 lanes[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
     uint i = group.x;
     if (i >= pieces) return;
-    uint piece = (compare == 3u) ? differs.Load(out_at + i * 4u) : (first + i);
+    uint piece = (compare >= 3u) ? piece_table.Load(first + i * 4u) : (first + i);
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
@@ -3014,10 +3059,10 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
         all = (all ^ lanes[k]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
         all = all.yzwx ^ (all >> 15);
     }
-    if (compare == 1u || compare == 2u) {
+    if (compare == 1u || compare == 2u || compare == 4u || compare == 5u) {
         uint folded = all.x ^ (all.y * 3u) ^ (all.z * 5u) ^ (all.w * 7u);
         differs.Store(out_at + i * 4u, (folded << 1u) | (any(all != hashes.Load4(piece * 16u)) ? 1u : 0u));
-        if (compare == 2u) hashes.Store4(piece * 16u, all);
+        if (compare == 2u || compare == 5u) hashes.Store4(piece * 16u, all);
     } else {
         hashes.Store4(piece * 16u, all);
     }
@@ -3109,18 +3154,28 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
     }
 }
 
-/// One indexed re-hash pass (`compare == 3`) of [`CARD_COMPARE`] reading
-/// `count` piece indices from `u1` starting at dword `at`.
+/// One indexed pass (`mode == 3`: rehash; `4`: compare; `5`: compare & store)
+/// of [`CARD_COMPARE`] reading `count` piece indices from `t1` (`piece_table`)
+/// starting at dword `idx_at`, and writing `differs` (`u1`) starting at dword
+/// `out_at` (ignored for `mode == 3`).
 ///
 /// # Safety
-/// Same as [`card_pass`], with `u1` bound to the piece-index buffer.
-unsafe fn card_pass_indexed(list: &ID3D12GraphicsCommandList, skew: u32, size: u32, count: u32, at: u32) -> u64 {
+/// Same as [`card_pass`], with `t1` bound to the piece-index buffer.
+unsafe fn card_pass_indexed(
+    list: &ID3D12GraphicsCommandList,
+    skew: u32,
+    size: u32,
+    count: u32,
+    idx_at: u32,
+    out_at: u32,
+    mode: u32,
+) -> u64 {
     const MOST: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
     let mut done = 0;
     let mut passes = 0u64;
     while done < count {
         let n = (count - done).min(MOST);
-        let constants = [0u32, skew, size, n, (at + done) * 4, 3];
+        let constants = [(idx_at + done) * 4, skew, size, n, (out_at + done) * 4, mode];
         // SAFETY: the caller's.
         unsafe {
             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
@@ -3130,6 +3185,33 @@ unsafe fn card_pass_indexed(list: &ID3D12GraphicsCommandList, skew: u32, size: u
         passes += 1;
     }
     passes
+}
+
+/// Groups consecutive compared ranges `(shadow_key, mode, first_piece, pieces, at)`
+/// into non-overlapping, contiguous-`at` batches that can run in a single indexed
+/// `CARD_COMPARE` dispatch without two groups touching the same piece index.
+fn batch_compare_groups(items: &[(usize, u32, u32, u32, u32)]) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    while start < items.len() {
+        let (key, mode, first, pieces, at) = items[start];
+        let mut end = start + 1;
+        let mut prev_piece_end = first.saturating_add(pieces);
+        let mut next_at = at.saturating_add(pieces);
+        while end < items.len() {
+            let (k2, m2, f2, p2, a2) = items[end];
+            if k2 == key && m2 == mode && f2 >= prev_piece_end && a2 == next_at {
+                prev_piece_end = f2.saturating_add(p2);
+                next_at = a2.saturating_add(p2);
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        groups.push(start..end);
+        start = end;
+    }
+    groups
 }
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
@@ -3301,6 +3383,16 @@ struct Deferred {
     /// True once at least one `Step::Placed` has been recorded in `copies`,
     /// allowing `forward_fill` to skip scanning `copies` in O(1) otherwise.
     has_placed: bool,
+    /// Whether a clamp dispatch in this recording has already written the
+    /// list's indirect-work budget (subsequent clamps order against it with a
+    /// resource-scoped UAV barrier).
+    budget_used: bool,
+    /// Whether a global UAV barrier has already flushed all prior shader/copy
+    /// UAV writes on this recording, with no intervening UAV-capable shader
+    /// or buffer copy recorded since. Starts `false` on every fresh/reset list
+    /// because an earlier list in the same `ExecuteCommandLists` may have
+    /// unflushed UAV writes.
+    uav_clean: bool,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -3354,6 +3446,8 @@ impl Deferred {
         self.dxr_ops.clear();
         self.budget_zeroed = false;
         self.has_placed = false;
+        self.budget_used = false;
+        self.uav_clean = false;
         self.indirect_readable = 0;
     }
 
@@ -5347,6 +5441,7 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 twins_writing: std::sync::atomic::AtomicBool::new(false),
+                aliases: Mutex::default(),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -5749,7 +5844,8 @@ impl Host {
                     if !rehashes.is_empty() {
                         list.SetComputeRootSignature(&work.root);
                         list.SetPipelineState(&compare_pso);
-                        list.SetComputeRootUnorderedAccessView(3, work.piece_indices.0.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                        list.SetComputeRootShaderResourceView(4, work.piece_indices.0.GetGPUVirtualAddress());
                         let mut post_barriers = Vec::with_capacity(rehashes.len() * 2);
                         let mut befores = Vec::with_capacity(rehashes.len());
                         for (shadow, runs) in &rehashes {
@@ -5774,7 +5870,7 @@ impl Host {
                                     }
                                 }
                                 work.taken_indices += total_pieces;
-                                let passes = card_pass_indexed(list, runs[0].skew, size as u32, total_pieces, base);
+                                let passes = card_pass_indexed(list, runs[0].skew, size as u32, total_pieces, base, 0, 3);
                                 CARD_PASSES[0].fetch_add(passes, Ordering::Relaxed);
                             } else {
                                 CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
@@ -5856,21 +5952,62 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&compare_pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootShaderResourceView(4, work.piece_indices.0.GetGPUVirtualAddress());
+                    let compared: Vec<&CardRange> = plan.ranges.iter().filter(|r| r.compared).collect();
+                    let descriptors: Vec<(usize, u32, u32, u32, u32)> = compared
+                        .iter()
+                        .map(|r| {
+                            let mode = if flown && !r.picked { 2 } else { 1 };
+                            (Arc::as_ptr(&r.shadow) as usize, mode, r.span.first, r.span.pieces, r.at)
+                        })
+                        .collect();
                     let mut bound_shadow: usize = 0;
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                    for group in batch_compare_groups(&descriptors) {
+                        let first = compared[group.start];
+                        let (Some((_, Some(before), _)), size) =
+                            (first.shadow.card_sides(), first.shadow.card_hash_size())
+                        else {
                             continue;
                         };
-                        let key = Arc::as_ptr(&r.shadow) as usize;
+                        let mode = descriptors[group.start].1;
+                        let key = Arc::as_ptr(&first.shadow) as usize;
                         if bound_shadow != key {
                             bound_shadow = key;
-                            list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootShaderResourceView(1, first.shadow.buffer.GetGPUVirtualAddress());
                             list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         }
-                        // (What is only looked at keeps its hashes: what
-                        // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        let total_pieces: u32 = compared[group.clone()].iter().map(|r| r.span.pieces).sum();
+                        if group.len() > 1
+                            && u64::from(work.taken_indices + total_pieces) * 4 <= work.piece_indices.2
+                        {
+                            let base = work.taken_indices;
+                            let dst = (work.piece_indices.1 as *mut u32).add(base as usize);
+                            let mut k = 0usize;
+                            for r in &compared[group.clone()] {
+                                for p in r.span.first..r.span.first + r.span.pieces {
+                                    dst.add(k).write(p);
+                                    k += 1;
+                                }
+                            }
+                            work.taken_indices += total_pieces;
+                            let passes = card_pass_indexed(
+                                list,
+                                first.span.skew,
+                                size as u32,
+                                total_pieces,
+                                base,
+                                first.at,
+                                mode + 3,
+                            );
+                            CARD_PASSES[2].fetch_add(passes, Ordering::Relaxed);
+                        } else {
+                            for r in &compared[group] {
+                                // (What is only looked at keeps its hashes: what
+                                // changed there is the next declared range's to land.)
+                                card_pass(list, &r.span, size as u32, r.at, mode);
+                                CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                     }
                     list.Close()?;
                     list.cast()
@@ -7976,6 +8113,7 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins_writing.store(false, Ordering::Relaxed);
+        self.aliases.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8065,15 +8203,18 @@ impl HostList {
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
         let wanted = legal_for(copy.flags(), wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let write_inc = u32::from(is_texture_write_state(wanted));
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, write_inc, copy));
                 self.changed_something();
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                if before != wanted {
+                let entry = o.get_mut();
+                let before = std::mem::replace(&mut entry.1, wanted);
+                entry.2 = entry.2.saturating_add(write_inc);
+                if before != wanted || write_inc != 0 {
                     self.changed_something();
                 }
                 (before != wanted).then_some((texture, before))
@@ -8088,14 +8229,17 @@ impl HostList {
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_for(copy.flags(), wanted);
         self.changed_something();
+        let write_inc = u32::from(is_texture_write_state(wanted));
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy.clone()));
+                v.insert((wanted, wanted, write_inc, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                let entry = o.get_mut();
+                let before = std::mem::replace(&mut entry.1, wanted);
+                entry.2 = entry.2.saturating_add(write_inc);
                 (before != wanted).then_some(before)
             }
         };
@@ -8109,6 +8253,44 @@ impl HostList {
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
+    }
+
+    /// Records a read of format-aliased `placed` backed by `source` through
+    /// `through`. Returns `true` if `source` was written earlier in this list
+    /// since the last inline sync (caller must record an inline copy); `false`
+    /// if the sync is handled by `plan_prelude` or already up to date.
+    pub(crate) fn alias_use(
+        &self,
+        source: &std::sync::Arc<crate::resource::HostTexture>,
+        placed: &std::sync::Arc<crate::resource::HostTexture>,
+        through: &std::sync::Arc<crate::texture::Through>,
+    ) -> bool {
+        let src_key = std::sync::Arc::as_ptr(source) as usize;
+        let src_writes = self
+            .states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&src_key)
+            .map_or(0, |s| s.2);
+        let mut aliases = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = aliases
+            .entry(std::sync::Arc::as_ptr(placed) as usize)
+            .or_insert_with(|| AliasUse {
+                source: source.clone(),
+                placed: placed.clone(),
+                through: through.clone(),
+                needs_prelude: false,
+                synced_local_write: 0,
+            });
+        let was = (entry.needs_prelude, entry.synced_local_write);
+        let inline = alias_use_step(src_writes, &mut entry.needs_prelude, &mut entry.synced_local_write);
+        let changed = was != (entry.needs_prelude, entry.synced_local_write);
+        drop(aliases);
+        if changed {
+            self.changed_something();
+            self.keep(&through.buffer);
+        }
+        inline
     }
 
     /// A use of title texture `resource` about to be recorded, if it is a
@@ -8366,6 +8548,32 @@ impl HostList {
             u.twin.behind.store(left, Ordering::Relaxed);
         }
         drop(twins);
+        let aliases = self.aliases.lock().unwrap_or_else(|e| e.into_inner());
+        let mut alias_syncs = Vec::new();
+        for u in aliases.values() {
+            if u.needs_prelude {
+                let wgen = u.source.write_gen.load(Ordering::Relaxed);
+                if u.through.synced_gen.load(Ordering::Relaxed) != wgen {
+                    alias_syncs.push((u.source.clone(), u.placed.clone(), u.through.clone()));
+                    u.through.synced_gen.store(wgen, Ordering::Relaxed);
+                }
+            }
+        }
+        // Advance `write_gen` for textures written by this list, and record
+        // any alias whose last inline copy already covers the final write.
+        for (key, &(_, _, local_writes, ref copy)) in states.iter() {
+            if local_writes > 0 {
+                let new_gen = copy.write_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                for u in aliases.values() {
+                    if std::sync::Arc::as_ptr(&u.source) as usize == *key
+                        && u.synced_local_write == local_writes
+                    {
+                        u.through.synced_gen.store(new_gen, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        drop(aliases);
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
@@ -8373,6 +8581,7 @@ impl HostList {
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying: ByCopy<u32> = ByCopy::default();
+        let mut restore: ByCopy<(u32, std::sync::Arc<crate::resource::HostTexture>)> = ByCopy::default();
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
                 (depth, &twin.colour)
@@ -8381,20 +8590,35 @@ impl HostList {
             };
             for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
                 let key = std::sync::Arc::as_ptr(texture) as usize;
-                let real = texture.state.load(Ordering::Relaxed);
+                let orig = texture.state.load(Ordering::Relaxed);
+                let cur = copying.get(&key).copied().unwrap_or(orig);
                 copying.insert(key, state);
-                if real != state {
+                if cur != state {
                     to_copy.push(transition(
                         &texture.texture,
-                        host_state(real),
+                        host_state(cur),
                         host_state(state),
                     ));
                     if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
+                        restore.entry(key).or_insert((orig, texture.clone()));
+                    }
+                }
+            }
+        }
+        for (source, placed, _) in &alias_syncs {
+            for (texture, state) in [(source, COPY_SOURCE), (placed, COPY_DEST)] {
+                let key = std::sync::Arc::as_ptr(texture) as usize;
+                let orig = texture.state.load(Ordering::Relaxed);
+                let cur = copying.get(&key).copied().unwrap_or(orig);
+                copying.insert(key, state);
+                if cur != state {
+                    to_copy.push(transition(
+                        &texture.texture,
+                        host_state(cur),
+                        host_state(state),
+                    ));
+                    if !states.contains_key(&key) {
+                        restore.entry(key).or_insert((orig, texture.clone()));
                     }
                 }
             }
@@ -8417,36 +8641,39 @@ impl HostList {
                     },
                 });
             }
-            let real = copying.get(&key).copied().unwrap_or_else(|| copy.state.load(Ordering::Relaxed));
-            if real != COPY_DEST {
+            let orig = copy.state.load(Ordering::Relaxed);
+            let cur = copying.get(&key).copied().unwrap_or(orig);
+            copying.insert(key, COPY_DEST);
+            if cur != COPY_DEST {
                 to_copy.push(transition(
                     &copy.texture,
-                    host_state(real),
+                    host_state(cur),
                     host_state(COPY_DEST),
                 ));
-                copying.insert(key, COPY_DEST);
                 if !states.contains_key(&key) {
-                    barriers.push(transition(
-                        &copy.texture,
-                        host_state(COPY_DEST),
-                        host_state(real),
-                    ));
+                    restore.entry(key).or_insert((orig, copy.clone()));
                 }
-            } else {
-                copying.insert(key, COPY_DEST);
             }
         }
-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
+        for (key, (orig, texture)) in restore {
+            if let Some(&cur) = copying.get(&key)
+                && cur != orig
+            {
+                barriers.push(transition(&texture.texture, host_state(cur), host_state(orig)));
+            }
+        }
+        barriers.extend(states.iter().filter_map(|(key, (first, last, _, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && alias_syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         Some(PreludePlan {
             syncs,
+            alias_syncs,
             aliasing,
             to_copy,
             barriers,
@@ -8482,6 +8709,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &plan.syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (source, placed, through) in &plan.alias_syncs {
+                    crate::texture::record_alias_copy(list, &source.texture, &placed.texture, through);
                 }
                 for (upload, uplan) in &plan.uploads {
                     upload.record(list, uplan.sub_mask);
@@ -8565,6 +8795,7 @@ impl HostList {
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.aliases.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Notes an indirect execution, while device-removed data is kept
@@ -8810,7 +9041,17 @@ impl HostList {
 
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
+    #[allow(dead_code)]
     pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_resource().map(|(_, gpu, _)| gpu)
+    }
+
+    /// The host resource, GPU virtual address, and prior-use flag of the list's
+    /// indirect-work budget, zeroed at each submission of the list from the
+    /// first use after a reset on. Returns `budget_dirty = true` from the
+    /// second clamp on the same recording onward so callers can emit a
+    /// resource-scoped UAV barrier on the budget buffer.
+    pub(crate) fn budget_resource(&self) -> Option<(ID3D12Resource, u64, bool)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -8820,6 +9061,8 @@ impl HostList {
             .as_ref()?;
         let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
         let mut deferred = self.deferred();
+        let was_used = deferred.budget_used;
+        deferred.budget_used = true;
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
@@ -8847,8 +9090,47 @@ impl HostList {
                 self.zero_card_budget(card);
             }
         }
+        let res = card.unwrap_or(buffer);
         // SAFETY: a live buffer.
-        Some(unsafe { card.unwrap_or(buffer).GetGPUVirtualAddress() })
+        let gpu = unsafe { res.GetGPUVirtualAddress() };
+        Some((res.clone(), gpu, was_used))
+    }
+
+    /// Whether a global UAV barrier has already flushed all prior shader/copy
+    /// UAV writes on this recording with no intervening UAV write since.
+    pub(crate) fn is_uav_clean(&self) -> bool {
+        self.deferred().uav_clean
+    }
+
+    /// Marks that a global UAV barrier has flushed all prior UAV writes on this
+    /// recording.
+    pub(crate) fn mark_uav_clean(&self) {
+        self.deferred().uav_clean = true;
+    }
+
+    /// Marks that a shader dispatch, UAV-capable draw, or GPU buffer copy may
+    /// have written a UAV since the last global UAV barrier on this recording.
+    pub(crate) fn mark_uav_dirty(&self) {
+        self.deferred().uav_clean = false;
+    }
+
+    /// Records a global `NULL` UAV barrier on this list unless redundant
+    /// consecutive global UAV barrier coalescing (`VICTORY_COALESCE_UAV_BARRIERS`,
+    /// on by default) sees that no UAV-capable work ran since the last global
+    /// UAV barrier on this recording. Returns `true` if a barrier was recorded.
+    pub(crate) fn emit_global_uav_barrier(&self) -> bool {
+        if coalesce_uav_barriers() {
+            let mut deferred = self.deferred();
+            if deferred.uav_clean {
+                return false;
+            }
+            deferred.uav_clean = true;
+        } else {
+            self.deferred().uav_clean = true;
+        }
+        // SAFETY: an open list; a null-resource UAV barrier is always valid.
+        unsafe { self.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+        true
     }
 
     /// The budget's words in the card's own memory ([`card_budget`]), if
@@ -10025,6 +10307,61 @@ mod front_tests {
         )
         .expect("CARD_COMPARE_WIDE HLSL must compile cleanly for cs_5_1");
         assert!(!code.is_empty());
+    }
+
+    #[test]
+    fn coalesce_uav_barriers_default_on_and_opt_out() {
+        use std::ffi::OsStr;
+        assert!(super::coalesce_uav_barriers_for(None));
+        assert!(super::coalesce_uav_barriers_for(Some(OsStr::new("1"))));
+        assert!(!super::coalesce_uav_barriers_for(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn texture_write_state_and_alias_use_step_track_dirty_writes() {
+        // Read-only states do not count as writes; write states do.
+        assert!(!super::is_texture_write_state(0x40 | 0x80)); // SHADER_RESOURCE
+        assert!(!super::is_texture_write_state(0x800)); // COPY_SOURCE
+        assert!(!super::is_texture_write_state(0x20)); // DEPTH_READ
+        assert!(super::is_texture_write_state(0x4)); // RENDER_TARGET
+        assert!(super::is_texture_write_state(0x8)); // UNORDERED_ACCESS
+        assert!(super::is_texture_write_state(0x10)); // DEPTH_WRITE
+        assert!(super::is_texture_write_state(0x400)); // COPY_DEST
+        assert!(super::is_texture_write_state(0x1000)); // RESOLVE_DEST
+
+        // Read before any local write -> defers to prelude, no inline copy.
+        let (mut needs_prelude, mut synced) = (false, 0u32);
+        assert!(!super::alias_use_step(0, &mut needs_prelude, &mut synced));
+        assert!(needs_prelude);
+        assert_eq!(synced, 0);
+        // Repeated read before any write -> still no inline copy.
+        assert!(!super::alias_use_step(0, &mut needs_prelude, &mut synced));
+        // Local write occurs (src_writes == 1) -> triggers inline copy once.
+        assert!(super::alias_use_step(1, &mut needs_prelude, &mut synced));
+        assert_eq!(synced, 1);
+        // Repeated read after SRV transition (src_writes still 1) -> no redundant copy.
+        assert!(!super::alias_use_step(1, &mut needs_prelude, &mut synced));
+        // Second local write (src_writes == 2) -> triggers inline copy again.
+        assert!(super::alias_use_step(2, &mut needs_prelude, &mut synced));
+        assert_eq!(synced, 2);
+    }
+
+    #[test]
+    fn batch_compare_groups_merges_disjoint_and_splits_overlaps() {
+        // Items: (shadow_key, mode, first_piece, pieces, at)
+        let items = [
+            (1usize, 2u32, 0u32, 2u32, 0u32),   // shadow 1, pieces 0..2, at 0
+            (1, 2, 5, 1, 2),                    // shadow 1, disjoint piece 5, contiguous at 2 -> merges
+            (1, 2, 10, 3, 3),                   // shadow 1, disjoint pieces 10..13, at 3 -> merges
+            (1, 2, 12, 2, 6),                   // shadow 1, overlaps piece 12 (< 13) -> splits!
+            (1, 1, 20, 1, 8),                   // shadow 1, different mode (1 vs 2) -> splits!
+            (2, 2, 0, 4, 9),                    // shadow 2 -> splits!
+            (2, 2, 8, 2, 14),                   // shadow 2, non-contiguous at (14 != 13) -> splits!
+        ];
+        assert_eq!(
+            super::batch_compare_groups(&items),
+            vec![0..3, 3..4, 4..5, 5..6, 6..7]
+        );
     }
 }
 
@@ -12322,6 +12659,20 @@ pub(crate) fn transition(
             }),
         },
     }
+}
+
+/// Whether consecutive redundant global `NULL` UAV barriers on the same
+/// recording (with zero intervening UAV-capable draws, dispatches, or GPU
+/// buffer copies) are coalesced (`VICTORY_COALESCE_UAV_BARRIERS=0` disables).
+pub(crate) fn coalesce_uav_barriers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        coalesce_uav_barriers_for(std::env::var_os("VICTORY_COALESCE_UAV_BARRIERS").as_deref())
+    })
+}
+
+fn coalesce_uav_barriers_for(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
 }
 
 fn uav_barrier(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {

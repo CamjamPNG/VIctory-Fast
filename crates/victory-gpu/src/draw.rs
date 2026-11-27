@@ -433,11 +433,15 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
 /// to wait that do not pass through its lists' methods is not known.
 fn batches() -> u8 {
     static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("VICTORY_INDIRECT_BATCH").as_deref() {
-        Ok("0") => 0,
-        Ok("2") => 2,
-        _ => 1,
-    })
+    *ON.get_or_init(|| batches_for(std::env::var_os("VICTORY_INDIRECT_BATCH").as_deref()))
+}
+
+fn batches_for(value: Option<&std::ffi::OsStr>) -> u8 {
+    match value.and_then(|v| v.to_str()) {
+        Some("0") => 0,
+        Some("1") => 1,
+        _ => 2,
+    }
 }
 
 /// The records clamped by the pass opened last ([`batches`]).
@@ -454,7 +458,7 @@ struct Batch {
 static ARGUMENT_COPIES: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> = std::sync::Mutex::new(Vec::new());
 
 /// [`ARGUMENT_COPIES`] that live, and `first` put in front of them.
-fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource)> {
+fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource, bool)> {
     let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
     let live: Vec<_> = copies.iter().filter_map(std::sync::Weak::upgrade).filter(|s| s.id() != first.id()).collect();
     *copies = std::iter::once(first)
@@ -462,7 +466,7 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
         .take(crate::indirect::batch::SOURCES)
         .map(std::sync::Arc::downgrade)
         .collect();
-    live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
+    live.iter().map(|s| (s.id(), s.buffer.clone(), s.in_place())).collect()
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -569,10 +573,6 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
-    /// Under `VICTORY_INDIRECT_CLAMP=0`: a UAV barrier has already flushed all
-    /// prior buffer writes on the current host list, so consecutive read-only
-    /// indirect draws need not re-emit one.
-    uav_clean: bool,
 }
 
 /// Owned dynamic descriptor slot ranges detached from a submitted list's
@@ -1536,7 +1536,6 @@ impl State {
         self.root_uav_slots.clear();
         self.tables_gone = false;
         self.recording = 0;
-        self.uav_clean = false;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -2079,7 +2078,10 @@ impl State {
         }
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
-            list.twin_use(self.depth as This, false, true);
+            // A read-only DSV cannot modify either plane, so it must not dirty
+            // the colour twin and trigger a spurious depth->twin copy.
+            let writes_depth = self.depth_state != DEPTH_READ;
+            list.twin_use(self.depth as This, false, writes_depth);
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -2455,6 +2457,7 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
+            list.mark_uav_dirty();
             if writes {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, pipeline);
@@ -3832,7 +3835,7 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(gx, gy, gz) };
-        self.buffers_written();
+        self.buffers_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
@@ -4180,7 +4183,7 @@ impl State {
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
-                    self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+                    self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
@@ -4843,7 +4846,7 @@ impl State {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4948,7 +4951,7 @@ impl State {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
-            self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
+            self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -4962,8 +4965,8 @@ impl State {
 impl State {
     /// Shaders that can write buffers were recorded: arguments may be others
     /// from here on.
-    fn buffers_written(&mut self) {
-        self.uav_clean = false;
+    fn buffers_written(&mut self, list: &HostList) {
+        list.mark_uav_dirty();
         match &mut self.batch {
             Some(batch) if batches() == 2 => batch.wrote = true,
             batch => *batch = None,
@@ -4972,16 +4975,15 @@ impl State {
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
-    fn drew(&mut self, p: Option<&HostPipeline>) {
+    fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
-            self.uav_clean = false;
+            list.mark_uav_dirty();
             self.batch = None;
         }
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self) {
-        self.uav_clean = false;
         self.window = None;
         self.batch = None;
     }
@@ -5020,7 +5022,11 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        let (mut table, scratch) = crate::indirect::open_batch(
+            list,
+            (id, &args.buffer, args.in_place()),
+            &argument_copies(args),
+        )?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
@@ -5163,13 +5169,8 @@ impl State {
                 s.refresh(list, *at, 4);
             }
             self.window = None;
-            const NOCLAMP_USE: usize = usize::MAX - 0x79;
-            if list.first_use(NOCLAMP_USE) || !self.uav_clean {
-                // Ensure earlier compute UAV / copy writes to argument or count buffers are visible.
-                // SAFETY: an open list; a null-resource UAV barrier is always valid.
-                unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
-                self.uav_clean = true;
-            }
+            // Ensure earlier compute UAV / copy writes to argument or count buffers are visible.
+            list.emit_global_uav_barrier();
             (args.buffer.clone(), offset)
         } else {
             // One record without a count: clamped in a batch (`batches`).
@@ -5246,11 +5247,18 @@ impl State {
                     // More than the record asked for: a window clamped ahead,
                     // whose unfilled slots must not spend the list's budget.
                     let bounded = if windowed && records > 1 {
-                        crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                        crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records), in_place)
                     } else {
                         // (A spread dispatch is never windowed: `windowed` is
                         // false for dispatches.)
-                        crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
+                        crate::indirect::bound(
+                            list,
+                            (&args.buffer, offset),
+                            count_arg,
+                            (kind, step, records),
+                            is_spread,
+                            in_place,
+                        )
                     };
                     let Some(bounded) = bounded else {
                         self.window = None;
@@ -5307,9 +5315,9 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
-            self.buffers_written();
+            self.buffers_written(list);
         } else {
-            self.drew(Some(p));
+            self.drew(list, Some(p));
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
@@ -5470,6 +5478,7 @@ impl State {
             Vec::new()
         };
         let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        let any_in_place = arg_shadow.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place());
         let Some(bounded) = crate::indirect::repack(
             list,
             (&arg_shadow.buffer, arg_shadow.offset(arguments)),
@@ -5477,6 +5486,7 @@ impl State {
             &plan,
             &rebase,
             max,
+            any_in_place,
         ) else {
             self.window = None;
             why("multi-arg repack failed");
@@ -5523,7 +5533,7 @@ impl State {
             self.mesh_scissor(list, false);
         }
         if kind == KIND_DISPATCH {
-            self.buffers_written();
+            self.buffers_written(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
                 && crate::ambient::on()
@@ -5533,7 +5543,7 @@ impl State {
                 self.host_roots[1] = 0;
             }
         } else {
-            self.drew(Some(p));
+            self.drew(list, Some(p));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
@@ -6138,6 +6148,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
+            list.mark_uav_dirty();
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
@@ -6201,6 +6212,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            list.mark_uav_dirty();
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Some compute-written textures are also read by the title CPU.
@@ -6437,6 +6449,15 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    #[test]
+    fn indirect_batch_defaults_to_level_2_and_honors_overrides() {
+        use std::ffi::OsStr;
+        assert_eq!(super::batches_for(None), 2);
+        assert_eq!(super::batches_for(Some(OsStr::new("2"))), 2);
+        assert_eq!(super::batches_for(Some(OsStr::new("1"))), 1);
+        assert_eq!(super::batches_for(Some(OsStr::new("0"))), 0);
     }
 }
 

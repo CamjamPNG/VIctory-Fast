@@ -180,6 +180,7 @@ pub fn record<R>(list: This, f: impl FnOnce(&Recording<'_>) -> R) -> Option<R> {
         };
         let out = f(&recording);
         recording.flush_barriers();
+        host.mark_uav_dirty();
         state.external_compute();
         out
     })

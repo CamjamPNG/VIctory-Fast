@@ -1193,6 +1193,11 @@ pub(crate) struct HostTexture {
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
+    /// Monotonic generation bumped in submission order whenever a list writes
+    /// this texture, so format-aliased views (`crate::texture::alias`) copy
+    /// only when the source actually changed. Starts at 1 so the first alias
+    /// read always syncs.
+    pub(crate) write_gen: std::sync::atomic::AtomicU64,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -2442,6 +2447,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            write_gen: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -2467,6 +2473,7 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            write_gen: std::sync::atomic::AtomicU64::new(1),
         }
     }
 }

@@ -14,7 +14,7 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::{Clamp, uav_barrier};
+use super::{Clamp, ClampBarrierPlan, PreInputUav, uav_barrier, uav_barrier_for};
 use crate::host::transition;
 
 /// The jobs of one pass.
@@ -321,14 +321,42 @@ impl Table {
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
 /// the clamped records.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    budget: u64,
+    (budget_res, budget): (Option<&ID3D12Resource>, u64),
     sources: [u64; SOURCES],
+    source_resources: &[&ID3D12Resource],
     jobs: u64,
+    barrier_plan: ClampBarrierPlan,
 ) {
+    let mut first: [D3D12_RESOURCE_BARRIER; SOURCES + 2] =
+        std::array::from_fn(|_| D3D12_RESOURCE_BARRIER::default());
+    let mut first_len = 0usize;
+    match barrier_plan.pre_inputs {
+        PreInputUav::None => {}
+        PreInputUav::Global => {
+            first[first_len] = uav_barrier();
+            first_len += 1;
+        }
+        PreInputUav::Scoped => {
+            for &res in source_resources {
+                first[first_len] = uav_barrier_for(res);
+                first_len += 1;
+            }
+        }
+    }
+    if barrier_plan.pre_budget {
+        first[first_len] = match budget_res {
+            Some(res) => uav_barrier_for(res),
+            None => uav_barrier(),
+        };
+        first_len += 1;
+    }
+    first[first_len] = transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    first_len += 1;
     let after = transition(
         dst,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -337,10 +365,7 @@ pub(super) fn record(
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        l.ResourceBarrier(&first[..first_len]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {
@@ -350,8 +375,8 @@ pub(super) fn record(
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 1, dst.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 2, budget);
         l.Dispatch(JOBS.div_ceil(64), 1, 1);
-        // Nothing else the pass writes is read before the next full wait
-        // (the budget, by the next pass): only the records have to be there.
+        // Only the clamped records have to transition to INDIRECT_ARGUMENT;
+        // the next clamp in this list orders `budget` via a scoped UAV barrier.
         l.ResourceBarrier(&[after]);
     }
 }

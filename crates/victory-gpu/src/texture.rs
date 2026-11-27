@@ -169,12 +169,69 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// ([`alias`]): every level of every layer as each of the two formats lays
 /// it out for a copy (the same bytes: the texels are as wide), the written
 /// texture's layout first.
-struct Through {
-    buffer: ID3D12Resource,
-    parts: Vec<(
+pub(crate) struct Through {
+    pub(crate) buffer: ID3D12Resource,
+    pub(crate) parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
+    /// Last `source.write_gen` synced into the placed texture in submission
+    /// order (starts at 0 while `write_gen` starts at 1, so the first read
+    /// always syncs).
+    pub(crate) synced_gen: std::sync::atomic::AtomicU64,
+}
+
+/// Whether format-alias copies track source texture write generations across
+/// command lists and defer cross-list syncs to list preludes
+/// (`VICTORY_ALIAS_DIRTY=0` reverts to legacy per-list copying).
+fn alias_dirty_tracking() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_DIRTY").is_none_or(|v| v != "0"))
+}
+
+/// Records the `from -> through.buffer -> to` subresource copies into `list`.
+/// Both `from` (`COPY_SOURCE`) and `to` (`COPY_DEST`) must already be in their
+/// copy states; `through.buffer` begins and ends in `COMMON`.
+pub(crate) fn record_alias_copy(
+    list: &ID3D12GraphicsCommandList,
+    from: &ID3D12Resource,
+    to: &ID3D12Resource,
+    through: &Through,
+) {
+    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer the location never releases.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: index as u32,
+        },
+    };
+    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: as above.
+        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: *row,
+        },
+    };
+    let (common, read, written) = (
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    );
+    // SAFETY: an open list and live resources; the buffer is as big as
+    // the footprints and rests in the common state between copies.
+    unsafe {
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        for (index, (of_written, _)) in through.parts.iter().enumerate() {
+            list.CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+        }
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        for (index, (_, of_read)) in through.parts.iter().enumerate() {
+            list.CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+        }
+        list.ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+    }
 }
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
@@ -204,12 +261,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const COPY_SOURCE: u32 = 0x800;
     // (All of its levels: the copy is level by level.)
     crate::resource::want_level(placed, 0);
-    let (Some(to), Some(from)) = (
-        crate::resource::host_resource(placed),
-        crate::resource::host_resource(source),
+    let (Some(to_copy), Some(from_copy)) = (
+        crate::resource::host_copy(placed),
+        crate::resource::host_copy(source),
     ) else {
         return false;
     };
+    let (to, from) = (&to_copy.texture, &from_copy.texture);
     let Some(host) = host() else { return false };
     let through = {
         let mut map = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
@@ -291,12 +349,43 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let through = Arc::new(Through {
                     buffer,
                     parts: of_written.into_iter().zip(of_read).collect(),
+                    synced_gen: std::sync::atomic::AtomicU64::new(0),
                 });
                 map.insert(placed as usize, through.clone());
                 through
             }
         }
     };
+    if alias_dirty_tracking() && crate::resource::host_tiled(placed).is_none() {
+        if !list.alias_use(&from_copy, &to_copy, &through) {
+            return true;
+        }
+        let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
+            let state = crate::host::legal_state(texture, COPY_SOURCE);
+            let barrier = crate::host::transition(
+                texture,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(state as i32),
+            );
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            before
+        });
+        crate::list::ensure_state(list, placed, COPY_DEST);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+        record_alias_copy(&list.list, from, to, &through);
+        list.keep(&through.buffer);
+        // A draw that also writes the source (a view of it handled before
+        // this one) needs it in that state again; restoring the write state
+        // bumps `local_writes` so the next alias read copies once more.
+        if let Some(before) = before
+            && before & TARGET_OR_UNORDERED != 0
+        {
+            crate::list::ensure_state(list, source, before);
+        }
+        return true;
+    }
     let first = list.first_use(placed as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
@@ -317,47 +406,9 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     }
     card_writes(list, placed, to, None);
     crate::list::ensure_state(list, placed, COPY_DEST);
-    let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: a borrowed pointer the location never releases.
-        pResource: unsafe { std::mem::transmute_copy(texture) },
-        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            SubresourceIndex: index as u32,
-        },
-    };
-    let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: as above.
-        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
-        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            PlacedFootprint: *row,
-        },
-    };
-    let (common, read, written) = (
-        D3D12_RESOURCE_STATE_COMMON,
-        D3D12_RESOURCE_STATE_COPY_SOURCE,
-        D3D12_RESOURCE_STATE_COPY_DEST,
-    );
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
-    // SAFETY: an open list and live resources; the buffer is as big as
-    // the footprints and rests in the common state between copies.
-    unsafe {
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
-        for (index, (of_written, _)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
-        }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
-        for (index, (_, of_read)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
-        }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
-    }
+    record_alias_copy(&list.list, from, to, &through);
     list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias

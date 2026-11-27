@@ -172,6 +172,38 @@ std::arch::global_asm!(
     "vzeroupper",
     "xor eax, eax",
     "ret",
+    ".globl victory_safe_probe_readable",
+    ".globl victory_safe_probe_at",
+    ".globl victory_safe_probe_after",
+    ".globl victory_safe_probe_failed",
+    // rcx address, rdx length in bytes, r8 stride (>= 1); eax: 1 if every
+    // stride-spaced probe byte and the final byte were readable, 0 on fault.
+    // Leaf using only volatile registers so stack unwinding works with zero
+    // prologue or epilogue.
+    "victory_safe_probe_readable:",
+    "test rdx, rdx",
+    "jz 3f",
+    "2:",
+    "victory_safe_probe_at:",
+    "movzx eax, byte ptr [rcx]",
+    "victory_safe_probe_after:",
+    "cmp rdx, 1",
+    "jbe 3f",
+    "cmp rdx, r8",
+    "jbe 4f",
+    "add rcx, r8",
+    "sub rdx, r8",
+    "jmp 2b",
+    "4:",
+    "lea rcx, [rcx + rdx - 1]",
+    "mov rdx, 1",
+    "jmp 2b",
+    "3:",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_probe_failed:",
+    "xor eax, eax",
+    "ret",
 );
 
 unsafe extern "system" {
@@ -191,6 +223,10 @@ unsafe extern "system" {
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
+    fn victory_safe_probe_readable(addr: *const u8, len: usize, stride: usize) -> u32;
+    fn victory_safe_probe_at();
+    fn victory_safe_probe_after();
+    fn victory_safe_probe_failed();
 }
 
 /// The records of 32 bytes at `title` (`records` of them) that differ from
@@ -402,6 +438,81 @@ pub(crate) unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
     unsafe { victory_safe_copy(dst, src, len) != 0 }
 }
 
+/// Probes `[addr, addr + len)` for readability at `stride`-byte intervals plus
+/// the final byte, without mutating or dirtying any page. Returns `true` if
+/// `len == 0` or every probed byte was readable without faulting.
+///
+/// # Safety
+/// [`on`] must have been asked (which installs the [`crate::watch`] fault
+/// handler). Non-mutating read-only probe; never dirties pages.
+pub(crate) unsafe fn probe_readable(addr: *const u8, len: usize, stride: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let stride = stride.max(1);
+    // SAFETY: a fault reading `addr` leaves through the failing exit
+    // ([`failing_exit`]); `stride >= 1` guarantees termination.
+    unsafe { victory_safe_probe_readable(addr, len, stride) != 0 }
+}
+
+/// Counts how many `stride`-spaced chunks covering `[addr, addr + len)` (where
+/// chunk `i` covers `[addr + i * stride, (addr + (i + 1) * stride).min(addr + len))`)
+/// are readable.
+///
+/// # Safety
+/// [`on`] must have been asked (which installs the [`crate::watch`] fault
+/// handler). Non-mutating read-only probe; never dirties pages.
+#[allow(dead_code)]
+pub(crate) unsafe fn count_readable(addr: *const u8, len: usize, stride: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let stride = stride.max(1);
+    // SAFETY: caller's contract.
+    if unsafe { probe_readable(addr, len, stride) } {
+        return len.div_ceil(stride);
+    }
+    let mut count = 0;
+    let mut off = 0;
+    while off < len {
+        let chunk_len = (len - off).min(stride);
+        // SAFETY: `probe_readable` traps faults; `wrapping_add` avoids UB on unmapped addresses.
+        if unsafe { probe_readable(addr.wrapping_add(off), chunk_len, stride) } {
+            count += 1;
+        }
+        off += chunk_len;
+    }
+    count
+}
+
+/// Returns the total byte length of readable `stride`-spaced chunks covering
+/// `[addr, addr + len)`.
+///
+/// # Safety
+/// [`on`] must have been asked (which installs the [`crate::watch`] fault
+/// handler). Non-mutating read-only probe; never dirties pages.
+pub(crate) unsafe fn readable_bytes(addr: *const u8, len: usize, stride: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let stride = stride.max(1);
+    // SAFETY: caller's contract.
+    if unsafe { probe_readable(addr, len, stride) } {
+        return len;
+    }
+    let mut total = 0;
+    let mut off = 0;
+    while off < len {
+        let chunk_len = (len - off).min(stride);
+        // SAFETY: `probe_readable` traps faults; `wrapping_add` avoids UB on unmapped addresses.
+        if unsafe { probe_readable(addr.wrapping_add(off), chunk_len, stride) } {
+            total += chunk_len;
+        }
+        off += chunk_len;
+    }
+    total
+}
+
 /// For the fault handler: where a fault at instruction `at` is to go on, if
 /// it is [`copy`]'s.
 pub(crate) fn failing_exit(at: usize) -> Option<usize> {
@@ -416,6 +527,10 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_changed_at as *const () as usize, victory_safe_changed_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_changed_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_probe_at as *const () as usize, victory_safe_probe_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_probe_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
     (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
@@ -821,5 +936,109 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn probe_readable_handles_committed_decommitted_noaccess_and_readonly() {
+        assert!(on());
+        let pages = Pages::new(1 << 16);
+        pages.fill();
+        let unmapped: *const u8 = std::ptr::without_provenance(0x1000);
+        let mut old = 0;
+
+        // SAFETY: `on()` installed the fault handler; all offsets lie within `pages` or test unmapped trapping.
+        unsafe {
+            // Zero-length always succeeds, even on unmapped addresses or zero stride.
+            assert!(probe_readable(pages.0, 0, 4096));
+            assert!(probe_readable(pages.0, 0, 0));
+            assert!(probe_readable(unmapped, 0, 4096));
+
+            // Single byte, unaligned offsets, and exact page boundaries on committed memory.
+            for off in [0usize, 1, 7, 4095] {
+                assert!(probe_readable(pages.0.add(off), 1, 4096));
+                assert!(probe_readable(pages.0.add(off), 1, 0));
+                assert!(probe_readable(pages.0.add(off), 4095, 4096));
+                assert!(probe_readable(pages.0.add(off), 4096, 4096));
+                assert!(probe_readable(pages.0.add(off), 4097, 4096));
+            }
+            assert!(probe_readable(pages.0, 1 << 16, 4096));
+
+            // Unmapped address fails.
+            assert!(!probe_readable(unmapped, 1, 4096));
+            assert!(!probe_readable(unmapped, 4096, 4096));
+
+            // PAGE_READONLY is readable.
+            assert_ne!(VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READONLY, &mut old), 0);
+            assert!(probe_readable(pages.0, 1 << 16, 4096));
+            assert!(probe_readable(pages.0.add(4096), 4096, 4096));
+            assert_ne!(VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old), 0);
+
+            // PAGE_NOACCESS fails whenever touched (start, middle, or exact last byte).
+            assert_ne!(VirtualProtect(pages.0.add(2 * 4096).cast(), 4096, PAGE_NOACCESS, &mut old), 0);
+            assert!(!probe_readable(pages.0, 1 << 16, 4096));
+            assert!(!probe_readable(pages.0.add(2 * 4096), 1, 4096));
+            assert!(!probe_readable(pages.0.add(4096), 4097, 4096));
+            assert!(probe_readable(pages.0, 2 * 4096, 4096));
+            assert!(probe_readable(pages.0.add(3 * 4096), 4096, 4096));
+            assert_ne!(VirtualProtect(pages.0.add(2 * 4096).cast(), 4096, PAGE_READWRITE, &mut old), 0);
+
+            // MEM_DECOMMIT in middle.
+            assert_ne!(VirtualFree(pages.0.add(8 * 4096).cast(), 4096, MEM_DECOMMIT), 0);
+            assert!(!probe_readable(pages.0, 1 << 16, 4096));
+            assert!(!probe_readable(pages.0.add(7 * 4096 + 1), 4096, 4096));
+            assert!(probe_readable(pages.0, 8 * 4096, 4096));
+            assert!(probe_readable(pages.0.add(9 * 4096), 7 * 4096, 4096));
+
+            // MEM_DECOMMIT at start.
+            assert_ne!(VirtualFree(pages.0.cast(), 4096, MEM_DECOMMIT), 0);
+            assert!(!probe_readable(pages.0, 4096, 4096));
+            assert!(!probe_readable(pages.0, 2 * 4096, 4096));
+            assert!(probe_readable(pages.0.add(4096), 7 * 4096, 4096));
+
+            // MEM_DECOMMIT at end.
+            assert_ne!(VirtualFree(pages.0.add(15 * 4096).cast(), 4096, MEM_DECOMMIT), 0);
+            assert!(!probe_readable(pages.0.add(9 * 4096), 7 * 4096, 4096));
+            assert!(!probe_readable(pages.0.add(14 * 4096 + 1), 4096, 4096));
+            assert!(probe_readable(pages.0.add(9 * 4096), 6 * 4096, 4096));
+        }
+    }
+
+    #[test]
+    fn count_readable_and_readable_bytes_skip_holes_accurately() {
+        assert!(on());
+        let pages = Pages::new(8 * 4096);
+        pages.fill();
+        let mut old = 0;
+
+        // SAFETY: `on()` installed the fault handler; all operations are on `pages`.
+        unsafe {
+            // Zero length and fully-readable fast path.
+            assert_eq!(count_readable(pages.0, 0, 4096), 0);
+            assert_eq!(readable_bytes(pages.0, 0, 4096), 0);
+            assert_eq!(count_readable(pages.0, 8 * 4096, 4096), 8);
+            assert_eq!(readable_bytes(pages.0, 8 * 4096, 4096), 8 * 4096);
+
+            // Punch holes: decommit pages 2 and 5, NOACCESS page 4, READONLY page 6.
+            assert_ne!(VirtualFree(pages.0.add(2 * 4096).cast(), 4096, MEM_DECOMMIT), 0);
+            assert_ne!(VirtualFree(pages.0.add(5 * 4096).cast(), 4096, MEM_DECOMMIT), 0);
+            assert_ne!(VirtualProtect(pages.0.add(4 * 4096).cast(), 4096, PAGE_NOACCESS, &mut old), 0);
+            assert_ne!(VirtualProtect(pages.0.add(6 * 4096).cast(), 4096, PAGE_READONLY, &mut old), 0);
+
+            // Readable pages: 0, 1, 3, 6 (readonly), 7 => 5 pages.
+            assert_eq!(count_readable(pages.0, 8 * 4096, 4096), 5);
+            assert_eq!(readable_bytes(pages.0, 8 * 4096, 4096), 5 * 4096);
+
+            // Unaligned tail on readable page 7.
+            assert_eq!(count_readable(pages.0, 7 * 4096 + 321, 4096), 5);
+            assert_eq!(readable_bytes(pages.0, 7 * 4096 + 321, 4096), 4 * 4096 + 321);
+
+            // Unaligned tail on decommitted page 5.
+            assert_eq!(count_readable(pages.0, 5 * 4096 + 321, 4096), 3);
+            assert_eq!(readable_bytes(pages.0, 5 * 4096 + 321, 4096), 3 * 4096);
+
+            // Unaligned start + tail: chunk 0 (p0..p1), chunk 6 (p6..p7), and tail chunk 7 (p7) are readable.
+            assert_eq!(count_readable(pages.0.add(100), 7 * 4096 + 123, 4096), 3);
+            assert_eq!(readable_bytes(pages.0.add(100), 7 * 4096 + 123, 4096), 2 * 4096 + 123);
+        }
     }
 }

@@ -10,11 +10,13 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{
+    Arc, Condvar, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
+use std::time::{Duration, Instant};
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
 
@@ -86,9 +88,18 @@ impl Task {
     }
 }
 
+struct WaiterGuard<'a>(&'a AtomicUsize);
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct Port {
     mode: Mode,
     tasks: Mutex<VecDeque<Task>>,
+    waiters: AtomicUsize,
     ready: Condvar,
 }
 
@@ -97,6 +108,7 @@ impl Port {
         let port = Arc::new(Port {
             mode,
             tasks: Mutex::default(),
+            waiters: AtomicUsize::new(0),
             ready: Condvar::new(),
         });
         if mode == Mode::Serialized {
@@ -121,8 +133,13 @@ impl Port {
             Mode::Immediate => task.run(false),
             Mode::ThreadPool => POOL.submit(task),
             Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
-                self.ready.notify_one();
+                let mut tasks = lock(&self.tasks);
+                tasks.push_back(task);
+                let has_waiters = self.waiters.load(Ordering::Acquire) > 0;
+                drop(tasks);
+                if has_waiters {
+                    self.ready.notify_one();
+                }
             }
         }
     }
@@ -130,8 +147,16 @@ impl Port {
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
     /// (checked whenever the port is woken) says no task will come.
     fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
+        let mut tasks = lock(&self.tasks);
+        if let Some(task) = tasks.pop_front() {
+            return Some(task);
+        }
+        if timeout_ms == 0 || ended() {
+            return None;
+        }
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+        let _guard = WaiterGuard(&self.waiters);
         let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
-        let tasks = lock(&self.tasks);
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
                 .wait_while(tasks, waiting)
@@ -148,39 +173,92 @@ impl Port {
 }
 
 /// The thread pool behind thread-pool ports: idle workers are reused, and a
-/// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
+/// new one starts whenever more tasks wait than workers idle or spawning, so
+/// a callback that blocks on another never starves it. Core workers stay warm;
+/// excess burst workers exit after an idle timeout.
+struct PoolState {
+    tasks: VecDeque<Task>,
+    idle: usize,
+    spawning: usize,
+    live: usize,
+}
+
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    state: Mutex<PoolState>,
     ready: Condvar,
 }
 
 static POOL: Pool = Pool {
-    state: Mutex::new((VecDeque::new(), 0)),
+    state: Mutex::new(PoolState {
+        tasks: VecDeque::new(),
+        idle: 0,
+        spawning: 0,
+        live: 0,
+    }),
     ready: Condvar::new(),
 };
+
+fn pool_core_workers() -> usize {
+    static CORE: LazyLock<usize> = LazyLock::new(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(4)
+    });
+    *CORE
+}
 
 impl Pool {
     fn submit(&'static self, task: Task) {
         let mut state = lock(&self.state);
-        state.0.push_back(task);
-        if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
-        } else {
+        state.tasks.push_back(task);
+        if state.tasks.len() > state.idle + state.spawning {
+            state.spawning += 1;
+            drop(state);
+            if std::thread::Builder::new()
+                .name("victory-xtask".into())
+                .spawn(move || self.work())
+                .is_err()
+            {
+                let mut state = lock(&self.state);
+                state.spawning = state.spawning.saturating_sub(1);
+                if state.idle > 0 {
+                    drop(state);
+                    self.ready.notify_one();
+                }
+            }
+        } else if state.idle > 0 {
+            drop(state);
             self.ready.notify_one();
         }
     }
 
     fn work(&self) {
+        const EXCESS_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+        let core = pool_core_workers();
         let mut state = lock(&self.state);
+        state.spawning = state.spawning.saturating_sub(1);
+        state.live += 1;
         loop {
-            while state.0.is_empty() {
-                state.1 += 1;
-                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
-                state.1 -= 1;
+            while state.tasks.is_empty() {
+                state.idle += 1;
+                if state.live > core {
+                    let (next, timeout) = self
+                        .ready
+                        .wait_timeout(state, EXCESS_IDLE_TIMEOUT)
+                        .unwrap_or_else(|e| e.into_inner());
+                    state = next;
+                    state.idle -= 1;
+                    if state.tasks.is_empty() && timeout.timed_out() && state.live > core {
+                        state.live -= 1;
+                        return;
+                    }
+                } else {
+                    state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+                    state.idle -= 1;
+                }
             }
-            let task = state.0.pop_front();
+            let task = state.tasks.pop_front();
             drop(state);
             if let Some(task) = task {
                 task.run(false);
@@ -190,11 +268,104 @@ impl Pool {
     }
 }
 
+struct TimerEntry {
+    deadline: Instant,
+    seq: u64,
+    id: u64,
+    port: u32,
+    queue: Arc<Queue>,
+}
+
+impl PartialEq for TimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.seq == other.seq
+    }
+}
+
+impl Eq for TimerEntry {}
+
+impl PartialOrd for TimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimerEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse so BinaryHeap pops the earliest deadline first.
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+struct DelayedTimer {
+    heap: Mutex<BinaryHeap<TimerEntry>>,
+    wake: Condvar,
+}
+
+static DELAYED_TIMER: LazyLock<Arc<DelayedTimer>> = LazyLock::new(|| {
+    let timer = Arc::new(DelayedTimer {
+        heap: Mutex::default(),
+        wake: Condvar::new(),
+    });
+    let worker = Arc::clone(&timer);
+    std::thread::Builder::new()
+        .name("victory-xtask-timer".into())
+        .spawn(move || worker.run())
+        .expect("spawn victory-xtask-timer");
+    timer
+});
+
+impl DelayedTimer {
+    fn schedule(&self, entry: TimerEntry) {
+        let mut heap = lock(&self.heap);
+        let earlier = heap
+            .peek()
+            .is_none_or(|top| entry.deadline < top.deadline);
+        heap.push(entry);
+        drop(heap);
+        if earlier {
+            self.wake.notify_one();
+        }
+    }
+
+    fn run(&self) {
+        let mut heap = lock(&self.heap);
+        loop {
+            let Some(top) = heap.peek() else {
+                heap = self.wake.wait(heap).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let now = Instant::now();
+            if top.deadline > now {
+                let wait = top.deadline.saturating_duration_since(now);
+                heap = self
+                    .wake
+                    .wait_timeout(heap, wait)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
+            }
+            let entry = heap.pop().unwrap();
+            drop(heap);
+            // Gone if the queue was terminated meanwhile, which canceled it.
+            let task = lock(&entry.queue.delayed).remove(&entry.id);
+            if let Some(task) = task {
+                entry.queue.deliver(entry.port, task);
+            }
+            heap = lock(&self.heap);
+        }
+    }
+}
+
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
+    monitor_count: AtomicUsize,
     terminated: AtomicBool,
     /// Delayed callbacks still waiting out their delay, in submission
     /// order: terminating the queue cancels them with the queued ones.
@@ -206,6 +377,7 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
+            monitor_count: AtomicUsize::new(0),
             terminated: AtomicBool::new(false),
             delayed: Mutex::default(),
         })
@@ -233,23 +405,46 @@ impl Queue {
             }
             delayed.insert(id, task);
         }
-        let queue = self.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(delay_ms.into()));
-            // Gone if the queue was terminated meanwhile, which canceled it.
-            let task = lock(&queue.delayed).remove(&id);
-            if let Some(task) = task {
-                queue.deliver(port, task);
-            }
+        DELAYED_TIMER.schedule(TimerEntry {
+            deadline: Instant::now() + Duration::from_millis(delay_ms.into()),
+            seq: id,
+            id,
+            port,
+            queue: Arc::clone(self),
         });
         S_OK
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
         self.ports[port as usize].submit(task);
+        if self.monitor_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
         // Copied out: a monitor may unregister itself.
-        let monitors = lock(&self.monitors).clone();
-        for (_, context, callback) in monitors {
+        let mut stack = [(0usize, 0usize); 4];
+        let mut stack_len = 0;
+        let mut heap = Vec::new();
+        {
+            let monitors = lock(&self.monitors);
+            if monitors.len() <= stack.len() {
+                for (dst, &(_, context, callback)) in stack.iter_mut().zip(monitors.iter()) {
+                    *dst = (context, callback);
+                }
+                stack_len = monitors.len();
+            } else {
+                heap.extend(
+                    monitors
+                        .iter()
+                        .map(|&(_, context, callback)| (context, callback)),
+                );
+            }
+        }
+        let slice = if heap.is_empty() {
+            &stack[..stack_len]
+        } else {
+            &heap[..]
+        };
+        for &(context, callback) in slice {
             // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
             let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
             callback(context as *mut c_void, Arc::as_ptr(self), port);
@@ -261,12 +456,23 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn read<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write<T>(m: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The process queue: `None` until first used (then a thread-pool queue),
 /// `Some(None)` once the title clears it.
-static PROCESS_QUEUE: Mutex<Option<Option<Arc<Queue>>>> = Mutex::new(None);
+static PROCESS_QUEUE: RwLock<Option<Option<Arc<Queue>>>> = RwLock::new(None);
 
 fn process_queue() -> Option<Arc<Queue>> {
-    lock(&PROCESS_QUEUE)
+    if let Some(slot) = read(&PROCESS_QUEUE).as_ref() {
+        return slot.clone();
+    }
+    write(&PROCESS_QUEUE)
         .get_or_insert_with(|| {
             Some(Queue::new([
                 Port::new(Mode::ThreadPool),
@@ -435,7 +641,11 @@ pub fn XTaskQueueRegisterMonitor(
         return E_INVALIDARG;
     }
     let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    lock(&queue.monitors).push((id, context as usize, callback as usize));
+    {
+        let mut monitors = lock(&queue.monitors);
+        monitors.push((id, context as usize, callback as usize));
+        queue.monitor_count.store(monitors.len(), Ordering::Release);
+    }
     // SAFETY: checked non-null.
     unsafe { token.write(id) };
     S_OK
@@ -443,7 +653,9 @@ pub fn XTaskQueueRegisterMonitor(
 
 pub fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
     if let Some(queue) = queue(handle) {
-        lock(&queue.monitors).retain(|m| m.0 != token);
+        let mut monitors = lock(&queue.monitors);
+        monitors.retain(|m| m.0 != token);
+        queue.monitor_count.store(monitors.len(), Ordering::Release);
     }
 }
 
@@ -463,7 +675,7 @@ pub fn XTaskQueueSetCurrentProcessTaskQueue(handle: *const Queue) {
     } else {
         queue(handle)
     };
-    *lock(&PROCESS_QUEUE) = Some(new);
+    *write(&PROCESS_QUEUE) = Some(new);
 }
 
 /// An async block: what the title fills in, then the system area.
@@ -490,11 +702,21 @@ const OP_GET_RESULT: u32 = 2;
 const OP_CANCEL: u32 = 3;
 const OP_CLEANUP: u32 = 4;
 
+struct CallWaiterGuard<'a>(&'a AtomicU32);
+
+impl Drop for CallWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// One call in flight, until its result is taken or it fails.
 struct Call {
     provider: Provider,
     context: usize,
     identity: usize,
+    is_done: AtomicBool,
+    waiters: AtomicU32,
     done: Mutex<bool>,
     finished: Condvar,
 }
@@ -517,17 +739,25 @@ impl Call {
     }
 }
 
-/// Calls by block address.
-static CALLS: LazyLock<Mutex<HashMap<usize, Arc<Call>>>> = LazyLock::new(Default::default);
+const CALL_SHARDS: usize = 16;
+
+/// Calls by block address, sharded to reduce contention across concurrent calls.
+static CALLS: LazyLock<[RwLock<HashMap<usize, Arc<Call>>>; CALL_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| RwLock::new(HashMap::new())));
+
+#[inline]
+fn call_shard(block: *mut AsyncBlock) -> &'static RwLock<HashMap<usize, Arc<Call>>> {
+    &CALLS[((block as usize) >> 4) & (CALL_SHARDS - 1)]
+}
 
 fn call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
-    lock(&CALLS).get(&(block as usize)).cloned()
+    read(call_shard(block)).get(&(block as usize)).cloned()
 }
 
 /// Whether `call` is still the call in flight on `block`: once it is over,
 /// the title may begin another call on the same block.
 fn is_current(call: &Arc<Call>, block: *mut AsyncBlock) -> bool {
-    lock(&CALLS)
+    read(call_shard(block))
         .get(&(block as usize))
         .is_some_and(|current| Arc::ptr_eq(current, call))
 }
@@ -553,7 +783,7 @@ fn zeroed(block: *mut AsyncBlock) -> bool {
 
 fn release(block: *mut AsyncBlock) {
     // Unlocked before the provider runs: it may call back into us.
-    let removed = lock(&CALLS).remove(&(block as usize));
+    let removed = write(call_shard(block)).remove(&(block as usize));
     if let Some(call) = removed {
         call.provider(OP_CLEANUP, block, 0, std::ptr::null_mut());
     }
@@ -580,7 +810,7 @@ pub fn XAsyncBegin(
         // behind never reads zero (it holds the result's size). So this is
         // a new block, and the call left behind ends here. A call in flight
         // keeps its address, and a block still holding a result is in use.
-        let over = *lock(&left.done);
+        let over = left.is_done.load(Ordering::Acquire);
         if !(over && zeroed(block)) {
             return E_INVALIDARG;
         }
@@ -593,10 +823,12 @@ pub fn XAsyncBegin(
         provider,
         context: context as usize,
         identity: identity as usize,
+        is_done: AtomicBool::new(false),
+        waiters: AtomicU32::new(0),
         done: Mutex::new(false),
         finished: Condvar::new(),
     });
-    lock(&CALLS).insert(block as usize, call.clone());
+    write(call_shard(block)).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
     let hr = call.provider(OP_BEGIN, block, 0, std::ptr::null_mut());
     if hr < 0 {
@@ -685,8 +917,12 @@ fn complete_call(call: &Call, block: *mut AsyncBlock, result: HRESULT, required_
     size.store(required_size, Ordering::Release);
     status.store(result as u32 as usize, Ordering::Release);
     *done = true;
-    call.finished.notify_all();
+    call.is_done.store(true, Ordering::Release);
+    let has_waiters = call.waiters.load(Ordering::Acquire) > 0;
     drop(done);
+    if has_waiters {
+        call.finished.notify_all();
+    }
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
         match queue(handle) {
@@ -701,8 +937,17 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
         return E_INVALIDARG;
     }
     if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+        if !call.is_done.load(Ordering::Acquire) {
+            let done = lock(&call.done);
+            if !*done {
+                call.waiters.fetch_add(1, Ordering::AcqRel);
+                let _guard = CallWaiterGuard(&call.waiters);
+                let _done = call
+                    .finished
+                    .wait_while(done, |d| !*d)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+        }
     }
     status(block)
 }
@@ -725,6 +970,9 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
+        if call.is_done.load(Ordering::Acquire) {
+            return;
+        }
         if *lock(&call.done) {
             return;
         }
@@ -774,10 +1022,21 @@ pub fn XAsyncGetResult(
 /// Starts a call on `block` that is already over: it completes with `hr`
 /// and no result data, through the block's completion port as usual.
 pub fn finished(block: *mut AsyncBlock, identity: *const c_void, hr: HRESULT) -> HRESULT {
-    finished_with(
+    extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+        // SAFETY: the runtime passes valid provider data; `context` encodes the HRESULT.
+        let data = unsafe { &*data };
+        if op == OP_BEGIN {
+            let hr = data.context as isize as HRESULT;
+            XAsyncComplete(data.block, hr, 0);
+        }
+        S_OK
+    }
+    XAsyncBegin(
         block,
+        hr as isize as *mut c_void,
         identity,
-        if hr < 0 { Err(hr) } else { Ok(Vec::new()) },
+        std::ptr::null(),
+        Some(provider),
     )
 }
 
@@ -1104,7 +1363,6 @@ static VTABLE: Methods<31> = Methods([
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
 
     fn slot<F: Copy>(offset: usize) -> F {
         crate::modules::xgameruntime::method(&OBJECT, offset)
@@ -1659,6 +1917,193 @@ mod tests {
         // Its delay passes without it running.
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn delayed_timer_fires_in_deadline_order_and_cancels_on_terminate() {
+        static ORDER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        static CANCELED: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn record(context: *mut c_void, canceled: bool) {
+            if canceled {
+                CANCELED.fetch_add(1, Ordering::SeqCst);
+            } else {
+                lock(&ORDER).push(context as usize);
+            }
+        }
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        // Submit longer delay before shorter delay; shorter must arrive first.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 80, 2 as *mut c_void, Some(record)),
+            S_OK
+        );
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 20, 1 as *mut c_void, Some(record)),
+            S_OK
+        );
+        // A long-delayed callback that will be canceled by terminate.
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 5_000, 99 as *mut c_void, Some(record)),
+            S_OK
+        );
+
+        assert!(XTaskQueueDispatch(q, WORK, 2_000));
+        assert!(XTaskQueueDispatch(q, WORK, 2_000));
+        assert_eq!(*lock(&ORDER), [1, 2]);
+        assert_eq!(CANCELED.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            XTaskQueueTerminate(q, true, std::ptr::null_mut(), None),
+            S_OK
+        );
+        assert_eq!(CANCELED.load(Ordering::SeqCst), 1);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn sharded_calls_high_concurrency_begin_schedule_complete_get_result() {
+        extern "system" fn echo_provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let data = unsafe { &*data };
+            match op {
+                OP_BEGIN => XAsyncSchedule(data.block, 0),
+                OP_DO_WORK => {
+                    XAsyncComplete(data.block, S_OK, size_of::<usize>());
+                    S_OK
+                }
+                OP_GET_RESULT => {
+                    // SAFETY: the runtime checked `size_of::<usize>()` bytes.
+                    unsafe { data.buffer.cast::<usize>().write(data.context as usize) };
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let q_addr = q as usize;
+
+        std::thread::scope(|s| {
+            for t in 0..8usize {
+                s.spawn(move || {
+                    let identity = 0x55 as *const c_void;
+                    for i in 0..64usize {
+                        let expected = (t << 16) | i;
+                        let mut block = AsyncBlock {
+                            queue: q_addr as *const Queue,
+                            context: std::ptr::null_mut(),
+                            callback: None,
+                            internal: [0; 4],
+                        };
+                        assert_eq!(
+                            XAsyncBegin(
+                                &mut block,
+                                expected as *mut c_void,
+                                identity,
+                                std::ptr::null(),
+                                Some(echo_provider),
+                            ),
+                            S_OK
+                        );
+                        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+                        // Second wait hits the lock-free `is_done` fast-path.
+                        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+                        let mut out = 0usize;
+                        let mut used = 0usize;
+                        assert_eq!(
+                            XAsyncGetResult(
+                                &mut block,
+                                identity,
+                                size_of::<usize>(),
+                                (&mut out as *mut usize).cast(),
+                                &mut used,
+                            ),
+                            S_OK
+                        );
+                        assert_eq!((out, used), (expected, size_of::<usize>()));
+                        assert!(call(&mut block).is_none());
+                    }
+                });
+            }
+        });
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn zero_alloc_finished_handles_ok_and_error_hresults() {
+        static CALLBACKS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn on_complete(_: *mut AsyncBlock) {
+            CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let identity = 0x99 as *const c_void;
+
+        // S_OK completion
+        let mut ok_block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(on_complete),
+            internal: [0; 4],
+        };
+        assert_eq!(finished(&mut ok_block, identity, S_OK), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut ok_block, false), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut ok_block, true), S_OK);
+        let mut size = 99usize;
+        assert_eq!(XAsyncGetResultSize(&mut ok_block, &mut size), S_OK);
+        assert_eq!(size, 0);
+        assert!(call(&mut ok_block).is_none());
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(CALLBACKS.load(Ordering::SeqCst), 1);
+
+        // Error HRESULT completion
+        let mut err_block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(on_complete),
+            internal: [0; 4],
+        };
+        assert_eq!(finished(&mut err_block, identity, E_ABORT), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut err_block, false), E_ABORT);
+        assert_eq!(XAsyncGetStatus(&mut err_block, true), E_ABORT);
+        assert!(call(&mut err_block).is_none());
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(CALLBACKS.load(Ordering::SeqCst), 2);
+
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn nonblocking_dispatch_and_blocking_wakeup() {
+        static HITS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn bump(_: *mut c_void, _: bool) {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+
+        // Non-blocking poll on empty port returns immediately.
+        assert!(!XTaskQueueDispatch(q, WORK, 0));
+
+        // Blocking wait wakes up promptly when a callback is submitted.
+        let q_addr = q as usize;
+        let waiter = std::thread::spawn(move || {
+            XTaskQueueDispatch(q_addr as *const Queue, WORK, 5_000)
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 0, std::ptr::null_mut(), Some(bump)),
+            S_OK
+        );
+        assert!(waiter.join().unwrap());
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        assert!(!XTaskQueueDispatch(q, WORK, 0));
+
         XTaskQueueCloseHandle(q);
     }
 }

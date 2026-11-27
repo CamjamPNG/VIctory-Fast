@@ -62,37 +62,57 @@ pub(crate) fn probe_level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
+/// `VICTORY_INPLACE_ALL`: `1` enables full native in-place heap coverage:
+/// private `VirtualAlloc` allocations (`OpenExistingHeapFromAddress1`),
+/// committed sections (`OpenExistingHeapFromFileMapping`), and mapped section
+/// stretches across both 32-bit and 64-bit addresses within `VICTORY_INPLACE_MB`.
+pub(crate) fn all_on() -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALL.get_or_init(|| std::env::var("VICTORY_INPLACE_ALL").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `VICTORY_INPLACE`: 0 (unset) off. 1: a window of title memory outside
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: also contiguous committed
+/// section-backed stretches via `OpenExistingHeapFromFileMapping` (implied by
+/// `VICTORY_INPLACE_ALL=1`).
 ///
-/// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
-/// memory (the page pool) is turned down here: its section is made
-/// reserved, which the host refuses, and what a view shows changes when
-/// the title maps pages.
-///
-/// What it assumes, for 2: nothing reads title memory that a submission
+/// What it assumes, for 2+: nothing reads title memory that a submission
 /// not yet run writes through such a buffer. With every submission waited
 /// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
 /// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
-///
-/// shortcut: while a window is in place the title cannot decommit, free
-/// or protect its pages (the call fails with error 87; the probe shows
-/// it). The title's heaps are allocated once and kept, and nothing of the
-/// kind was seen; [`title_memory_freeing`] is there for the runtime to
-/// call before such a call once it takes them over.
+/// declare. Do not combine 2+ with late wait.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *LEVEL.get_or_init(|| {
+        if all_on() {
+            return 3;
+        }
+        std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
 }
 
-/// The most title memory in place at once, in bytes
-/// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
-/// memory, also those the title never touched.
-fn most() -> u64 {
+/// Whether committed section-backed stretches (`SEC_COMMIT`) may be opened via
+/// `ID3D12Device3::OpenExistingHeapFromFileMapping`. Enabled by
+/// `VICTORY_INPLACE_SECTIONS=1`, `VICTORY_INPLACE_ALL=1`, or `VICTORY_INPLACE>=3`
+/// unless explicitly turned off with `VICTORY_INPLACE_SECTIONS=0`.
+pub(crate) fn sections_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_INPLACE_SECTIONS").as_deref().map(str::trim) {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => level() >= 3 || all_on(),
+    })
+}
+
+/// The most title memory pinned in place at once via address-opened heaps, in
+/// bytes (`VICTORY_INPLACE_MB`, 4096): opening from an address locks pages into
+/// the PC's working set, also those the title never touched. Section heaps
+/// opened via `OpenExistingHeapFromFileMapping` lock 0 MB and do not consume
+/// this budget.
+pub(crate) fn most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
 }
@@ -102,6 +122,11 @@ fn most() -> u64 {
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Bytes currently pinned via address-opened private heaps (`OpenExistingHeapFromAddress1`).
+/// Committed section heaps (`OpenExistingHeapFromFileMapping`) pin 0 MB and do not consume
+/// [`most`].
+static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -115,12 +140,13 @@ pub(crate) struct Placed {
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
 /// as a heap of their own and places one buffer over all of them. `Err`
-/// with nothing if the memory is not private memory committed whole
-/// (nothing was asked of the host), with the host's error if it refused.
+/// with nothing if the memory is not a contiguous committed private sub-range
+/// of one `VirtualAlloc` reservation (nothing was asked of the host), with the
+/// host's error if it refused.
 pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
-    if !private_whole(at as usize, bytes as usize) {
+    if !crate::inplace_sections::private_committed_subrange(at as usize, bytes as usize) {
         return Err(None);
     }
     let heap = open(device, From::Part(at as usize, bytes as usize)).map_err(Some)?;
@@ -137,21 +163,46 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
+    let host = crate::host::host()?;
+    // Committed section-backed run (`OpenExistingHeapFromFileMapping`): 0 MB
+    // locked working set, title views stay free to unmap/guard.
+    if sections_on() {
+        match crate::inplace_sections::place_section_for(&host.device, start, len) {
+            Ok(placed) => {
+                let at = if window { 0 } else { 2 };
+                STATS[at].fetch_add(1, Ordering::Relaxed);
+                STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+                return Some(placed);
+            }
+            Err(crate::inplace_sections::SectionPlaceError::NotCommittedRun) => {}
+            Err(crate::inplace_sections::SectionPlaceError::Remapped) => {
+                STATS[4].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            Err(crate::inplace_sections::SectionPlaceError::Host(e)) => {
+                if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "committed section not opened in place: a copy instead");
+                }
+                return None;
+            }
+        }
+    }
+    // View memory (not a committed section): known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    let aligned_bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - (start & !(K64 as u64 - 1));
+    if PINNED_BYTES.load(Ordering::Relaxed) + crate::port::pinned_bytes() + aligned_bytes > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    let host = crate::host::host()?;
     match place_part(&host.device, start, len) {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            PINNED_BYTES.fetch_add(len, Ordering::Relaxed);
             Some(placed)
         }
         Err(None) => {
@@ -181,6 +232,9 @@ pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    let _ = PINNED_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        Some(cur.saturating_sub(bytes))
+    });
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -190,6 +244,7 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    crate::inplace_sections::bump_generation();
     // Renderer port 1's regions there: no longer what the title shows.
     crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
@@ -208,13 +263,21 @@ fn say() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    let sec = crate::inplace_sections::stats();
     tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); \
+         section heaps: {} opened ({} MB, 0 MB pinned), {} placed ({} MB), {} remap aborts, {} evicted; \
+         turned down: {} view memory or not private committed, {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go",
         s[0],
         s[1] >> 20,
         s[2],
         s[3] >> 20,
+        sec[0],
+        sec[1] >> 20,
+        sec[2],
+        sec[3] >> 20,
+        sec[4],
+        sec[5],
         s[4],
         s[5],
         s[6],
@@ -312,6 +375,7 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    crate::inplace_sections::section_evict(section);
     let mut v = views_mut();
     v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
@@ -323,8 +387,10 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    crate::inplace_sections::section_evict(section);
     let whole = {
         let mut v = views_mut();
+        v.sections.retain(|s| s.0 != section);
         let at = v.whole.iter().position(|w| w.0 == section);
         at.map(|i| v.whole.swap_remove(i).1)
     };
@@ -349,6 +415,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
             v.pages_twice += usize::from(twice);
         }
     }
+    crate::inplace_sections::bump_generation();
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
@@ -366,6 +433,9 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let end = at.saturating_add(len);
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
+    if gone.is_empty() {
+        return;
+    }
     for base in gone {
         let Some((bytes, section, offset)) = v.views.remove(&base) else {
             continue;
@@ -384,6 +454,8 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
+    drop(v);
+    crate::inplace_sections::bump_generation();
 }
 
 /// The 64 KiB pages of `[start, end)` that the title shows at other
@@ -534,6 +606,22 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+/// If `[at, at + len)` is covered by one contiguous run of a `SEC_COMMIT`
+/// section, returns `(section_handle, byte_offset_in_section, section_bytes)`.
+pub(crate) fn committed_run(at: usize, len: usize) -> Option<(usize, u64, u64)> {
+    let v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
+        return None;
+    };
+    let &(_, bytes, committed) = v.sections.iter().find(|s| s.0 == section)?;
+    committed.then_some((section, offset, bytes))
+}
+
+/// Whether `section` was registered as a `SEC_COMMIT` section.
+pub(crate) fn is_committed_section(section: usize) -> bool {
+    views().sections.iter().any(|s| s.0 == section && s.2)
 }
 
 /// The whole stretch of views around `[at, at + len)` that follow one
@@ -761,7 +849,7 @@ impl Rig {
 
     /// A compute shader stores, through a root unordered-access view at
     /// `gpu`, the sum of the buffer's first two words in its third.
-    fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
+    pub(crate) fn shade(&mut self, gpu: u64) -> windows::core::Result<()> {
         const SOURCE: &str = "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n[RootSignature(RS)]\n[numthreads(1, 1, 1)]\nvoid main() { b.Store(8, b.Load(0) + b.Load(4)); }\n";
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; then the

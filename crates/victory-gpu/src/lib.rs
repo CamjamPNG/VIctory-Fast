@@ -42,6 +42,10 @@ pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+pub(crate) mod gpu_bcpack;
+#[cfg(windows)]
+pub(crate) mod gpu_detile;
+#[cfg(windows)]
 mod heap_worker;
 #[cfg(windows)]
 mod host;
@@ -49,6 +53,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod inplace_sections;
 #[cfg(windows)]
 pub mod port;
 #[cfg(windows)]
@@ -68,6 +74,8 @@ mod picked;
 mod pool;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod popwatch;
+#[cfg(windows)]
+pub mod present;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -110,6 +118,20 @@ mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use present::{HdrCapabilities, HostDisplayMode, ScreenshotFrame, last_frame, take_screenshot};
+
+/// Whether native GPU compute BCPack decoding is enabled (`VICTORY_GPU_BCPACK=1`).
+#[cfg(windows)]
+pub fn gpu_bcpack_enabled() -> bool {
+    gpu_bcpack::on()
+}
+
+/// Decodes a single BCPack stream on the host GPU using the built-in tables.
+#[cfg(windows)]
+pub fn gpu_bcpack_decode(bc: u8, src: &[u8], dst: &mut [u8]) -> Result<(), String> {
+    gpu_bcpack::decode_gpu(bc, src, dst)
+}
 
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).

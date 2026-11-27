@@ -50,7 +50,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
@@ -248,39 +248,124 @@ pub(crate) static TRIMMED_BYTES: AtomicU64 = AtomicU64::new(0);
 static TRIMMED_AT: AtomicU64 = AtomicU64::new(0);
 static REPLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
-/// The library calls running now: thread, what (load, make, store,
-/// serialise), the pipeline, and since when (`crate::host::now_us`).
-static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new());
+/// Fixed slots for tracking in-flight library calls without global lock contention
+/// or per-call string formatting (only formatted inside [`removal_note`]).
+const CALL_SLOTS: usize = 128;
+
+enum CallName {
+    Inline([u8; 64], u8),
+    Heap(String),
+}
+
+impl CallName {
+    fn new(name: &str) -> Self {
+        let bytes = name.as_bytes();
+        if bytes.len() <= 64 {
+            let mut buf = [0u8; 64];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            Self::Inline(buf, bytes.len() as u8)
+        } else {
+            Self::Heap(name.to_owned())
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline(buf, len) => std::str::from_utf8(&buf[..usize::from(*len)]).unwrap_or(""),
+            Self::Heap(s) => s,
+        }
+    }
+}
+
+struct ActiveCall {
+    thread: u32,
+    what: &'static str,
+    name: CallName,
+    label: Option<Arc<str>>,
+    since: u64,
+}
+
+struct CallSlot {
+    in_use: AtomicBool,
+    entry: Mutex<Option<ActiveCall>>,
+}
+
+static CALL_SLOTS_TABLE: [CallSlot; CALL_SLOTS] = [const {
+    CallSlot {
+        in_use: AtomicBool::new(false),
+        entry: Mutex::new(None),
+    }
+}; CALL_SLOTS];
+static CALL_OVERFLOW: Mutex<Vec<ActiveCall>> = Mutex::new(Vec::new());
 
 thread_local! {
-    /// The pipeline this thread is making (its shaders), for [`CALLS`].
-    static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// The pipeline this thread is making (its shaders), for [`CALL_SLOTS_TABLE`].
+    static LABEL: std::cell::RefCell<Option<Arc<str>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Names the pipeline this thread makes next.
 pub(crate) fn label(text: String) {
-    LABEL.with(|l| *l.borrow_mut() = text);
+    let arc: Arc<str> = Arc::from(text);
+    LABEL.with(|l| *l.borrow_mut() = Some(arc));
 }
 
-/// A library call of this thread, listed in [`CALLS`] until dropped.
-struct Call(u32, u64);
+/// A library call of this thread, listed in [`CALL_SLOTS_TABLE`] until dropped.
+struct Call {
+    slot: Option<usize>,
+    thread: u32,
+    since: u64,
+}
 
 fn call(what: &'static str, name: &str) -> Call {
     let (thread, since) = (crate::host::thread_id(), crate::host::now_us());
     let label = LABEL.with(|l| l.borrow().clone());
-    CALLS
+    let active = ActiveCall {
+        thread,
+        what,
+        name: CallName::new(name),
+        label,
+        since,
+    };
+    let start = (thread as usize).wrapping_mul(31) & (CALL_SLOTS - 1);
+    for offset in 0..CALL_SLOTS {
+        let idx = (start + offset) & (CALL_SLOTS - 1);
+        let slot = &CALL_SLOTS_TABLE[idx];
+        if slot
+            .in_use
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            *slot.entry.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
+            return Call {
+                slot: Some(idx),
+                thread,
+                since,
+            };
+        }
+    }
+    CALL_OVERFLOW
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((thread, what, format!("{name} {label}"), since));
-    Call(thread, since)
+        .push(active);
+    Call {
+        slot: None,
+        thread,
+        since,
+    }
 }
 
 impl Drop for Call {
     fn drop(&mut self) {
-        CALLS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|c| (c.0, c.3) != (self.0, self.1));
+        if let Some(idx) = self.slot {
+            let slot = &CALL_SLOTS_TABLE[idx];
+            *slot.entry.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            slot.in_use.store(false, Ordering::Release);
+        } else {
+            CALL_OVERFLOW
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|c| (c.thread, c.since) != (self.thread, self.since));
+        }
     }
 }
 
@@ -296,17 +381,36 @@ pub(crate) fn removal_note() -> String {
     let now = crate::host::now_us();
     let mut text = String::from("pipeline library: ");
     {
-        let calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
-        if calls.is_empty() {
-            text.push_str("no call running");
-        }
-        for (i, (thread, what, name, since)) in calls.iter().enumerate() {
+        let mut count = 0usize;
+        let mut write_active = |c: &ActiveCall| {
+            let label = c.label.as_deref().unwrap_or("");
             let _ = write!(
                 text,
-                "{}{what} of {name} running for {:.1} ms on thread {thread}",
-                if i == 0 { "" } else { ", " },
-                now.saturating_sub(*since) as f64 / 1000.0
+                "{}{} of {} {} running for {:.1} ms on thread {}",
+                if count == 0 { "" } else { ", " },
+                c.what,
+                c.name.as_str(),
+                label,
+                now.saturating_sub(c.since) as f64 / 1000.0,
+                c.thread
             );
+            count += 1;
+        };
+        for slot in &CALL_SLOTS_TABLE {
+            if !slot.in_use.load(Ordering::Acquire) {
+                continue;
+            }
+            let entry = slot.entry.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(c) = entry.as_ref() {
+                write_active(c);
+            }
+        }
+        let overflow = CALL_OVERFLOW.lock().unwrap_or_else(|e| e.into_inner());
+        for c in overflow.iter() {
+            write_active(c);
+        }
+        if count == 0 {
+            text.push_str("no call running");
         }
     }
     let (at, len) = (VIEW[0].load(Ordering::Relaxed), VIEW[1].load(Ordering::Relaxed));
@@ -417,12 +521,16 @@ unsafe impl Sync for Library {}
 
 /// Held by a load of the pipeline named `name`: loads of the same name
 /// wait for each other (the host's one exception to the library's thread
-/// safety: such a load may change that pipeline's entry). Names share 64
+/// safety: such a load may change that pipeline's entry). Names share 128
 /// locks, so two different names seldom wait.
 fn same_name(name: &str) -> MutexGuard<'static, ()> {
-    static LOADING: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
-    let at = name.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(usize::from(b)));
-    LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
+    static LOADING: [Mutex<()>; 128] = [const { Mutex::new(()) }; 128];
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in name.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    LOADING[(h as usize) & 127].lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
@@ -512,6 +620,35 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Stack-allocated UTF-16 NUL-terminated pipeline name for ASCII names < 64 bytes
+/// (all 32-char hex pipeline keys), falling back to `HSTRING` otherwise.
+enum WideName {
+    Stack([u16; 64]),
+    Heap(HSTRING),
+}
+
+impl WideName {
+    fn new(name: &str) -> Self {
+        let bytes = name.as_bytes();
+        if bytes.len() < 64 && bytes.is_ascii() {
+            let mut buf = [0u16; 64];
+            for (dst, &b) in buf.iter_mut().zip(bytes) {
+                *dst = u16::from(b);
+            }
+            Self::Stack(buf)
+        } else {
+            Self::Heap(HSTRING::from(name))
+        }
+    }
+
+    fn as_pcwstr(&self) -> PCWSTR {
+        match self {
+            Self::Stack(buf) => PCWSTR(buf.as_ptr()),
+            Self::Heap(s) => PCWSTR(s.as_ptr()),
+        }
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -519,17 +656,17 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
-    let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
+    let wide = WideName::new(name);
     let began = std::time::Instant::now();
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
         let _call = call("load", name);
-        load(&library.library, PCWSTR(wide.as_ptr()))
+        load(&library.library, wide.as_pcwstr())
     };
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
@@ -538,8 +675,11 @@ pub(crate) fn pipeline(
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
             crate::host::trail(|| {
-                let label = LABEL.with(|l| l.borrow().clone());
-                format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
+                LABEL.with(|l| {
+                    let label = l.borrow();
+                    let label = label.as_deref().unwrap_or("");
+                    format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
+                })
             });
             return Ok(pso);
         }
@@ -552,36 +692,68 @@ pub(crate) fn pipeline(
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
-        let label = LABEL.with(|l| l.borrow().clone());
-        format!(
-            "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
-            began.elapsed().as_secs_f64() * 1e3
-        )
+        LABEL.with(|l| {
+            let label = l.borrow();
+            let label = label.as_deref().unwrap_or("");
+            format!(
+                "pipeline library: made {label} in {:.1} ms (the library did not load it: {refused})",
+                began.elapsed().as_secs_f64() * 1e3
+            )
+        })
     });
     let _all = one_call();
     let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
     let _call = call("store", name);
     // SAFETY: a live pipeline; a name already stored (a description that
     // differs) is refused, which leaves the library as it was.
-    if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+    if unsafe { library.library.StorePipeline(wide.as_pcwstr(), &pso) }.is_ok() {
         library.added.fetch_add(1, Ordering::Relaxed);
     }
     Ok(pso)
 }
 
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY_MS` has passed (or `now`).
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    static LAST_SAVE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+    static SAVING_NOW: AtomicBool = AtomicBool::new(false);
+    static SAVE_LOCK: Mutex<()> = Mutex::new(());
+    const SAVE_EVERY_MS: u64 = 20_000;
+    if !now && SAVING_NOW.load(Ordering::Relaxed) {
+        return;
+    }
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+    let _save_guard = if now {
+        let guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        SAVING_NOW.store(true, Ordering::Release);
+        guard
+    } else {
+        let now_ms = crate::host::coarse_ms();
+        let last = LAST_SAVE_MS.load(Ordering::Relaxed);
+        if last != u64::MAX && now_ms.saturating_sub(last) < SAVE_EVERY_MS {
             return;
         }
-        *last = Some(std::time::Instant::now());
+        if library.added.load(Ordering::Relaxed) == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(guard) = SAVE_LOCK.try_lock() else {
+            return;
+        };
+        let last = LAST_SAVE_MS.load(Ordering::Relaxed);
+        if last != u64::MAX && now_ms.saturating_sub(last) < SAVE_EVERY_MS {
+            return;
+        }
+        SAVING_NOW.store(true, Ordering::Release);
+        guard
+    };
+    struct ClearSaving;
+    impl Drop for ClearSaving {
+        fn drop(&mut self) {
+            SAVING_NOW.store(false, Ordering::Release);
+        }
     }
+    let _clear = ClearSaving;
+    LAST_SAVE_MS.store(crate::host::coarse_ms(), Ordering::Relaxed);
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
@@ -615,9 +787,14 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    // Through `used`: a process that asked for none yet (`victory shaders`)
+    // Through `used_set`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used_set()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .cloned()
+        .collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -633,7 +810,12 @@ pub(crate) fn save(now: bool) {
             )
         });
     }
-    let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+    let slow: Vec<String> = slow_map()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(key, ms)| format!("{key} {ms}"))
+        .collect();
     let written = library_written
         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
@@ -703,27 +885,31 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 const SLOW_FILE: &str = "slow-pipelines.txt";
 /// A pipeline that takes this long is one ([`slow`]).
 pub(crate) const SLOW_MS: u64 = 1000;
-static SLOW: Mutex<Option<std::collections::HashMap<String, u64>>> = Mutex::new(None);
+static SLOW: OnceLock<RwLock<std::collections::HashMap<String, u64>>> = OnceLock::new();
 
-fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMap<String, u64>>> {
-    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
-    if slow.is_none() {
-        let listed = DIR.get().and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok()).unwrap_or_default();
-        *slow = Some(
+fn slow_map() -> &'static RwLock<std::collections::HashMap<String, u64>> {
+    SLOW.get_or_init(|| {
+        let listed = DIR
+            .get()
+            .and_then(|d| std::fs::read_to_string(d.join(SLOW_FILE)).ok())
+            .unwrap_or_default();
+        RwLock::new(
             listed
                 .lines()
                 .filter_map(|l| l.split_once(' '))
                 .filter_map(|(key, ms)| Some((key.to_owned(), ms.parse().ok()?)))
                 .collect(),
-        );
-    }
-    slow
+        )
+    })
 }
 
 /// Whether making the title pipeline with `key` took [`SLOW_MS`] in this or
 /// an earlier run.
 pub(crate) fn slow(key: &str) -> bool {
-    slow_ones().as_ref().is_some_and(|s| s.contains_key(key))
+    slow_map()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(key)
 }
 
 /// The title pipeline with `key` took `ms` to make.
@@ -731,8 +917,16 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     if ms < SLOW_MS {
         return;
     }
-    let mut slow = slow_ones();
-    let known = slow.get_or_insert_default().entry(key.to_owned()).or_insert(0);
+    if slow_map()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .is_some_and(|&known| ms <= known)
+    {
+        return;
+    }
+    let mut slow = slow_map().write().unwrap_or_else(|e| e.into_inner());
+    let known = slow.entry(key.to_owned()).or_insert(0);
     if ms > *known {
         *known = ms;
         // With the next save of the early list.
@@ -741,21 +935,19 @@ pub(crate) fn note_time(key: &str, ms: u64) {
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static USED: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
-    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    if used.is_none() {
+fn used_set() -> &'static RwLock<HashSet<String>> {
+    USED.get_or_init(|| {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
-        *used = Some(set);
-    }
-    used
+        RwLock::new(set)
+    })
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
@@ -768,14 +960,22 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     if *ALL.get_or_init(|| std::env::var_os("VICTORY_EARLY_ALL").is_some_and(|v| v == "1")) {
         return true;
     }
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used_set()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(key)
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
-    let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    {
+        let used = used_set().read().unwrap_or_else(|e| e.into_inner());
+        if used.len() >= EARLY_MAX || used.contains(key) {
+            return;
+        }
+    }
+    let mut used = used_set().write().unwrap_or_else(|e| e.into_inner());
+    if used.len() < EARLY_MAX && used.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -930,5 +1130,49 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn wide_name_matches_hstring_for_ascii_long_and_non_ascii() {
+        let cases: [(&str, bool); 6] = [
+            ("", true),
+            ("0123456789abcdef0123456789abcdef", true),
+            (&"a".repeat(63), true),
+            (&"b".repeat(64), false),
+            (&"c".repeat(100), false),
+            ("pîpeline-λ-🔥", false),
+        ];
+        for (input, expect_stack) in cases {
+            let wide = WideName::new(input);
+            assert_eq!(
+                matches!(wide, WideName::Stack(_)),
+                expect_stack,
+                "unexpected storage variant for {input:?}"
+            );
+            let hstr = HSTRING::from(input);
+            let wide_ptr = wide.as_pcwstr();
+            let expected_ptr = PCWSTR(hstr.as_ptr());
+            // SAFETY: both pointers are NUL-terminated UTF-16 strings.
+            let got = unsafe { wide_ptr.as_wide() };
+            let expected = unsafe { expected_ptr.as_wide() };
+            assert_eq!(got, expected, "UTF-16 mismatch for {input:?}");
+        }
+    }
+
+    #[test]
+    fn active_call_tracker_reports_and_clears() {
+        label("[vertex aabbccdd]".to_owned());
+        let guard = call("load", "deadbeef01234567deadbeef01234567");
+        let note = removal_note();
+        assert!(
+            note.contains("load of deadbeef01234567deadbeef01234567 [vertex aabbccdd] running for "),
+            "missing active call in note: {note}"
+        );
+        drop(guard);
+        let note_after = removal_note();
+        assert!(
+            !note_after.contains("deadbeef01234567deadbeef01234567"),
+            "dropped call still present in note: {note_after}"
+        );
     }
 }

@@ -123,15 +123,28 @@ impl Cursor<'_> {
     }
 }
 
+/// Metadata of a frame read into a caller-supplied buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameInfo {
+    pub bits: usize,
+    /// Bit offset in the buffer where it starts, and where the next frame
+    /// starts (`None` when the buffer has no further frame).
+    pub start: usize,
+    pub next: Option<usize>,
+}
+
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
-/// payload) of `data`, a buffer of whole packets of one stream.
-pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+/// payload) of `data`, a buffer of whole packets of one stream, into `out`
+/// (reusing its allocation).
+pub fn read_frame_into(data: &[u8], start: usize, out: &mut Vec<u8>) -> Option<FrameInfo> {
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = Vec::with_capacity(bits.div_ceil(8));
+    let bytes = bits.div_ceil(8);
+    out.clear();
+    out.reserve(bytes);
     let mut cursor = Cursor { data, pos: start };
     for _ in 0..bits / 8 {
         out.push(cursor.byte()?);
@@ -142,11 +155,19 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
+    Some(FrameInfo { bits, start, next })
+}
+
+/// Reads the frame starting at bit `start` (a frame start inside a packet's
+/// payload) of `data`, a buffer of whole packets of one stream.
+pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    let mut out = Vec::new();
+    let info = read_frame_into(data, start, &mut out)?;
     Some(Frame {
         data: out,
-        bits,
-        start,
-        next,
+        bits: info.bits,
+        start: info.start,
+        next: info.next,
     })
 }
 
@@ -235,9 +256,15 @@ impl Bits<'_> {
     }
 }
 
+const VLC_LUT_BITS: u32 = 10;
+const VLC_LUT_SIZE: usize = 1 << VLC_LUT_BITS;
+
 /// A prefix code built like FFmpeg's `ff_vlc_init_from_lengths`: codes are
 /// handed out in table order, each the next free one of its length.
 struct Vlc {
+    /// Direct lookup for codes up to `VLC_LUT_BITS` bits: `(symbol, len)`,
+    /// with `len == 0` falling back to binary search on `codes`.
+    lut: Box<[(i32, u8); VLC_LUT_SIZE]>,
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
 }
@@ -246,15 +273,28 @@ impl Vlc {
     fn new(entries: impl Iterator<Item = (i32, u8)>) -> Vlc {
         let mut code = 0u64;
         let mut codes = Vec::new();
+        let mut lut = Box::new([(0i32, 0u8); VLC_LUT_SIZE]);
         for (symbol, len) in entries {
-            codes.push((code as u32, len, symbol));
+            let c = code as u32;
+            codes.push((c, len, symbol));
+            if len >= 1 && (len as u32) <= VLC_LUT_BITS {
+                let prefix = (c >> (32 - VLC_LUT_BITS)) as usize;
+                let count = 1usize << (VLC_LUT_BITS - len as u32);
+                lut[prefix..prefix + count].fill((symbol, len));
+            }
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        Vlc { lut, codes }
     }
 
+    #[inline]
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
+        let (symbol, len) = self.lut[(v >> (32 - VLC_LUT_BITS)) as usize];
+        if len != 0 {
+            bits.pos += len as usize;
+            return symbol;
+        }
         let i = self.codes.partition_point(|c| c.0 <= v) - 1;
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
@@ -546,38 +586,118 @@ impl Channel {
     }
 }
 
-/// Decodes the frames of one mono or stereo stream.
-#[derive(Clone)]
-pub struct Decoder {
-    channels: usize,
+/// Overlap samples per channel carried between frames (`FRAME_SAMPLES / 2`).
+pub const OVERLAP_SAMPLES: usize = FRAME_SAMPLES / 2;
+
+/// Inter-frame overlap state of a [`Decoder`]: the half-frame overlap tail and
+/// previous subframe length for each channel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlapState {
+    pub channels: usize,
+    pub prev_block_len: [usize; 2],
+    pub samples: [[f32; OVERLAP_SAMPLES]; 2],
+}
+
+impl OverlapState {
+    const MAGIC: [u8; 4] = *b"XMAO";
+    const HEADER_BYTES: usize = 16;
+
+    /// Byte length required to serialize `channels` (1 or 2) of exact overlap state.
+    pub const fn encoded_len(channels: usize) -> usize {
+        Self::HEADER_BYTES + channels * OVERLAP_SAMPLES * 4
+    }
+
+    /// True when every channel's overlap buffer is silent and at the initial block length.
+    pub fn is_zero(&self) -> bool {
+        (0..self.channels.clamp(1, 2)).all(|c| {
+            self.prev_block_len[c] == FRAME_SAMPLES && self.samples[c].iter().all(|&s| s == 0.0)
+        })
+    }
+
+    /// Serializes the overlap state into `dst`, returning the bytes written.
+    pub fn encode_bytes(&self, dst: &mut [u8]) -> Option<usize> {
+        let channels = self.channels.clamp(1, 2);
+        let needed = Self::encoded_len(channels);
+        if dst.len() < needed {
+            return None;
+        }
+        dst[0..4].copy_from_slice(&Self::MAGIC);
+        dst[4] = channels as u8;
+        dst[5] = encode_block_len(self.prev_block_len[0]);
+        dst[6] = encode_block_len(self.prev_block_len[1]);
+        dst[7] = 0;
+        dst[8..16].fill(0);
+        let mut at = Self::HEADER_BYTES;
+        for c in 0..channels {
+            for &s in &self.samples[c] {
+                dst[at..at + 4].copy_from_slice(&s.to_le_bytes());
+                at += 4;
+            }
+        }
+        Some(needed)
+    }
+
+    /// Deserializes an overlap state previously written by [`Self::encode_bytes`].
+    /// Returns `None` on zeroed, truncated or unrecognized data.
+    pub fn decode_bytes(src: &[u8]) -> Option<OverlapState> {
+        if src.len() < Self::HEADER_BYTES || src[0..4] != Self::MAGIC {
+            return None;
+        }
+        let channels = src[4] as usize;
+        if !(1..=2).contains(&channels) || src.len() < Self::encoded_len(channels) {
+            return None;
+        }
+        let prev_block_len = [decode_block_len(src[5])?, decode_block_len(src[6])?];
+        let mut samples = [[0.0f32; OVERLAP_SAMPLES]; 2];
+        let mut at = Self::HEADER_BYTES;
+        for sample_row in samples.iter_mut().take(channels) {
+            for s in sample_row.iter_mut() {
+                let v = f32::from_le_bytes(src[at..at + 4].try_into().ok()?);
+                *s = if v.is_finite() { v } else { 0.0 };
+                at += 4;
+            }
+        }
+        Some(OverlapState {
+            channels,
+            prev_block_len,
+            samples,
+        })
+    }
+}
+
+fn encode_block_len(len: usize) -> u8 {
+    match len {
+        128 => 0,
+        256 => 1,
+        _ => 2,
+    }
+}
+
+fn decode_block_len(code: u8) -> Option<usize> {
+    match code {
+        0 => Some(128),
+        1 => Some(256),
+        2 => Some(512),
+        _ => None,
+    }
+}
+
+fn sanitize_block_len(len: usize) -> usize {
+    match len {
+        128 | 256 | 512 => len,
+        _ => FRAME_SAMPLES,
+    }
+}
+
+/// Cached scale factor band layouts for one of the four XMA sample rates.
+struct BandTables {
     num_sfb: [usize; BLOCK_SIZES],
     sfb_offsets: [[usize; MAX_BANDS + 1]; BLOCK_SIZES],
     sf_offsets: [[[usize; MAX_BANDS]; BLOCK_SIZES]; BLOCK_SIZES],
-    ch: [Channel; 2],
-    // Per subframe.
-    subframe_len: usize,
-    channels_for_cur_subframe: usize,
-    channel_indexes: [usize; 2],
-    num_bands: usize,
-    table_idx: usize,
-    esc_len: u32,
-    transmit_num_vec_coeffs: bool,
-    transform: bool,
-    transform_band: [bool; MAX_BANDS],
-    parsed_all_subframes: bool,
 }
 
-/// What the decoder needs from the stream format: the channel count and
-/// the sample rate, which sets the scale factor band layout.
-impl Decoder {
-    pub fn new(channels: usize, sample_rate: u32) -> Decoder {
-        let channels = channels.clamp(1, 2);
-        let rate = match sample_rate {
-            r if r > 44_100 => 48_000,
-            r if r > 32_000 => 44_100,
-            r if r > 24_000 => 32_000,
-            _ => 24_000,
-        };
+impl BandTables {
+    fn new(rate: usize) -> BandTables {
         let mut sfb_offsets = [[0usize; MAX_BANDS + 1]; BLOCK_SIZES];
         let mut num_sfb = [0usize; BLOCK_SIZES];
         for i in 0..BLOCK_SIZES {
@@ -613,11 +733,62 @@ impl Decoder {
                 }
             }
         }
-        Decoder {
-            channels,
+        BandTables {
             num_sfb,
             sfb_offsets,
             sf_offsets,
+        }
+    }
+}
+
+fn rate_index(sample_rate: u32) -> usize {
+    match sample_rate {
+        r if r > 44_100 => 3,
+        r if r > 32_000 => 2,
+        r if r > 24_000 => 1,
+        _ => 0,
+    }
+}
+
+fn band_tables(sample_rate: u32) -> &'static BandTables {
+    static TABLES: OnceLock<[BandTables; 4]> = OnceLock::new();
+    let tables = TABLES.get_or_init(|| {
+        [
+            BandTables::new(24_000),
+            BandTables::new(32_000),
+            BandTables::new(44_100),
+            BandTables::new(48_000),
+        ]
+    });
+    &tables[rate_index(sample_rate)]
+}
+
+/// Decodes the frames of one mono or stereo stream.
+#[derive(Clone)]
+pub struct Decoder {
+    channels: usize,
+    bands: &'static BandTables,
+    ch: [Channel; 2],
+    // Per subframe.
+    subframe_len: usize,
+    channels_for_cur_subframe: usize,
+    channel_indexes: [usize; 2],
+    num_bands: usize,
+    table_idx: usize,
+    esc_len: u32,
+    transmit_num_vec_coeffs: bool,
+    transform: bool,
+    transform_band: [bool; MAX_BANDS],
+    parsed_all_subframes: bool,
+}
+
+/// What the decoder needs from the stream format: the channel count and
+/// the sample rate, which sets the scale factor band layout.
+impl Decoder {
+    pub fn new(channels: usize, sample_rate: u32) -> Decoder {
+        Decoder {
+            channels: channels.clamp(1, 2),
+            bands: band_tables(sample_rate),
             ch: [Channel::new(), Channel::new()],
             subframe_len: FRAME_SAMPLES,
             channels_for_cur_subframe: 0,
@@ -634,6 +805,48 @@ impl Decoder {
 
     pub fn channels(&self) -> usize {
         self.channels
+    }
+
+    /// Reconfigures the stream format in place, resetting overlap only when
+    /// the channel count or band layout actually changes.
+    pub fn reconfigure(&mut self, channels: usize, sample_rate: u32) {
+        let channels = channels.clamp(1, 2);
+        let bands = band_tables(sample_rate);
+        if self.channels != channels || !std::ptr::eq(self.bands, bands) {
+            self.channels = channels;
+            self.bands = bands;
+            self.reset();
+        }
+    }
+
+    /// Exports the half-frame overlap tail and previous subframe lengths so
+    /// a subsequent context of the same voice can continue seamlessly.
+    pub fn export_overlap(&self) -> OverlapState {
+        let mut samples = [[0.0f32; OVERLAP_SAMPLES]; 2];
+        for c in 0..self.channels {
+            samples[c].copy_from_slice(&self.ch[c].out[..OVERLAP_SAMPLES]);
+        }
+        OverlapState {
+            channels: self.channels,
+            prev_block_len: [self.ch[0].prev_block_len, self.ch[1].prev_block_len],
+            samples,
+        }
+    }
+
+    /// Restores overlap samples and previous subframe lengths from `state`,
+    /// sanitizing non-finite values and invalid block lengths.
+    pub fn import_overlap(&mut self, state: &OverlapState) {
+        self.reset();
+        let copy_channels = self.channels.min(state.channels.clamp(1, 2));
+        for c in 0..copy_channels {
+            self.ch[c].prev_block_len = sanitize_block_len(state.prev_block_len[c]);
+            for (dst, &src) in self.ch[c].out[..OVERLAP_SAMPLES]
+                .iter_mut()
+                .zip(&state.samples[c])
+            {
+                *dst = if src.is_finite() { src } else { 0.0 };
+            }
+        }
     }
 
     /// Forgets the overlap with earlier frames (a new stream or a seek).
@@ -908,7 +1121,7 @@ impl Decoder {
         let codes = codes();
         for i in 0..self.channels_for_cur_subframe {
             let c = self.channel_indexes[i];
-            let sf_offsets = self.sf_offsets[self.table_idx][self.ch[c].table_idx];
+            let sf_offsets = self.bands.sf_offsets[self.table_idx][self.ch[c].table_idx];
             let ch = &mut self.ch[c];
             let target = 1 - ch.scale_factor_idx;
             ch.scale_factors = target;
@@ -992,7 +1205,7 @@ impl Decoder {
             self.parsed_all_subframes = true;
         }
         self.table_idx = log2(FRAME_SAMPLES / subframe_len) as usize;
-        self.num_bands = self.num_sfb[self.table_idx];
+        self.num_bands = self.bands.num_sfb[self.table_idx];
         self.subframe_len = subframe_len;
         self.esc_len = log2(subframe_len - 1) + 1;
 
@@ -1083,7 +1296,7 @@ impl Decoder {
             self.inverse_channel_transform();
             // Output in [-1, 1] for 16-bit streams.
             let scale = 2.0 / subframe_len as f32 / 32768.0;
-            let sfb = self.sfb_offsets[self.table_idx];
+            let sfb = self.bands.sfb_offsets[self.table_idx];
             let mut tmp = [0f32; FRAME_SAMPLES];
             for i in 0..self.channels_for_cur_subframe {
                 let ch = &mut self.ch[self.channel_indexes[i]];
@@ -1134,7 +1347,7 @@ impl Decoder {
         if !self.transform || self.channels_for_cur_subframe != 2 {
             return;
         }
-        let sfb = self.sfb_offsets[self.table_idx];
+        let sfb = self.bands.sfb_offsets[self.table_idx];
         let [a, b] = &mut self.ch;
         for band in 0..self.num_bands {
             let range = sfb[band]..sfb[band + 1].min(self.subframe_len);
@@ -1823,5 +2036,126 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+    }
+
+    #[test]
+    fn vlc_lut_matches_binary_search_on_every_table() {
+        let c = codes();
+        let tables = [
+            &c.scale,
+            &c.scale_rl,
+            &c.coef[0],
+            &c.coef[1],
+            &c.vec4,
+            &c.vec2,
+            &c.vec1,
+        ];
+        let mut noise = Noise(0x1234_5678_9abc_def1);
+        for vlc in tables {
+            // Test every exact codeword in the table.
+            for &(code, len, expected_sym) in &vlc.codes {
+                let bytes = code.to_be_bytes();
+                let mut b = Bits {
+                    data: &bytes,
+                    pos: 0,
+                    end: 32,
+                };
+                let sym = vlc.read(&mut b);
+                assert_eq!((sym, b.pos), (expected_sym, len as usize));
+            }
+            // Test random 32-bit patterns against pure binary search.
+            for _ in 0..512 {
+                let v = noise.next() as u32;
+                let bytes = v.to_be_bytes();
+                let mut b = Bits {
+                    data: &bytes,
+                    pos: 0,
+                    end: 32,
+                };
+                let got_sym = vlc.read(&mut b);
+                let idx = vlc.codes.partition_point(|e| e.0 <= v) - 1;
+                let (_, exp_len, exp_sym) = vlc.codes[idx];
+                assert_eq!((got_sym, b.pos), (exp_sym, exp_len as usize));
+            }
+        }
+    }
+
+    #[test]
+    fn read_frame_into_matches_read_frame_and_reuses_buffer() {
+        let mut noise = Noise(0xfeed_face_cafe_babe);
+        let (data, _) = noise_stream(&mut noise, 3, 0);
+        let mut at = packet(&data, 0).map(|p| HEADER_BITS + p.first_frame_bit as usize);
+        let mut scratch = Vec::with_capacity(1024);
+        let cap_ptr = scratch.as_ptr();
+        let cap_len = scratch.capacity();
+        let mut count = 0;
+        while let Some(bit) = at {
+            let owned = read_frame(&data, bit).unwrap();
+            let info = read_frame_into(&data, bit, &mut scratch).unwrap();
+            assert_eq!((info.bits, info.start, info.next), (owned.bits, owned.start, owned.next));
+            assert_eq!(scratch, owned.data);
+            if scratch.len() <= cap_len {
+                assert_eq!(scratch.as_ptr(), cap_ptr);
+            }
+            count += 1;
+            at = info.next;
+        }
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn overlap_state_round_trips_and_sanitizes_invalid_data() {
+        let mut continuous = Decoder::new(2, 48_000);
+        // Seed non-zero overlap and distinct prev_block_len on both channels.
+        let mut initial = OverlapState {
+            channels: 2,
+            prev_block_len: [128, 256],
+            samples: [[0.0; OVERLAP_SAMPLES]; 2],
+        };
+        for i in 0..OVERLAP_SAMPLES {
+            initial.samples[0][i] = (i as f32 * 0.03).sin() * 0.4;
+            initial.samples[1][i] = (i as f32 * 0.07).cos() * 0.3;
+        }
+        continuous.import_overlap(&initial);
+
+        let exported = continuous.export_overlap();
+        assert_eq!(exported, initial);
+        assert!(!exported.is_zero());
+
+        let mut bytes = vec![0u8; OverlapState::encoded_len(2)];
+        assert_eq!(exported.encode_bytes(&mut bytes), Some(bytes.len()));
+        let decoded_state = OverlapState::decode_bytes(&bytes).expect("valid overlap bytes");
+        assert_eq!(decoded_state, exported);
+
+        // Zeroed buffer decodes as None (fresh voice).
+        let zeroed = vec![0u8; OverlapState::encoded_len(2)];
+        assert!(OverlapState::decode_bytes(&zeroed).is_none());
+
+        // Non-finite floats and bogus prev_block_len sanitize cleanly to safe values.
+        let mut dirty = exported.clone();
+        dirty.prev_block_len = [999, 0];
+        dirty.samples[0][5] = f32::NAN;
+        dirty.samples[1][9] = f32::INFINITY;
+        let mut sanitized = Decoder::new(2, 48_000);
+        sanitized.import_overlap(&dirty);
+        let clean = sanitized.export_overlap();
+        assert_eq!(clean.prev_block_len, [FRAME_SAMPLES, FRAME_SAMPLES]);
+        assert_eq!(clean.samples[0][5], 0.0);
+        assert_eq!(clean.samples[1][9], 0.0);
+        assert!(clean.samples[0].iter().all(|v| v.is_finite()));
+
+        // A second decoder importing overlap produces bit-exact output on the next frame.
+        // Stereo frame with no coefficients: 15 (len) + 2 (tile) + 1 (postproc) + 8 (drc)
+        // + 1 (trim) + 2 (fill/res) + 2 (channel transform) + 25 (bands) + 2 (transmit) = 58 bits.
+        let mut silent_frame = [0u8; 8];
+        put_bits(&mut silent_frame, 0, 15, 64);
+        put_bits(&mut silent_frame, 15, 2, 0b10); // fixed layout, 512-sample subframe
+        let mut resumed = Decoder::new(2, 48_000);
+        resumed.import_overlap(&decoded_state);
+        let (mut pcm_a, mut pcm_b) = (Vec::new(), Vec::new());
+        continuous.decode(&silent_frame, 64, &mut pcm_a).unwrap();
+        resumed.decode(&silent_frame, 64, &mut pcm_b).unwrap();
+        assert_eq!(pcm_a, pcm_b);
+        assert!(pcm_a.iter().any(|&s| s != 0), "imported overlap must contribute to next frame");
     }
 }

@@ -131,12 +131,32 @@ fn opposite(p: u8) -> u8 {
     }
 }
 
+/// The comparison with its operands swapped (`cmp(p, a, b) == cmp(swap_pred(p), b, a)`).
+fn swap_pred(p: u8) -> u8 {
+    match p {
+        // Float predicates: bit 1 is GT, bit 2 is LT; swap them.
+        0..=15 => (p & !6) | ((p & 2) << 1) | ((p & 4) >> 1),
+        pred::EQ => pred::EQ,
+        pred::NE => pred::NE,
+        pred::IUGT => pred::IULT,
+        pred::IULT => pred::IUGT,
+        pred::IUGE => pred::IULE,
+        pred::IULE => pred::IUGE,
+        pred::SGT => pred::SLT,
+        pred::SLT => pred::SGT,
+        pred::SGE => pred::SLE,
+        _ => pred::SGE,
+    }
+}
+
 /// What holds in the block being walked: values that are a known bit there,
-/// and comparisons (by their operands) with a known outcome.
+/// integer values known to equal a constant, and comparisons (by their
+/// operands) with a known outcome.
 #[derive(Default)]
 struct Facts {
     bits: HashMap<V, bool>,
     compares: HashMap<(u8, V, V), bool>,
+    values: HashMap<V, V>,
 }
 
 /// The facts a block added, to forget when its part of the tree is done.
@@ -144,6 +164,7 @@ struct Facts {
 struct Learned {
     bits: Vec<V>,
     compares: Vec<(u8, V, V)>,
+    values: Vec<V>,
 }
 
 fn mask(bits: u32) -> u64 {
@@ -213,9 +234,13 @@ pub(super) fn effect(f: &Func) -> Effect {
     let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
     match f.attr {
         Some(Attr::ReadNone) => Effect::Pure,
-        // A shader cannot write a constant buffer or resize a resource.
+        // A shader cannot write a constant buffer, resize a resource, or change
+        // a thread's lane index or wave size.
         Some(Attr::ReadOnly)
-            if name.starts_with("cbufferLoadLegacy") || name.starts_with("getDimensions") =>
+            if name.starts_with("cbufferLoadLegacy")
+                || name.starts_with("getDimensions")
+                || name == "waveGetLaneIndex"
+                || name == "waveGetLaneCount" =>
         {
             Effect::Pure
         }
@@ -235,7 +260,7 @@ impl Module {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
-            for _ in 0..4 {
+            for _ in 0..8 {
                 let mut changed = self.merge(passes);
                 if passes & FOLD != 0 {
                     changed |= self.prune();
@@ -384,12 +409,38 @@ impl Module {
                 };
                 self.learn(x, holds != (k != 0), facts, learned, depth - 1);
             }
-            // The opposite comparison of the same operands.
+            // The opposite and operand-swapped comparisons of the same operands,
+            // plus integer equality to a constant.
             Op::Cmp(p, a, b) => {
-                let key = (opposite(p), a, b);
-                if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key) {
-                    e.insert(!holds);
-                    learned.compares.push(key);
+                let mut note_cmp = |key: (u8, V, V), val: bool| {
+                    if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key)
+                    {
+                        e.insert(val);
+                        learned.compares.push(key);
+                    }
+                };
+                note_cmp((opposite(p), a, b), !holds);
+                let sp = swap_pred(p);
+                note_cmp((sp, b, a), holds);
+                note_cmp((opposite(sp), b, a), !holds);
+                if p == pred::EQ || p == pred::NE {
+                    let eq_holds = (p == pred::EQ) == holds;
+                    let pair = match (a, b, self.int_k(a), self.int_k(b)) {
+                        (V::Inst(_), _, None, Some((bits, k))) => Some((a, b, bits, k)),
+                        (_, V::Inst(_), Some((bits, k)), None) => Some((b, a, bits, k)),
+                        _ => None,
+                    };
+                    if let Some((var, kv, bits, k)) = pair {
+                        if bits == 1 {
+                            self.learn(var, (k != 0) == eq_holds, facts, learned, depth - 1);
+                        } else if eq_holds
+                            && let std::collections::hash_map::Entry::Vacant(e) =
+                                facts.values.entry(var)
+                        {
+                            e.insert(kv);
+                            learned.values.push(var);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -495,6 +546,127 @@ impl Module {
         self.int_const(ty, signed(bits, x & mask(bits)))
     }
 
+    /// Bits (within `mask(bits)`) provably zero in `v` for every input.
+    fn known_zero_bits(&self, v: V, bits: u32, depth: u32) -> u64 {
+        let all = mask(bits);
+        if let Some((_, k)) = self.int_k(v) {
+            return !k & all;
+        }
+        let V::Inst(i) = v else { return 0 };
+        let Some(depth) = depth.checked_sub(1) else {
+            return 0;
+        };
+        match &self.insts[i as usize].op {
+            Op::Bin(Bin::And, a, b) => {
+                self.known_zero_bits(*a, bits, depth) | self.known_zero_bits(*b, bits, depth)
+            }
+            Op::Bin(Bin::Or | Bin::Xor, a, b) => {
+                self.known_zero_bits(*a, bits, depth) & self.known_zero_bits(*b, bits, depth)
+            }
+            Op::Bin(Bin::Shl, a, b) => match self.int_k(*b) {
+                Some((_, s)) if s < u64::from(bits) => {
+                    let s = s as u32;
+                    ((self.known_zero_bits(*a, bits, depth) << s) | mask(s)) & all
+                }
+                _ => 0,
+            },
+            Op::Bin(Bin::LShr, a, b) => match self.int_k(*b) {
+                Some((_, s)) if s < u64::from(bits) => {
+                    let s = s as u32;
+                    (self.known_zero_bits(*a, bits, depth) >> s) | (all & !mask(bits - s))
+                }
+                _ => 0,
+            },
+            Op::Cast(Cast::ZExt, x) => match self.int_bits(self.type_of(*x)) {
+                Some(fb) if fb < bits => {
+                    self.known_zero_bits(*x, fb, depth) | (all & !mask(fb))
+                }
+                _ => 0,
+            },
+            Op::Select(_, t, f) => {
+                self.known_zero_bits(*t, bits, depth) & self.known_zero_bits(*f, bits, depth)
+            }
+            Op::Call(f, args) => {
+                let name = self.funcs[*f as usize].name.as_str();
+                let Some((_, code)) = args.first().and_then(|&a| self.int_k(a)) else {
+                    return 0;
+                };
+                if name == "dx.op.unaryBits.i32" && code == 31 && bits == 32 {
+                    // Countbits of a 32-bit word is in 0..=32.
+                    all & !0x3F
+                } else if name.starts_with("dx.op.binary.i") && code == 40 && args.len() == 3 {
+                    // UMin(a, b) <= min(a, b): bits above any constant bound are 0.
+                    let both = self.known_zero_bits(args[1], bits, depth)
+                        & self.known_zero_bits(args[2], bits, depth);
+                    let k = self
+                        .int_k(args[1])
+                        .or_else(|| self.int_k(args[2]))
+                        .map(|x| x.1);
+                    match k {
+                        Some(0) => all,
+                        Some(k) => (all & !(u64::MAX >> k.leading_zeros())) | both,
+                        None => both,
+                    }
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// If `v` is an `i1` bitwise negation `x ^ true`, returns `x`.
+    fn bit_not(&self, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        let Op::Bin(Bin::Xor, a, b) = self.insts[i as usize].op else {
+            return None;
+        };
+        match (self.int_k(a), self.int_k(b)) {
+            (None, Some((1, 1))) => Some(a),
+            (Some((1, 1)), None) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Unwraps `v` to type `ty` if it is a `Bitcast` from `ty` or a 32-bit
+    /// constant convertible to `ty` without inserting instructions.
+    fn unwrap_bitcast(&mut self, v: V, ty: Ty) -> Option<V> {
+        if let V::Inst(j) = v {
+            if let Op::Cast(Cast::Bitcast, z) = self.insts[j as usize].op
+                && self.type_of(z) == ty
+            {
+                return Some(z);
+            }
+            return None;
+        }
+        let V::Const(c) = v else { return None };
+        let from = self.type_of(v);
+        let to_float = matches!(self.types[ty.0 as usize], TypeDef::Float);
+        match self.consts[c as usize].1 {
+            Const::Int(bits) if to_float && self.int_bits(from) == Some(32) => {
+                Some(self.f32(bits as u32))
+            }
+            Const::Float(bits) if self.int_bits(ty) == Some(32) => {
+                Some(self.int_const(ty, i64::from(bits as i32)))
+            }
+            _ => None,
+        }
+    }
+
+    /// If `v` is an integer `Op::Bin(op, x, k)` (commuted if commutative),
+    /// returns `(op, x, k, k_on_lhs)`.
+    fn inst_bin_k(&self, v: V) -> Option<(Bin, V, u64, bool)> {
+        let V::Inst(j) = v else { return None };
+        let Op::Bin(op, a, b) = self.insts[j as usize].op else {
+            return None;
+        };
+        match (self.int_k(a), self.int_k(b)) {
+            (None, Some((_, k))) => Some((op, a, k, false)),
+            (Some((_, k)), None) => Some((op, b, k, true)),
+            _ => None,
+        }
+    }
+
     /// The value instruction `i` is known to have without it, if any: a
     /// constant or an earlier value. May instead give `i` simpler operands
     /// (`changed` says so).
@@ -522,6 +694,14 @@ impl Module {
                         Bin::LShr => x >> amount?,
                         Bin::AShr => (signed(bits, x) >> amount?) as u64,
                         Bin::UDiv if y != 0 => x / y,
+                        Bin::SDiv if y != 0 => {
+                            let (sx, sy) = (signed(bits, x), signed(bits, y));
+                            let smin = if bits == 64 { i64::MIN } else { -(1i64 << (bits - 1)) };
+                            if sx == smin && sy == -1 {
+                                return None;
+                            }
+                            sx.wrapping_div(sy) as u64
+                        }
                         Bin::URem if y != 0 => x % y,
                         _ => return None,
                     };
@@ -532,19 +712,393 @@ impl Module {
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
                         _,
                         Some(0),
-                    ) => Some(a),
-                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => Some(b),
-                    (Bin::Mul | Bin::UDiv, _, Some(1)) => Some(a),
-                    (Bin::Mul, Some(1), _) => Some(b),
-                    (Bin::Mul | Bin::And, _, Some(0)) => Some(b),
-                    (Bin::Mul | Bin::And, Some(0), _) => Some(a),
-                    (Bin::And, _, Some(m)) if m == all => Some(a),
-                    (Bin::And, Some(m), _) if m == all => Some(b),
-                    (Bin::Or, _, Some(m)) if m == all => Some(b),
-                    (Bin::Or, Some(m), _) if m == all => Some(a),
-                    (Bin::And | Bin::Or, _, _) if a == b => Some(a),
-                    _ => None,
+                    ) => return Some(a),
+                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => return Some(b),
+                    (Bin::Mul | Bin::UDiv | Bin::SDiv, _, Some(1)) => return Some(a),
+                    (Bin::Mul, Some(1), _) => return Some(b),
+                    (Bin::Mul | Bin::And, _, Some(0)) => return Some(b),
+                    (Bin::Mul | Bin::And, Some(0), _) => return Some(a),
+                    (Bin::And, _, Some(m)) if m == all => return Some(a),
+                    (Bin::And, Some(m), _) if m == all => return Some(b),
+                    (Bin::Or, _, Some(m)) if m == all => return Some(b),
+                    (Bin::Or, Some(m), _) if m == all => return Some(a),
+                    (Bin::And | Bin::Or, _, _) if a == b => return Some(a),
+                    (Bin::Xor | Bin::Sub, _, _) if a == b => return Some(self.k(ty, bits, 0)),
+                    _ => {}
                 }
+                // Non-constant algebraic identities (absorption, complement,
+                // self-cancellation).
+                let inst_bin = |v: V| match v {
+                    V::Inst(j) => match self.insts[j as usize].op {
+                        Op::Bin(iop, x, y) => Some((iop, x, y)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                match op {
+                    Bin::And => {
+                        for (other, cand) in [(a, b), (b, a)] {
+                            if let Some((iop, x, y)) = inst_bin(cand) {
+                                // x & (x | y) -> x; x & (x & y) -> cand; x & ~x -> 0.
+                                if iop == Bin::Or && (x == other || y == other) {
+                                    return Some(other);
+                                }
+                                if iop == Bin::And && (x == other || y == other) {
+                                    return Some(cand);
+                                }
+                                if iop == Bin::Xor
+                                    && ((x == other && self.int_k(y).is_some_and(|k| k.1 == all))
+                                        || (y == other
+                                            && self.int_k(x).is_some_and(|k| k.1 == all)))
+                                {
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                            }
+                        }
+                    }
+                    Bin::Or => {
+                        for (other, cand) in [(a, b), (b, a)] {
+                            if let Some((iop, x, y)) = inst_bin(cand) {
+                                // x | (x & y) -> x; x | (x | y) -> cand; x | ~x -> all.
+                                if iop == Bin::And && (x == other || y == other) {
+                                    return Some(other);
+                                }
+                                if iop == Bin::Or && (x == other || y == other) {
+                                    return Some(cand);
+                                }
+                                if iop == Bin::Xor
+                                    && ((x == other && self.int_k(y).is_some_and(|k| k.1 == all))
+                                        || (y == other
+                                            && self.int_k(x).is_some_and(|k| k.1 == all)))
+                                {
+                                    return Some(self.k(ty, bits, all));
+                                }
+                            }
+                        }
+                    }
+                    Bin::Xor => {
+                        for (other, cand) in [(a, b), (b, a)] {
+                            if let Some((Bin::Xor, x, y)) = inst_bin(cand) {
+                                if x == other {
+                                    return Some(y);
+                                }
+                                if y == other {
+                                    return Some(x);
+                                }
+                            }
+                        }
+                    }
+                    Bin::Add => {
+                        // (x - y) + y -> x
+                        for (other, cand) in [(a, b), (b, a)] {
+                            if let Some((Bin::Sub, x, y)) = inst_bin(cand)
+                                && y == other
+                            {
+                                return Some(x);
+                            }
+                        }
+                    }
+                    Bin::Sub => {
+                        // (x + y) - y -> x; (x + y) - x -> y
+                        if let Some((Bin::Add, x, y)) = inst_bin(a) {
+                            if y == b {
+                                return Some(x);
+                            }
+                            if x == b {
+                                return Some(y);
+                            }
+                        }
+                        // x - (x - y) -> y
+                        if let Some((Bin::Sub, x, y)) = inst_bin(b)
+                            && x == a
+                        {
+                            return Some(y);
+                        }
+                    }
+                    _ => {}
+                }
+                // Reassociation with constant operands and bit-level folding.
+                if let Some((var, k2, k2_lhs)) = match (ka, kb) {
+                    (None, Some(k)) => Some((a, k, false)),
+                    (Some(k), None) => Some((b, k, true)),
+                    _ => None,
+                } {
+                    match op {
+                        Bin::Add => {
+                            if let Some((iop, x, k1, k1_lhs)) = self.inst_bin_k(var) {
+                                match iop {
+                                    Bin::Add => {
+                                        let k = k1.wrapping_add(k2) & all;
+                                        if k == 0 {
+                                            return Some(x);
+                                        }
+                                        let kv = self.k(ty, bits, k);
+                                        self.insts[i as usize].op = Op::Bin(Bin::Add, x, kv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    Bin::Sub if !k1_lhs => {
+                                        // (x - k1) + k2 -> x + (k2 - k1)
+                                        let k = k2.wrapping_sub(k1) & all;
+                                        if k == 0 {
+                                            return Some(x);
+                                        }
+                                        let kv = self.k(ty, bits, k);
+                                        self.insts[i as usize].op = Op::Bin(Bin::Add, x, kv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    Bin::Sub => {
+                                        // (k1 - x) + k2 -> (k1 + k2) - x
+                                        let kv = self.k(ty, bits, k1.wrapping_add(k2));
+                                        self.insts[i as usize].op = Op::Bin(Bin::Sub, kv, x);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Bin::Sub => {
+                            if let Some((iop, x, k1, k1_lhs)) = self.inst_bin_k(var) {
+                                match (k2_lhs, iop, k1_lhs) {
+                                    (false, Bin::Add, _) => {
+                                        // (x + k1) - k2 -> x + (k1 - k2)
+                                        let k = k1.wrapping_sub(k2) & all;
+                                        if k == 0 {
+                                            return Some(x);
+                                        }
+                                        let kv = self.k(ty, bits, k);
+                                        self.insts[i as usize].op = Op::Bin(Bin::Add, x, kv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    (false, Bin::Sub, false) => {
+                                        // (x - k1) - k2 -> x - (k1 + k2)
+                                        let k = k1.wrapping_add(k2) & all;
+                                        if k == 0 {
+                                            return Some(x);
+                                        }
+                                        let kv = self.k(ty, bits, k);
+                                        self.insts[i as usize].op = Op::Bin(Bin::Sub, x, kv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    (false, Bin::Sub, true) => {
+                                        // (k1 - x) - k2 -> (k1 - k2) - x
+                                        let kv = self.k(ty, bits, k1.wrapping_sub(k2));
+                                        self.insts[i as usize].op = Op::Bin(Bin::Sub, kv, x);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    (true, Bin::Add, _) => {
+                                        // k2 - (x + k1) -> (k2 - k1) - x
+                                        let kv = self.k(ty, bits, k2.wrapping_sub(k1));
+                                        self.insts[i as usize].op = Op::Bin(Bin::Sub, kv, x);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    (true, Bin::Sub, false) => {
+                                        // k2 - (x - k1) -> (k2 + k1) - x
+                                        let kv = self.k(ty, bits, k2.wrapping_add(k1));
+                                        self.insts[i as usize].op = Op::Bin(Bin::Sub, kv, x);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    (true, Bin::Sub, true) => {
+                                        // k2 - (k1 - x) -> x + (k2 - k1)
+                                        let k = k2.wrapping_sub(k1) & all;
+                                        if k == 0 {
+                                            return Some(x);
+                                        }
+                                        let kv = self.k(ty, bits, k);
+                                        self.insts[i as usize].op = Op::Bin(Bin::Add, x, kv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Bin::Mul => {
+                            if let Some((Bin::Mul, x, k1, _)) = self.inst_bin_k(var) {
+                                let k = k1.wrapping_mul(k2) & all;
+                                if k == 0 {
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                                if k == 1 {
+                                    return Some(x);
+                                }
+                                let kv = self.k(ty, bits, k);
+                                self.insts[i as usize].op = Op::Bin(Bin::Mul, x, kv);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                        Bin::And => {
+                            let live = all & !self.known_zero_bits(var, bits, 4);
+                            if live & k2 == 0 {
+                                return Some(self.k(ty, bits, 0));
+                            }
+                            if live & !k2 == 0 {
+                                return Some(var);
+                            }
+                            if let Some((Bin::And, x, k1, _)) = self.inst_bin_k(var) {
+                                let k = k1 & k2;
+                                if k == 0 {
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                                if k == k1 {
+                                    return Some(var);
+                                }
+                                let kv = self.k(ty, bits, k);
+                                self.insts[i as usize].op = Op::Bin(Bin::And, x, kv);
+                                *changed = true;
+                                return None;
+                            }
+                            // (x | y) & k -> x & k when y has no bits in k (same for ^).
+                            if let Some((Bin::Or | Bin::Xor, x, y)) = inst_bin(var) {
+                                if (all & !self.known_zero_bits(y, bits, 3)) & k2 == 0 {
+                                    let kv = self.k(ty, bits, k2);
+                                    self.insts[i as usize].op = Op::Bin(Bin::And, x, kv);
+                                    *changed = true;
+                                    return None;
+                                }
+                                if (all & !self.known_zero_bits(x, bits, 3)) & k2 == 0 {
+                                    let kv = self.k(ty, bits, k2);
+                                    self.insts[i as usize].op = Op::Bin(Bin::And, y, kv);
+                                    *changed = true;
+                                    return None;
+                                }
+                            }
+                        }
+                        Bin::Or => {
+                            if let Some((Bin::Or, x, k1, _)) = self.inst_bin_k(var) {
+                                let k = k1 | k2;
+                                if k == all {
+                                    return Some(self.k(ty, bits, all));
+                                }
+                                if k == k1 {
+                                    return Some(var);
+                                }
+                                let kv = self.k(ty, bits, k);
+                                self.insts[i as usize].op = Op::Bin(Bin::Or, x, kv);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                        Bin::Xor => {
+                            if let Some((Bin::Xor, x, k1, _)) = self.inst_bin_k(var) {
+                                let k = k1 ^ k2;
+                                if k == 0 {
+                                    return Some(x);
+                                }
+                                let kv = self.k(ty, bits, k);
+                                self.insts[i as usize].op = Op::Bin(Bin::Xor, x, kv);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                        Bin::Shl | Bin::LShr | Bin::AShr if !k2_lhs && k2 < u64::from(bits) => {
+                            let s2 = k2 as u32;
+                            if let Some((iop, x, k1, false)) = self.inst_bin_k(var)
+                                && k1 < u64::from(bits)
+                            {
+                                let s1 = k1 as u32;
+                                if iop == op {
+                                    let sum = s1 + s2;
+                                    if sum < bits {
+                                        let kv = self.k(ty, bits, u64::from(sum));
+                                        self.insts[i as usize].op = Op::Bin(op, x, kv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    if op == Bin::AShr {
+                                        let max_s = bits - 1;
+                                        if s1 == max_s {
+                                            return Some(var);
+                                        }
+                                        let kv = self.k(ty, bits, u64::from(max_s));
+                                        self.insts[i as usize].op = Op::Bin(Bin::AShr, x, kv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                                // (x << s) >>u s -> x & mask(bits - s);
+                                // (x >>u s) << s -> x & !mask(s);
+                                // (x << s) >>s s -> x when top s+1 bits are already sign bits.
+                                if s1 == s2 && s1 > 0 {
+                                    if iop == Bin::Shl && op == Bin::AShr {
+                                        let live = all & !self.known_zero_bits(x, bits, 4);
+                                        if live >> (bits - 1 - s1) == 0 {
+                                            return Some(x);
+                                        }
+                                        if let Some((Bin::AShr, _, k0, false)) = self.inst_bin_k(x)
+                                            && u64::from(s1) <= k0
+                                            && k0 < u64::from(bits)
+                                        {
+                                            return Some(x);
+                                        }
+                                    }
+                                    let m = match (iop, op) {
+                                        (Bin::Shl, Bin::LShr) => Some(mask(bits - s1)),
+                                        (Bin::LShr, Bin::Shl) => Some(all & !mask(s1)),
+                                        _ => None,
+                                    };
+                                    if let Some(m) = m {
+                                        let live = all & !self.known_zero_bits(x, bits, 4);
+                                        if live & !m == 0 {
+                                            return Some(x);
+                                        }
+                                        let mv = self.k(ty, bits, m);
+                                        self.insts[i as usize].op = Op::Bin(Bin::And, x, mv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                }
+                            }
+                            if op == Bin::LShr {
+                                let live = all & !self.known_zero_bits(var, bits, 4);
+                                if live >> s2 == 0 {
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                                // (x | y) >>u s -> x >>u s when y's live bits all shift out.
+                                if let Some((Bin::Or | Bin::Xor, x, y)) = inst_bin(var) {
+                                    if (all & !self.known_zero_bits(y, bits, 3)) >> s2 == 0 {
+                                        let sv = self.k(ty, bits, u64::from(s2));
+                                        self.insts[i as usize].op = Op::Bin(Bin::LShr, x, sv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                    if (all & !self.known_zero_bits(x, bits, 3)) >> s2 == 0 {
+                                        let sv = self.k(ty, bits, u64::from(s2));
+                                        self.insts[i as usize].op = Op::Bin(Bin::LShr, y, sv);
+                                        *changed = true;
+                                        return None;
+                                    }
+                                }
+                            } else if op == Bin::Shl {
+                                let live = all & !self.known_zero_bits(var, bits, 4);
+                                if (live << s2) & all == 0 {
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                                // `(x & m) << s` -> `x << s` when `m` preserves every surviving bit.
+                                let keep = mask(bits - s2);
+                                if let Some((Bin::And, x, m, _)) = self.inst_bin_k(var)
+                                    && m & keep == keep
+                                {
+                                    let sv = self.k(ty, bits, u64::from(s2));
+                                    self.insts[i as usize].op = Op::Bin(Bin::Shl, x, sv);
+                                    *changed = true;
+                                    return None;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                None
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
                 // Two float constants compare one way (`v_mul_legacy` asks
@@ -572,9 +1126,9 @@ impl Module {
                 if !(pred::EQ..=pred::SLE).contains(&p) {
                     return None;
                 }
-                let holds = |x: u64, y: u64, bits: u32| {
+                let eval_cmp = |pred_p: u8, x: u64, y: u64, bits: u32| {
                     let (sx, sy) = (signed(bits, x), signed(bits, y));
-                    match p {
+                    match pred_p {
                         pred::EQ => x == y,
                         pred::NE => x != y,
                         pred::IUGT => x > y,
@@ -588,29 +1142,150 @@ impl Module {
                     }
                 };
                 if let (Some((bits, x)), Some((_, y))) = (self.int_k(a), self.int_k(b)) {
-                    return Some(self.bool(holds(x, y, bits)));
+                    return Some(self.bool(eval_cmp(p, x, y, bits)));
                 }
                 if a == b {
-                    return Some(self.bool(holds(0, 0, 32)));
+                    return Some(self.bool(eval_cmp(p, 0, 0, 32)));
                 }
-                // A bit widened and tested again is the bit.
-                if p == pred::NE
-                    && self.int_k(b).is_some_and(|k| k.1 == 0)
-                    && let V::Inst(z) = a
-                    && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
-                    && self.type_of(x) == ty
-                {
-                    return Some(x);
+                let op_ty = self.type_of(a);
+                let bits = self.int_bits(op_ty)?;
+                let all = mask(bits);
+                // Normalise constant to the RHS as `(var, k, p_norm)`.
+                let norm = match (self.int_k(a), self.int_k(b)) {
+                    (None, Some((_, k))) => Some((a, k, p)),
+                    (Some((_, k)), None) => Some((b, k, swap_pred(p))),
+                    _ => None,
+                };
+                if let Some((var, k, pn)) = norm {
+                    // i1 compared with a constant.
+                    if bits == 1 && (pn == pred::EQ || pn == pred::NE) {
+                        let same = (pn == pred::EQ) == (k != 0);
+                        if same {
+                            return Some(var);
+                        }
+                        if let Some(inner) = self.bit_not(var) {
+                            return Some(inner);
+                        }
+                        let yes = self.bool(true);
+                        self.insts[i as usize].op = Op::Bin(Bin::Xor, var, yes);
+                        *changed = true;
+                        return None;
+                    }
+                    // A bit widened and tested against 0 or 1.
+                    if (pn == pred::EQ || pn == pred::NE)
+                        && (k == 0 || k == 1)
+                        && let V::Inst(z) = var
+                        && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
+                        && self.type_of(x) == ty
+                    {
+                        let same = (pn == pred::NE && k == 0) || (pn == pred::EQ && k == 1);
+                        if same {
+                            return Some(x);
+                        }
+                        if let Some(inner) = self.bit_not(x) {
+                            return Some(inner);
+                        }
+                        let yes = self.bool(true);
+                        self.insts[i as usize].op = Op::Bin(Bin::Xor, x, yes);
+                        *changed = true;
+                        return None;
+                    }
+                    // Comparing `select(c, k1, k2)` against constant `k`.
+                    if let V::Inst(s) = var
+                        && let Op::Select(sc, st, sf) = self.insts[s as usize].op
+                        && let (Some((_, kt)), Some((_, kf))) = (self.int_k(st), self.int_k(sf))
+                    {
+                        let ht = eval_cmp(pn, kt, k, bits);
+                        let hf = eval_cmp(pn, kf, k, bits);
+                        match (ht, hf) {
+                            (true, true) => return Some(self.bool(true)),
+                            (false, false) => return Some(self.bool(false)),
+                            (true, false) => return Some(sc),
+                            (false, true) => {
+                                if let Some(inner) = self.bit_not(sc) {
+                                    return Some(inner);
+                                }
+                                let yes = self.bool(true);
+                                self.insts[i as usize].op = Op::Bin(Bin::Xor, sc, yes);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                    }
+                    // `(x + k1) == k` -> `x == (k - k1)` (exact for modular EQ/NE).
+                    if (pn == pred::EQ || pn == pred::NE)
+                        && let Some((iop, x, k1, k1_lhs)) = self.inst_bin_k(var)
+                    {
+                        let new_k = match (iop, k1_lhs) {
+                            (Bin::Add, _) => Some(k.wrapping_sub(k1)),
+                            (Bin::Sub, false) => Some(k.wrapping_add(k1)),
+                            (Bin::Sub, true) => Some(k1.wrapping_sub(k)),
+                            (Bin::Xor, _) => Some(k ^ k1),
+                            _ => None,
+                        };
+                        if let Some(nk) = new_k {
+                            let kv = self.k(op_ty, bits, nk);
+                            self.insts[i as usize].op = Op::Cmp(pn, x, kv);
+                            *changed = true;
+                            return None;
+                        }
+                    }
+                    // Known-zero bit contradictions and unsigned/signed bounds.
+                    let live = all & !self.known_zero_bits(var, bits, 4);
+                    let smin = 1u64 << (bits - 1);
+                    let smax = smin - 1;
+                    match pn {
+                        pred::EQ if k & !live != 0 => return Some(self.bool(false)),
+                        pred::NE if k & !live != 0 => return Some(self.bool(true)),
+                        pred::IULT if k == 0 => return Some(self.bool(false)),
+                        pred::IUGE if k == 0 => return Some(self.bool(true)),
+                        pred::IULT if live < k => return Some(self.bool(true)),
+                        pred::IUGE if live < k => return Some(self.bool(false)),
+                        pred::IULE if live <= k => return Some(self.bool(true)),
+                        pred::IUGT if live <= k => return Some(self.bool(false)),
+                        pred::SLT if k == smin => return Some(self.bool(false)),
+                        pred::SGE if k == smin => return Some(self.bool(true)),
+                        pred::SGT if k == smax => return Some(self.bool(false)),
+                        pred::SLE if k == smax => return Some(self.bool(true)),
+                        _ => {}
+                    }
+                }
+                // `(x + y) == x` -> `y == 0`; `(x ^ y) == x` -> `y == 0`.
+                if p == pred::EQ || p == pred::NE {
+                    for (other, cand) in [(a, b), (b, a)] {
+                        if let V::Inst(j) = cand
+                            && let Op::Bin(Bin::Add | Bin::Xor, x, y) = self.insts[j as usize].op
+                        {
+                            let rest = if x == other {
+                                Some(y)
+                            } else if y == other {
+                                Some(x)
+                            } else {
+                                None
+                            };
+                            if let Some(rest) = rest {
+                                let z = self.k(op_ty, bits, 0);
+                                self.insts[i as usize].op = Op::Cmp(p, rest, z);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                    }
                 }
                 None
             }
-            Op::Select(c, mut t, mut f) => {
+            Op::Select(mut c, mut t, mut f) => {
                 if let Some((_, c)) = self.int_k(c) {
                     return Some(if c != 0 { t } else { f });
                 }
+                let mut inner = false;
+                if let Some(c2) = self.bit_not(c) {
+                    c = c2;
+                    std::mem::swap(&mut t, &mut f);
+                    inner = true;
+                }
                 // Under the same condition an inner select is one of its
                 // operands (two guarded writes of one register in a row).
-                let mut inner = false;
                 while let V::Inst(x) = t
                     && let Op::Select(c2, t2, _) = self.insts[x as usize].op
                     && c2 == c
@@ -626,11 +1301,28 @@ impl Module {
                 if t == f {
                     return Some(t);
                 }
-                if self.int_bits(ty) == Some(1)
-                    && self.int_k(t).is_some_and(|k| k.1 == 1)
-                    && self.int_k(f).is_some_and(|k| k.1 == 0)
-                {
-                    return Some(c);
+                if self.int_bits(ty) == Some(1) {
+                    let kt = self.int_k(t).map(|k| k.1);
+                    let kf = self.int_k(f).map(|k| k.1);
+                    if kt == Some(1) && kf == Some(0) {
+                        return Some(c);
+                    }
+                    if kt == Some(0) && kf == Some(1) {
+                        let yes = self.bool(true);
+                        self.insts[i as usize].op = Op::Bin(Bin::Xor, c, yes);
+                        *changed = true;
+                        return None;
+                    }
+                    if kt == Some(1) || t == c {
+                        self.insts[i as usize].op = Op::Bin(Bin::Or, c, f);
+                        *changed = true;
+                        return None;
+                    }
+                    if kf == Some(0) || f == c {
+                        self.insts[i as usize].op = Op::Bin(Bin::And, c, t);
+                        *changed = true;
+                        return None;
+                    }
                 }
                 if inner {
                     self.insts[i as usize].op = Op::Select(c, t, f);
@@ -652,23 +1344,29 @@ impl Module {
                         if from == ty {
                             return Some(x);
                         }
-                        // There and back: the bits are the same.
-                        if let Some((Cast::Bitcast, z)) = through
-                            && self.type_of(z) == ty
+                        // There and back, or chained bitcasts.
+                        if let Some((Cast::Bitcast, z)) = through {
+                            if self.type_of(z) == ty {
+                                return Some(z);
+                            }
+                            self.insts[i as usize].op = Op::Cast(Cast::Bitcast, z);
+                            *changed = true;
+                            return None;
+                        }
+                        if let Some(v) = self.unwrap_bitcast(x, ty) {
+                            return Some(v);
+                        }
+                        // `bitcast(select(c, bitcast(a), bitcast(b)))` -> `select(c, a, b)`.
+                        if let V::Inst(s) = x
+                            && let Op::Select(sc, st, sf) = self.insts[s as usize].op
+                            && let Some(ut) = self.unwrap_bitcast(st, ty)
+                            && let Some(uf) = self.unwrap_bitcast(sf, ty)
                         {
-                            return Some(z);
+                            self.insts[i as usize].op = Op::Select(sc, ut, uf);
+                            *changed = true;
+                            return None;
                         }
-                        let V::Const(c) = x else { return None };
-                        let to_float = matches!(self.types[ty.0 as usize], TypeDef::Float);
-                        match self.consts[c as usize].1 {
-                            Const::Int(bits) if to_float && self.int_bits(from) == Some(32) => {
-                                Some(self.f32(bits as u32))
-                            }
-                            Const::Float(bits) if self.int_bits(ty) == Some(32) => {
-                                Some(self.int_const(ty, i64::from(bits as i32)))
-                            }
-                            _ => None,
-                        }
+                        None
                     }
                     Cast::ZExt | Cast::SExt | Cast::Trunc => {
                         let to = self.int_bits(ty)?;
@@ -680,17 +1378,182 @@ impl Module {
                             };
                             return Some(self.k(ty, to, k));
                         }
-                        // Widened and narrowed again.
+                        match (op, through) {
+                            (Cast::ZExt, Some((Cast::ZExt, z)))
+                            | (Cast::SExt, Some((Cast::SExt, z)))
+                            | (Cast::Trunc, Some((Cast::Trunc, z))) => {
+                                self.insts[i as usize].op = Op::Cast(op, z);
+                                *changed = true;
+                                return None;
+                            }
+                            (Cast::SExt, Some((Cast::ZExt, z)))
+                                if self.int_bits(self.type_of(z)) < self.int_bits(from) =>
+                            {
+                                self.insts[i as usize].op = Op::Cast(Cast::ZExt, z);
+                                *changed = true;
+                                return None;
+                            }
+                            (Cast::Trunc, Some((op2 @ (Cast::ZExt | Cast::SExt), z))) => {
+                                let zbits = self.int_bits(self.type_of(z))?;
+                                if zbits == to {
+                                    return Some(z);
+                                }
+                                let next = if zbits < to { op2 } else { Cast::Trunc };
+                                self.insts[i as usize].op = Op::Cast(next, z);
+                                *changed = true;
+                                return None;
+                            }
+                            _ => {}
+                        }
                         if op == Cast::Trunc
-                            && let Some((Cast::ZExt | Cast::SExt, z)) = through
-                            && self.type_of(z) == ty
+                            && let Some(fb) = self.int_bits(from)
                         {
-                            return Some(z);
+                            let low = mask(to);
+                            if self.known_zero_bits(x, fb, 4) & low == low {
+                                return Some(self.k(ty, to, 0));
+                            }
+                            if let V::Inst(j) = x
+                                && let Op::Bin(Bin::Or | Bin::Xor | Bin::Add, a, b) =
+                                    self.insts[j as usize].op
+                            {
+                                if self.known_zero_bits(b, fb, 3) & low == low {
+                                    self.insts[i as usize].op = Op::Cast(Cast::Trunc, a);
+                                    *changed = true;
+                                    return None;
+                                }
+                                if self.known_zero_bits(a, fb, 3) & low == low {
+                                    self.insts[i as usize].op = Op::Cast(Cast::Trunc, b);
+                                    *changed = true;
+                                    return None;
+                                }
+                            }
                         }
                         None
                     }
                     _ => None,
                 }
+            }
+            Op::Call(f, ref args) => {
+                // Exact integer DXIL intrinsics only; float calls stay untouched.
+                let bits = self.int_bits(ty)?;
+                let all = mask(bits);
+                let name = self.funcs[f as usize].name.as_str();
+                let (_, code) = self.int_k(*args.first()?)?;
+                if name == "dx.op.unary.i32" && code == 30 && args.len() == 2 && bits == 32 {
+                    let a = args[1];
+                    if let Some((_, x)) = self.int_k(a) {
+                        return Some(self.k(ty, 32, u64::from((x as u32).reverse_bits())));
+                    }
+                    if let V::Inst(j) = a
+                        && let Op::Call(f2, ref a2) = self.insts[j as usize].op
+                        && f2 == f
+                        && a2.len() == 2
+                        && self.int_k(a2[0]).is_some_and(|k| k.1 == 30)
+                    {
+                        return Some(a2[1]);
+                    }
+                    return None;
+                }
+                if name == "dx.op.unaryBits.i32" && args.len() == 2 && bits == 32 {
+                    let (_, x) = self.int_k(args[1])?;
+                    let u = x as u32;
+                    let r = match code {
+                        31 => u.count_ones(),
+                        32 => {
+                            if u == 0 {
+                                u32::MAX
+                            } else {
+                                u.trailing_zeros()
+                            }
+                        }
+                        33 => {
+                            if u == 0 {
+                                u32::MAX
+                            } else {
+                                u.leading_zeros()
+                            }
+                        }
+                        34 => {
+                            let s = u as i32;
+                            if s == 0 || s == -1 {
+                                u32::MAX
+                            } else if s > 0 {
+                                u.leading_zeros()
+                            } else {
+                                (!u).leading_zeros()
+                            }
+                        }
+                        _ => return None,
+                    };
+                    return Some(self.k(ty, 32, u64::from(r)));
+                }
+                if name.starts_with("dx.op.binary.i")
+                    && matches!(code, 37..=40)
+                    && args.len() == 3
+                {
+                    let (op_k, a, b) = (args[0], args[1], args[2]);
+                    if a == b {
+                        return Some(a);
+                    }
+                    let combine = |x: u64, y: u64| match code {
+                        37 => signed(bits, x).max(signed(bits, y)) as u64 & all,
+                        38 => signed(bits, x).min(signed(bits, y)) as u64 & all,
+                        39 => x.max(y),
+                        _ => x.min(y),
+                    };
+                    let (ka, kb) = (self.int_k(a).map(|k| k.1), self.int_k(b).map(|k| k.1));
+                    if let (Some(x), Some(y)) = (ka, kb) {
+                        return Some(self.k(ty, bits, combine(x, y)));
+                    }
+                    let (var, k2, kv2) = match (ka, kb) {
+                        (None, Some(k)) => (a, k, b),
+                        (Some(k), None) => (b, k, a),
+                        _ => return None,
+                    };
+                    let smin = 1u64 << (bits - 1);
+                    let smax = smin - 1;
+                    match code {
+                        37 if k2 == smax => return Some(kv2),
+                        37 if k2 == smin => return Some(var),
+                        38 if k2 == smin => return Some(kv2),
+                        38 if k2 == smax => return Some(var),
+                        39 if k2 == all => return Some(kv2),
+                        39 if k2 == 0 => return Some(var),
+                        40 if k2 == 0 => return Some(kv2),
+                        40 if k2 == all => return Some(var),
+                        _ => {}
+                    }
+                    if code == 39 || code == 40 {
+                        let live = all & !self.known_zero_bits(var, bits, 4);
+                        if live <= k2 {
+                            return Some(if code == 40 { var } else { kv2 });
+                        }
+                    }
+                    // Nested min/max with constants: `UMin(UMin(x, k1), k2)`.
+                    if let V::Inst(j) = var
+                        && let Op::Call(f2, ref a2) = self.insts[j as usize].op
+                        && f2 == f
+                        && a2.len() == 3
+                        && self.int_k(a2[0]).is_some_and(|k| k.1 == code)
+                    {
+                        let inner_pair = match (self.int_k(a2[1]), self.int_k(a2[2])) {
+                            (None, Some((_, k1))) => Some((a2[1], k1)),
+                            (Some((_, k1)), None) => Some((a2[2], k1)),
+                            _ => None,
+                        };
+                        if let Some((x, k1)) = inner_pair {
+                            let k = combine(k1, k2);
+                            if k == k1 {
+                                return Some(var);
+                            }
+                            let kv = self.k(ty, bits, k);
+                            self.insts[i as usize].op = Op::Call(f, vec![op_k, x, kv]);
+                            *changed = true;
+                            return None;
+                        }
+                    }
+                }
+                None
             }
             _ => None,
         }
@@ -742,10 +1605,26 @@ impl Module {
                 Key::Bin(*op as u8, a, b)
             }
             Op::Cast(op, v) => Key::Cast(*op as u8, inst.ty, *v),
-            Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
+            Op::Cmp(p, a, b) => {
+                if b < a {
+                    Key::Cmp(swap_pred(*p), *b, *a)
+                } else {
+                    Key::Cmp(*p, *a, *b)
+                }
+            }
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
-            Op::Call(f, args) => Key::Call(*f, args.clone()),
+            Op::Call(f, args) => {
+                let mut key_args = args.clone();
+                if key_args.len() == 3
+                    && self.funcs[*f as usize].name.starts_with("dx.op.binary.i")
+                    && self.int_k(key_args[0]).is_some_and(|k| (37..=40).contains(&k.1))
+                    && key_args[2] < key_args[1]
+                {
+                    key_args.swap(1, 2);
+                }
+                Key::Call(*f, key_args)
+            }
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),
             Op::Load(p) => Key::Load(*p),
             _ => return None,
@@ -801,8 +1680,10 @@ impl Module {
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
         let mut known: HashMap<Key, V> = HashMap::new();
-        // The reads of the block being walked since its last store.
-        let mut read: HashMap<Key, V> = HashMap::new();
+        // The reads of the block being walked since its last store, and each
+        // block's exit reads for single-predecessor children.
+        let mut read: HashMap<Key, (V, Effect)> = HashMap::new();
+        let mut read_out: Vec<HashMap<Key, (V, Effect)>> = vec![HashMap::new(); self.blocks.len()];
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
@@ -823,6 +1704,9 @@ impl Module {
                     for k in learned.compares {
                         facts.compares.remove(&k);
                     }
+                    for v in learned.values {
+                        facts.values.remove(&v);
+                    }
                     continue;
                 }
             };
@@ -837,12 +1721,41 @@ impl Module {
             {
                 self.learn(resolve(&repl, c), b == t, &mut facts, &mut learned, 8);
             }
-            let known_bit = |facts: &Facts, v: V| match facts.bits.get(&v) {
+            let known_val = |facts: &Facts, v: V| match facts.bits.get(&v) {
                 Some(true) => yes,
                 Some(false) => no,
-                None => v,
+                None => facts.values.get(&v).copied().unwrap_or(v),
             };
             read.clear();
+            if passes & LOADS != 0
+                && let [p] = tree.preds[b][..]
+            {
+                let same_lanes = matches!(self.blocks[p].term, Some(Term::Br(_)));
+                for (k, &(v, eff)) in &read_out[p] {
+                    if same_lanes || eff == Effect::Reads {
+                        read.insert(k.clone(), (v, eff));
+                    }
+                }
+            }
+            // Propagate branch facts into phis dominated by the branch.
+            if passes & FACTS != 0 && (!facts.bits.is_empty() || !facts.values.is_empty()) {
+                for n in 0..self.blocks[b].phis.len() {
+                    let p = self.blocks[b].phis[n];
+                    if repl[p as usize].is_some() {
+                        continue;
+                    }
+                    if let Op::Phi(incoming) = &mut self.insts[p as usize].op {
+                        for (v, _) in incoming {
+                            let r = resolve(&repl, *v);
+                            let kv = known_val(&facts, r);
+                            if kv != *v {
+                                *v = kv;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
@@ -878,9 +1791,9 @@ impl Module {
             for i in body {
                 map_operands(&mut self.insts[i as usize].op, |v| {
                     let v = resolve(&repl, v);
-                    let bit = known_bit(&facts, v);
-                    changed |= bit != v;
-                    bit
+                    let kv = known_val(&facts, v);
+                    changed |= kv != v;
+                    kv
                 });
                 if let Op::Cmp(p, x, y) = self.insts[i as usize].op
                     && let Some(&holds) = facts.compares.get(&(p, x, y))
@@ -915,12 +1828,12 @@ impl Module {
                     && matches!(class, Effect::Reads | Effect::Lanes)
                     && let Some(key) = self.key(i)
                 {
-                    if let Some(&first) = read.get(&key) {
+                    if let Some(&(first, _)) = read.get(&key) {
                         repl[i as usize] = Some(first);
                         changed = true;
                         continue;
                     }
-                    read.insert(key, V::Inst(i));
+                    read.insert(key, (V::Inst(i), class));
                 }
                 if class == Effect::Writes {
                     read.clear();
@@ -929,8 +1842,13 @@ impl Module {
             }
             self.blocks[b].body = kept;
             if let Some(Term::CondBr(c, t, f)) = self.blocks[b].term {
-                let c = known_bit(&facts, resolve(&repl, c));
-                self.blocks[b].term = Some(Term::CondBr(c, t, f));
+                let r = resolve(&repl, c);
+                let c2 = known_val(&facts, r);
+                changed |= c2 != r;
+                self.blocks[b].term = Some(Term::CondBr(c2, t, f));
+            }
+            if passes & LOADS != 0 && !tree.children[b].is_empty() && !read.is_empty() {
+                read_out[b] = std::mem::take(&mut read);
             }
             steps.push(Step::Leave(added, learned));
             for &c in tree.children[b].iter().rev() {
@@ -957,46 +1875,84 @@ impl Module {
         true
     }
 
-    /// [`FOLD`]: a branch on a constant goes one way. The side not taken
-    /// loses the branching block's values at its joins, and so do the joins
-    /// of blocks that nothing reaches any more. Returns whether a branch
-    /// changed.
+    /// [`FOLD`]: a branch on a constant goes one way, a branch to one target
+    /// drops its condition, and an inverted branch flips its targets. The side
+    /// not taken loses the branching block's values at its joins, and so do
+    /// the joins of blocks that nothing reaches any more. Returns whether a
+    /// branch changed.
     fn prune(&mut self) -> bool {
         let mut changed = false;
+        let mut pruned_edge = false;
         for b in 0..self.blocks.len() {
             let Some(Term::CondBr(c, t, f)) = self.blocks[b].term else {
                 continue;
             };
-            // Both sides one block: two edges into it, left as they are.
             if t == f {
+                let uniform = self.blocks[t].phis.iter().all(|&p| {
+                    let Op::Phi(incoming) = &self.insts[p as usize].op else {
+                        return true;
+                    };
+                    let mut first = None;
+                    for &(v, from) in incoming {
+                        if from == b {
+                            match first {
+                                None => first = Some(v),
+                                Some(f) if f == v => {}
+                                Some(_) => return false,
+                            }
+                        }
+                    }
+                    true
+                });
+                if uniform {
+                    self.blocks[b].term = Some(Term::Br(t));
+                    changed = true;
+                    for n in 0..self.blocks[t].phis.len() {
+                        let p = self.blocks[t].phis[n];
+                        if let Op::Phi(incoming) = &mut self.insts[p as usize].op {
+                            let mut seen = false;
+                            incoming.retain(|&(_, from)| {
+                                if from == b {
+                                    let keep = !seen;
+                                    seen = true;
+                                    keep
+                                } else {
+                                    true
+                                }
+                            });
+                        }
+                    }
+                }
                 continue;
             }
-            let Some((_, k)) = self.int_k(c) else {
-                continue;
-            };
-            let (taken, not) = if k != 0 { (t, f) } else { (f, t) };
-            self.blocks[b].term = Some(Term::Br(taken));
-            changed = true;
-            for n in 0..self.blocks[not].phis.len() {
-                let p = self.blocks[not].phis[n];
-                if let Op::Phi(incoming) = &mut self.insts[p as usize].op {
-                    incoming.retain(|&(_, from)| from != b);
+            if let Some((_, k)) = self.int_k(c) {
+                let (taken, not) = if k != 0 { (t, f) } else { (f, t) };
+                self.blocks[b].term = Some(Term::Br(taken));
+                changed = true;
+                pruned_edge = true;
+                for n in 0..self.blocks[not].phis.len() {
+                    let p = self.blocks[not].phis[n];
+                    if let Op::Phi(incoming) = &mut self.insts[p as usize].op {
+                        incoming.retain(|&(_, from)| from != b);
+                    }
+                }
+            } else if let Some(c2) = self.bit_not(c) {
+                self.blocks[b].term = Some(Term::CondBr(c2, f, t));
+                changed = true;
+            }
+        }
+        if pruned_edge {
+            let reached = self.reached();
+            let (blocks, insts) = (&self.blocks, &mut self.insts);
+            for (_, blk) in blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
+                for &p in &blk.phis {
+                    if let Op::Phi(incoming) = &mut insts[p as usize].op {
+                        incoming.retain(|&(_, from)| reached[from]);
+                    }
                 }
             }
         }
-        if !changed {
-            return false;
-        }
-        let reached = self.reached();
-        let (blocks, insts) = (&self.blocks, &mut self.insts);
-        for (_, blk) in blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
-            for &p in &blk.phis {
-                if let Op::Phi(incoming) = &mut insts[p as usize].op {
-                    incoming.retain(|&(_, from)| reached[from]);
-                }
-            }
-        }
-        true
+        changed
     }
 
     /// Whether instruction `i` must stay whatever reads it.
@@ -2291,5 +3247,408 @@ mod tests {
         );
         assert_ne!(s[0][1], s_before, "proceed invalidates cached state reads");
         m.write();
+    }
+
+    #[test]
+    fn algebraic_reassociation_and_shift_masking_fold() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (k0, k1, k3, k4, k5, k7, k8, k16, k20, k24, k31, k32) = (
+            m.i32(0),
+            m.i32(1),
+            m.i32(3),
+            m.i32(4),
+            m.i32(5),
+            m.i32(7),
+            m.i32(8),
+            m.i32(16),
+            m.i32(20),
+            m.i32(24),
+            m.i32(31),
+            m.i32(32),
+        );
+        let (kff, kffff, kall) = (m.i32(0xFF), m.i32(0xFFFF), m.i32(u32::MAX));
+        let x = m.call(b, reads, vec![k1, k1]);
+        let y = m.call(b, reads, vec![k3, k3]);
+
+        // Self-cancellation and complement identities.
+        let xxor = m.bin(b, Bin::Xor, x, x);
+        let xsub = m.bin(b, Bin::Sub, x, x);
+        let notx = m.bin(b, Bin::Xor, x, kall);
+        let and_not = m.bin(b, Bin::And, x, notx);
+        let or_not = m.bin(b, Bin::Or, x, notx);
+        let xor_cancel = m.bin(b, Bin::Xor, x, y);
+        let xor_cancel = m.bin(b, Bin::Xor, xor_cancel, x);
+        let or_xy = m.bin(b, Bin::Or, x, y);
+        let absorb = m.bin(b, Bin::And, x, or_xy);
+
+        // Constant reassociation: (x + 5) - 5 -> x, (x + 5) + 7 -> x + 12,
+        // (x - 3) + 7 -> x + 4, (x & 0xFF) & 0xFFFF -> x & 0xFF.
+        let xp5 = m.bin(b, Bin::Add, x, k5);
+        let back_x = m.bin(b, Bin::Sub, xp5, k5);
+        let xp12 = m.bin(b, Bin::Add, xp5, k7);
+        let xm3 = m.bin(b, Bin::Sub, x, k3);
+        let xp4 = m.bin(b, Bin::Add, xm3, k7);
+        let mask_ff = m.bin(b, Bin::And, x, kff);
+        let red_mask = m.bin(b, Bin::And, mask_ff, kffff);
+
+        // Shift reassociation, shift-pair masking, and redundant mask before shl.
+        let sh7 = m.bin(b, Bin::Shl, x, k3);
+        let sh7 = m.bin(b, Bin::Shl, sh7, k4);
+        let lshr_zero = m.bin(b, Bin::LShr, x, k20);
+        let lshr_zero = m.bin(b, Bin::LShr, lshr_zero, k20);
+        let ashr_sign = m.bin(b, Bin::AShr, x, k20);
+        let ashr_sign = m.bin(b, Bin::AShr, ashr_sign, k20);
+        // UB shift >= width must NOT fold.
+        let ub_sh = m.bin(b, Bin::Shl, x, k16);
+        let ub_sh = m.bin(b, Bin::Shl, ub_sh, k32);
+        // (x << 8) >>u 8 -> x & 0x00FF_FFFF; (x >>u 24) & 0xFF -> x >>u 24.
+        let sh_pair = m.bin(b, Bin::Shl, x, k8);
+        let sh_pair = m.bin(b, Bin::LShr, sh_pair, k8);
+        let top_byte = m.bin(b, Bin::LShr, x, k24);
+        let top_byte_m = m.bin(b, Bin::And, top_byte, kff);
+        // Packed half: ((x & 0xFFFF) | ((y & 0xFFFF) << 16)) >>u 16 -> y & 0xFFFF,
+        // and low half & 0xFFFF -> x & 0xFFFF.
+        let lo16 = m.bin(b, Bin::And, x, kffff);
+        let hi16_m = m.bin(b, Bin::And, y, kffff);
+        let hi16 = m.bin(b, Bin::Shl, hi16_m, k16);
+        let packed = m.bin(b, Bin::Or, lo16, hi16);
+        let unp_lo = m.bin(b, Bin::And, packed, kffff);
+        let unp_hi = m.bin(b, Bin::LShr, packed, k16);
+        // Signed top-half bfe: (((x >>s 16) & 0xFFFF) << 16) >>s 16 -> x >>s 16.
+        let ashr16 = m.bin(b, Bin::AShr, x, k16);
+        let ashr16_m = m.bin(b, Bin::And, ashr16, kffff);
+        let ashr16_shl = m.bin(b, Bin::Shl, ashr16_m, k16);
+        let ashr16_back = m.bin(b, Bin::AShr, ashr16_shl, k16);
+
+        // Known-zero unsigned range folding (bfe `width & 31 >= 32` is false).
+        let w5 = m.bin(b, Bin::And, x, k31);
+        let full = m.cmp(b, pred::IUGE, w5, k32);
+        let sel_full = m.select(b, full, kall, w5);
+
+        m.call(b, writes, vec![xxor, xsub]);
+        m.call(b, writes, vec![and_not, or_not]);
+        m.call(b, writes, vec![xor_cancel, absorb]);
+        m.call(b, writes, vec![back_x, red_mask]);
+        m.call(b, writes, vec![xp12, xp4]);
+        m.call(b, writes, vec![sh7, lshr_zero]);
+        m.call(b, writes, vec![ashr_sign, ub_sh]);
+        m.call(b, writes, vec![sh_pair, top_byte_m]);
+        m.call(b, writes, vec![unp_lo, unp_hi]);
+        m.call(b, writes, vec![ashr16_back, sel_full]);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | REUSE | DEAD);
+
+        let st = stores(&m, b);
+        assert_eq!(st[0], [k0, k0], "x ^ x and x - x fold to 0");
+        assert_eq!(st[1], [k0, kall], "x & ~x = 0 and x | ~x = -1");
+        assert_eq!(st[2], [y, x], "x ^ (x ^ y) = y and x & (x | y) = x");
+        assert_eq!(st[3], [x, mask_ff], "(x + 5) - 5 = x and redundant mask dropped");
+        let V::Inst(xp12_i) = st[4][0] else { panic!() };
+        assert!(matches!(m.insts[xp12_i as usize].op, Op::Bin(Bin::Add, a, k) if a == x && m.int_k(k) == Some((32, 12))));
+        let V::Inst(xp4_i) = st[4][1] else { panic!() };
+        assert!(matches!(m.insts[xp4_i as usize].op, Op::Bin(Bin::Add, a, k) if a == x && m.int_k(k) == Some((32, 4))));
+        let V::Inst(sh7_i) = st[5][0] else { panic!() };
+        assert!(matches!(m.insts[sh7_i as usize].op, Op::Bin(Bin::Shl, a, k) if a == x && m.int_k(k) == Some((32, 7))));
+        assert_eq!(st[5][1], k0, "(x >>u 20) >>u 20 folds to 0");
+        let V::Inst(ashr_i) = st[6][0] else { panic!() };
+        assert!(matches!(m.insts[ashr_i as usize].op, Op::Bin(Bin::AShr, a, k) if a == x && m.int_k(k) == Some((32, 31))));
+        assert_eq!(st[6][1], ub_sh, "UB shift by >= width stays intact");
+        let V::Inst(pair_i) = st[7][0] else { panic!() };
+        assert!(matches!(m.insts[pair_i as usize].op, Op::Bin(Bin::And, a, k) if a == x && m.int_k(k) == Some((32, 0x00FF_FFFF))));
+        assert_eq!(st[7][1], top_byte, "(x >>u 24) & 0xFF drops redundant mask");
+        assert_eq!(st[8][0], lo16, "packed low half extracts cleanly");
+        let V::Inst(unp_hi_i) = st[8][1] else { panic!() };
+        assert!(matches!(m.insts[unp_hi_i as usize].op, Op::Bin(Bin::And, a, k) if a == y && m.int_k(k) == Some((32, 0xFFFF))));
+        assert_eq!(st[9][0], ashr16, "signed top-half bfe collapses to x >>s 16");
+        assert_eq!(st[9][1], w5, "(x & 31) >=u 32 folds to false");
+        m.write();
+    }
+
+    #[test]
+    fn cmp_select_bitcast_and_cast_chains_fold() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (i1t, i8t, i16t, i32t, i64t, f32t) =
+            (m.int(1), m.int(8), m.int(16), m.int(32), m.int(64), m.float());
+        let (k0, k1, k2, k3, k5, k10, yes, no) = (
+            m.i32(0),
+            m.i32(1),
+            m.i32(2),
+            m.i32(3),
+            m.i32(5),
+            m.i32(10),
+            m.bool(true),
+            m.bool(false),
+        );
+        let x = m.call(b, reads, vec![k1, k1]);
+        let y = m.call(b, reads, vec![k2, k2]);
+        let c = m.cmp(b, pred::IULT, x, y);
+        let d = m.cmp(b, pred::NE, x, k0);
+
+        // icmp on zext(i1) and select(c, k1, k2).
+        let zc = m.cast(b, Cast::ZExt, c, i32t);
+        let eq1 = m.cmp(b, pred::EQ, zc, k1);
+        let eq0 = m.cmp(b, pred::EQ, zc, k0);
+        let sel01 = m.select(b, c, k1, k0);
+        let sel_ne0 = m.cmp(b, pred::NE, sel01, k0);
+        let sel_eq0 = m.cmp(b, pred::EQ, sel01, k0);
+        let sel_const = m.select(b, c, k5, k5);
+        let sel_const_eq = m.cmp(b, pred::EQ, sel_const, k5);
+        let r1 = m.select(b, eq1, x, y);
+        let r2 = m.select(b, eq0, x, y);
+        let r3 = m.select(b, sel_ne0, x, y);
+        let r4 = m.select(b, sel_eq0, x, y);
+        let r5 = m.select(b, sel_const_eq, x, y);
+
+        // (x + 3) == 10 -> x == 7, but (x + 3) <u 10 MUST NOT fold (wrap-around).
+        let xp3 = m.bin(b, Bin::Add, x, k3);
+        let eq10 = m.cmp(b, pred::EQ, xp3, k10);
+        let lt10 = m.cmp(b, pred::IULT, xp3, k10);
+        let r6 = m.select(b, eq10, x, y);
+        let r7 = m.select(b, lt10, x, y);
+
+        // i1 selects: select(c, true, d) -> c | d, select(c, d, false) -> c & d.
+        let sor = m.select(b, c, yes, d);
+        let sand = m.select(b, c, d, no);
+        let r8 = m.select(b, sor, x, y);
+        let r9 = m.select(b, sand, x, y);
+
+        // Bitcast through select: bitcast(select(c, bitcast(f1), 1.0_bits)) -> select(c, f1, 1.0).
+        let f1 = m.cast(b, Cast::Bitcast, x, f32t);
+        let bf1 = m.cast(b, Cast::Bitcast, f1, i32t);
+        let one_bits = m.i32(1.0f32.to_bits());
+        let sel_i = m.select(b, c, bf1, one_bits);
+        let sel_f = m.cast(b, Cast::Bitcast, sel_i, f32t);
+        let sel_f_back = m.cast(b, Cast::Bitcast, sel_f, i32t);
+
+        // Cast chains: sext(zext(i8 -> i16) -> i32) -> zext(i8 -> i32),
+        // trunc(zext(i1 -> i64) -> i32) -> zext(i1 -> i32).
+        let x8 = m.cast(b, Cast::Trunc, x, i8t);
+        let z16 = m.cast(b, Cast::ZExt, x8, i16t);
+        let sz32 = m.cast(b, Cast::SExt, z16, i32t);
+        let c64 = m.cast(b, Cast::ZExt, c, i64t);
+        let c32 = m.cast(b, Cast::Trunc, c64, i32t);
+        let _ = i1t;
+
+        m.call(b, writes, vec![r1, r2]);
+        m.call(b, writes, vec![r3, r4]);
+        m.call(b, writes, vec![r5, r6]);
+        m.call(b, writes, vec![r7, r8]);
+        m.call(b, writes, vec![r9, sel_f_back]);
+        m.call(b, writes, vec![sz32, c32]);
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | REUSE | DEAD);
+
+        let st = stores(&m, b);
+        assert_eq!(st[0][0], st[1][0], "eq1 and sel_ne0 both reduce to select(c, x, y)");
+        assert_eq!(st[0][1], st[1][1], "eq0 and sel_eq0 both invert to select(c, y, x)");
+        let V::Inst(r2_i) = st[0][1] else { panic!() };
+        assert!(matches!(m.insts[r2_i as usize].op, Op::Select(cc, t, f) if cc == c && t == y && f == x));
+        assert_eq!(st[2][0], x, "select(c, 5, 5) == 5 folds to true");
+        let V::Inst(r6_i) = st[2][1] else { panic!() };
+        let Op::Select(V::Inst(eq7_i), _, _) = m.insts[r6_i as usize].op else { panic!() };
+        assert!(matches!(m.insts[eq7_i as usize].op, Op::Cmp(pred::EQ, a, k) if a == x && m.int_k(k) == Some((32, 7))));
+        let V::Inst(r7_i) = st[3][0] else { panic!() };
+        let Op::Select(V::Inst(lt_i), _, _) = m.insts[r7_i as usize].op else { panic!() };
+        assert!(matches!(m.insts[lt_i as usize].op, Op::Cmp(pred::IULT, a, k) if a == xp3 && k == k10));
+        let V::Inst(r8_i) = st[3][1] else { panic!() };
+        let Op::Select(V::Inst(or_i), _, _) = m.insts[r8_i as usize].op else { panic!() };
+        assert!(matches!(m.insts[or_i as usize].op, Op::Bin(Bin::Or, a, z) if a == c && z == d));
+        let V::Inst(r9_i) = st[4][0] else { panic!() };
+        let Op::Select(V::Inst(and_i), _, _) = m.insts[r9_i as usize].op else { panic!() };
+        assert!(matches!(m.insts[and_i as usize].op, Op::Bin(Bin::And, a, z) if a == c && z == d));
+        let V::Inst(sf_i) = st[4][1] else { panic!() };
+        assert!(matches!(m.insts[sf_i as usize].op, Op::Select(cc, t, f) if cc == c && t == x && f == one_bits));
+        let V::Inst(sz_i) = st[5][0] else { panic!() };
+        assert!(matches!(m.insts[sz_i as usize].op, Op::Cast(Cast::ZExt, z) if z == x8));
+        let V::Inst(c32_i) = st[5][1] else { panic!() };
+        assert!(matches!(m.insts[c32_i as usize].op, Op::Cast(Cast::ZExt, z) if z == c));
+        m.write();
+    }
+
+    #[test]
+    fn pure_integer_dxop_calls_fold_and_cse() {
+        let mut k = kit();
+        let (i32t, f32t) = (k.m.int(32), k.m.float());
+        let u_ty = k.m.func_ty(i32t, vec![i32t, i32t]);
+        let b_ty = k.m.func_ty(i32t, vec![i32t, i32t, i32t]);
+        let fb_ty = k.m.func_ty(f32t, vec![i32t, f32t, f32t]);
+        for ty in [u_ty, b_ty, fb_ty] {
+            k.m.ptr(ty);
+        }
+        let unary_i = k.m.function("dx.op.unary.i32", u_ty, Some(Attr::ReadNone), false);
+        let ubits = k.m.function("dx.op.unaryBits.i32", u_ty, Some(Attr::ReadNone), false);
+        let bin_i = k.m.function("dx.op.binary.i32", b_ty, Some(Attr::ReadNone), false);
+        let bin_f = k.m.function("dx.op.binary.f32", fb_ty, Some(Attr::ReadNone), false);
+        let b = k.b;
+        let (op30, op31, op32, op33, op34, op36, op37, op40) = (
+            k.m.i32(30),
+            k.m.i32(31),
+            k.m.i32(32),
+            k.m.i32(33),
+            k.m.i32(34),
+            k.m.i32(36),
+            k.m.i32(37),
+            k.m.i32(40),
+        );
+        let (k0, k1, k15, k50, k100, k2047) =
+            (k.m.i32(0), k.m.i32(1), k.m.i32(15), k.m.i32(50), k.m.i32(100), k.m.i32(2047));
+        let x = k.m.call(b, k.reads, vec![k1, k1]);
+        let y = k.m.call(b, k.reads, vec![k15, k15]);
+
+        // Constant bit ops + Bfrev(Bfrev(x)) -> x.
+        let rev_k = k.m.i32(0x1234_5678);
+        let rev_const = k.m.call(b, unary_i, vec![op30, rev_k]);
+        let rev1 = k.m.call(b, unary_i, vec![op30, x]);
+        let rev2 = k.m.call(b, unary_i, vec![op30, rev1]);
+        let pop_arg = k.m.i32(0xF0F0_0001);
+        let pop = k.m.call(b, ubits, vec![op31, pop_arg]);
+        let fbl0 = k.m.call(b, ubits, vec![op32, k0]);
+        let fbh_msb = k.m.i32(0x8000_0000);
+        let fbh = k.m.call(b, ubits, vec![op33, fbh_msb]);
+        let fbsh = k.m.call(b, ubits, vec![op34, fbh_msb]);
+
+        // UMin/IMax identities, nested clamp, known-zero clamp elimination, commutative CSE.
+        let masked = k.m.bin(b, Bin::And, x, k15);
+        let clamp_noop = k.m.call(b, bin_i, vec![op40, masked, k2047]);
+        let clamp1 = k.m.call(b, bin_i, vec![op40, x, k100]);
+        let clamp2 = k.m.call(b, bin_i, vec![op40, clamp1, k50]);
+        let umin_xy = k.m.call(b, bin_i, vec![op40, x, y]);
+        let umin_yx = k.m.call(b, bin_i, vec![op40, y, x]);
+        let imax_same = k.m.call(b, bin_i, vec![op37, x, x]);
+
+        // Float FMin on constants must NOT fold.
+        let f0 = k.m.f32(0);
+        let fm0 = k.m.f32(0x8000_0000);
+        let fmin = k.m.call(b, bin_f, vec![op36, f0, fm0]);
+        let fmin_i = k.m.cast(b, Cast::Bitcast, fmin, i32t);
+
+        k.m.call(b, k.writes, vec![rev_const, rev2]);
+        k.m.call(b, k.writes, vec![pop, fbl0]);
+        k.m.call(b, k.writes, vec![fbh, fbsh]);
+        k.m.call(b, k.writes, vec![clamp_noop, clamp2]);
+        k.m.call(b, k.writes, vec![umin_xy, umin_yx]);
+        k.m.call(b, k.writes, vec![imax_same, fmin_i]);
+        k.m.terminate(b, Term::Ret);
+        k.m.optimise(FOLD | REUSE | DEAD);
+
+        let st = stores(&k.m, b);
+        let rev_want = k.m.i32(0x1234_5678u32.reverse_bits());
+        assert_eq!(st[0], [rev_want, x]);
+        let (k9, km1) = (k.m.i32(9), k.m.i32(u32::MAX));
+        assert_eq!(st[1], [k9, km1]);
+        assert_eq!(st[2], [k0, k1], "FirstbitHi(0x80000000)=0, FirstbitSHi(0x80000000)=1");
+        assert_eq!(st[3][0], masked, "UMin(x & 15, 2047) drops clamp");
+        let V::Inst(c2_i) = st[3][1] else { panic!() };
+        assert!(matches!(&k.m.insts[c2_i as usize].op, Op::Call(_, a) if a[1] == x && a[2] == k50));
+        assert_eq!(st[4][0], st[4][1], "UMin(x, y) and UMin(y, x) CSE");
+        assert_eq!(st[5][0], x, "IMax(x, x) -> x");
+        assert_eq!(st[5][1], fmin_i, "float FMin is left alone");
+        k.m.write();
+    }
+
+    #[test]
+    fn facts_propagate_integer_equality_and_cfg_cleanup() {
+        let mut k = kit();
+        let (i32t, f32t) = (k.m.int(32), k.m.float());
+        let (k1, k3, k7, k10, yes) = (k.m.i32(1), k.m.i32(3), k.m.i32(7), k.m.i32(10), k.m.bool(true));
+        let x = k.m.call(k.b, k.reads, vec![k1, k1]);
+        let eq7 = k.m.cmp(k.b, pred::EQ, x, k7);
+        let not_eq7 = k.m.bin(k.b, Bin::Xor, eq7, yes);
+        let (then, other, join) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+        // Branch on !eq7 -> flips to CondBr(eq7, then, other), and learns x == 7 in then.
+        k.m.terminate(k.b, Term::CondBr(not_eq7, other, then));
+        let sum = k.m.bin(then, Bin::Add, x, k3);
+        k.m.call(then, k.writes, vec![sum, x]);
+        // Identical targets CondBr(c, join, join) collapses to Br(join) and deduplicates phi.
+        let dummy = k.m.cmp(then, pred::IUGT, x, k3);
+        k.m.terminate(then, Term::CondBr(dummy, join, join));
+        k.m.call(other, k.writes, vec![x, x]);
+        k.m.terminate(other, Term::Br(join));
+        let p = k.m.phi(join, i32t);
+        k.m.set_phi(p, vec![(sum, then), (sum, then), (x, other)]);
+        k.m.call(join, k.writes, vec![p, x]);
+        k.m.terminate(join, Term::Ret);
+        k.m.optimise(ALL);
+
+        assert!(matches!(k.m.blocks[k.b].term, Some(Term::CondBr(c, t, f)) if c == eq7 && t == then && f == other));
+        assert_eq!(stores(&k.m, then), [[k10, k7]], "x == 7 propagated in then");
+        assert!(matches!(k.m.blocks[then].term, Some(Term::Br(t)) if t == join));
+        assert_eq!(stores(&k.m, other), [[x, x]], "x unchanged in other");
+        let Op::Phi(inc) = &k.m.insts[k.m.blocks[join].phis[0] as usize].op else { panic!() };
+        assert_eq!(inc, &vec![(k10, then), (x, other)]);
+
+        // Float OEQ(f, +0.0) must NOT substitute f with +0.0 (-0.0 has different sign bit).
+        let mut k = kit();
+        let f = k.m.call(k.b, k.reads, vec![k1, k1]);
+        let ff = k.m.cast(k.b, Cast::Bitcast, f, f32t);
+        let fp0 = k.m.f32(0);
+        let feq = k.m.cmp(k.b, pred::OEQ, ff, fp0);
+        let (t, o) = (k.m.new_block(), k.m.new_block());
+        k.m.terminate(k.b, Term::CondBr(feq, t, o));
+        let fb = k.m.cast(t, Cast::Bitcast, ff, i32t);
+        k.m.call(t, k.writes, vec![fb, fb]);
+        k.m.terminate(t, Term::Ret);
+        k.m.terminate(o, Term::Ret);
+        k.m.optimise(ALL);
+        assert_eq!(stores(&k.m, t), [[f, f]], "float equality does not replace bits");
+        k.m.write();
+    }
+
+    #[test]
+    fn wave_lane_index_is_pure_and_single_pred_loads_propagate() {
+        let mut k = kit();
+        let (i1t, i32t) = (k.m.int(1), k.m.int(32));
+        let lane_ty = k.m.func_ty(i32t, vec![i32t]);
+        let helper_ty = k.m.func_ty(i1t, vec![i32t]);
+        let wfirst_ty = k.m.func_ty(i32t, vec![i32t, i32t]);
+        for ty in [lane_ty, helper_ty, wfirst_ty] {
+            k.m.ptr(ty);
+        }
+        let lane_fn = k.m.function("dx.op.waveGetLaneIndex", lane_ty, Some(Attr::ReadOnly), false);
+        let helper_fn = k.m.function("dx.op.isHelperLane.i1", helper_ty, Some(Attr::ReadOnly), false);
+        let wfirst_fn = k.m.function("dx.op.waveReadLaneFirst.i32", wfirst_ty, Some(Attr::NoUnwind), false);
+        let (op111, op118, op221, k1, k2) = (k.m.i32(111), k.m.i32(118), k.m.i32(221), k.m.i32(1), k.m.i32(2));
+
+        let l1 = k.m.call(k.b, lane_fn, vec![op111]);
+        let h1 = k.m.call(k.b, helper_fn, vec![op221]);
+        let h1i = k.m.cast(k.b, Cast::ZExt, h1, i32t);
+        k.m.call(k.b, k.writes, vec![l1, h1i]);
+        // After the store: waveGetLaneIndex is Pure (reused), isHelperLane is Reads (not reused).
+        let l2 = k.m.call(k.b, lane_fn, vec![op111]);
+        let h2 = k.m.call(k.b, helper_fn, vec![op221]);
+        let h2i = k.m.cast(k.b, Cast::ZExt, h2, i32t);
+        let r1 = k.m.call(k.b, k.reads, vec![k1, k2]);
+        let w1 = k.m.call(k.b, wfirst_fn, vec![op118, r1]);
+        let cond = k.m.cmp(k.b, pred::NE, r1, k1);
+        let (then, other) = (k.m.new_block(), k.m.new_block());
+        k.m.terminate(k.b, Term::CondBr(cond, then, other));
+        // Across CondBr into single-pred `then`: Reads propagates, Lanes does NOT.
+        let r2 = k.m.call(then, k.reads, vec![k1, k2]);
+        let w2 = k.m.call(then, wfirst_fn, vec![op118, r2]);
+        k.m.call(then, k.writes, vec![l2, h2i]);
+        k.m.call(then, k.writes, vec![r2, w2]);
+        k.m.terminate(then, Term::Ret);
+        k.m.call(other, k.writes, vec![w1, l2]);
+        k.m.terminate(other, Term::Ret);
+        k.m.optimise(REUSE | LOADS | DEAD);
+
+        let st = stores(&k.m, then);
+        assert_eq!(st[0][0], l1, "waveGetLaneIndex reused across store and branch");
+        assert_ne!(st[0][1], h1i, "isHelperLane NOT reused across store/discard");
+        assert_eq!(st[1][0], r1, "bufferLoad reused across single-pred CondBr without store");
+        assert_ne!(st[1][1], w1, "waveReadLaneFirst NOT reused across CondBr");
+        k.m.write();
     }
 }

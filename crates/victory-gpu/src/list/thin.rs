@@ -513,7 +513,10 @@ plain! {
     COPY_RESOURCE_X copy_resource_x = super::copy_resource_x, (dst: This, src: This, flags: u32);
     COPY_MEMORY copy_memory = super::copy_memory, (dst: u64, src: u64, len: u64, flags: u32);
     RESOLVE resolve = super::resolve, (dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32);
+    BEGIN_QUERY begin_query = super::begin_query, (heap: This, kind: u32, index: u32);
+    END_QUERY end_query = super::end_query, (heap: This, kind: u32, index: u32);
     RESOLVE_QUERIES resolve_queries = super::resolve_queries, (heap: This, kind: u32, first: u32, count: u32, buffer: This, offset: u64);
+    SET_PREDICATION set_predication = super::set_predication, (buffer: This, offset: u64, operation: u32);
     EXECUTE_INDIRECT execute_indirect = super::execute_indirect, (signature: This, max: u32, arguments: This, offset: u64, count: This, count_offset: u64);
     WRITE32 write32 = super::write32, (address: u64, value: u32, flush: u32, flags: u32);
     WRITE64 write64 = super::write64, (address: u64, value: u64, flush: u32, flags: u32);
@@ -875,7 +878,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 53] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -892,7 +895,10 @@ const MINE: [(usize, *const ()); 50] = [
     (24, stencil_ref as *const ()),
     (25, set_pipeline as *const ()),
     (26, barrier as *const ()),
+    (28, begin_query as *const ()),
+    (29, end_query as *const ()),
     (30, resolve_queries as *const ()),
+    (31, set_predication as *const ()),
     (32, heaps as *const ()),
     (35, compute_table as *const ()),
     (36, graphics_table as *const ()),
@@ -936,7 +942,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 33, 34, 73, 99, 124];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");

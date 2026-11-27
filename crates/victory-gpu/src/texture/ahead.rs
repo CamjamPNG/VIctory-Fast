@@ -122,7 +122,9 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         return turned_down();
     }
     super::PICKING.set(Some(there));
+    super::COPY_QUEUE_ONLY.set(true);
     let staging = super::staging(resource, &copy, first);
+    super::COPY_QUEUE_ONLY.set(false);
     super::PICKING.set(None);
     let Some(staging) = staging.filter(|s| {
         !s.on_demand && s.first == s.level0 && !s.uploaded.load(Relaxed) && s.once.load(Relaxed)
@@ -313,6 +315,7 @@ fn finish(jobs: Vec<Arc<Job>>) {
     for job in &jobs {
         job.staging.uploaded.store(true, Relaxed);
         job.staging.dirty.store(false, Relaxed);
+        job.staging.dirty_subs.store(0, Relaxed);
         job.staging.note_held();
         job.copy.ahead.store(DONE, Relaxed);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);

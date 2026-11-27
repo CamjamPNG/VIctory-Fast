@@ -31,6 +31,26 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+fn default_interval() -> Duration {
+    #[cfg(windows)]
+    {
+        static USE_HOST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *USE_HOST.get_or_init(|| crate::switch::on("VICTORY_HOST_DISPLAY_MODES")) {
+            return crate::present::primary_refresh_interval().unwrap_or(SIXTIETH);
+        }
+    }
+    SIXTIETH
+}
+
+#[cfg(test)]
+fn interval_for(length: u32, use_host: bool, host_interval: Option<Duration>) -> Duration {
+    match length {
+        0 if use_host => host_interval.unwrap_or(SIXTIETH),
+        0 => SIXTIETH,
+        us => Duration::from_micros(u64::from(us)),
+    }
+}
+
 /// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
 /// title's (zero: no wait). Read once.
 fn asked() -> Option<Duration> {
@@ -88,7 +108,7 @@ pub(crate) extern "system" fn set_interval(
     _flags: u32,
 ) -> HRESULT {
     let asked_by_title = match length {
-        0 => SIXTIETH,
+        0 => default_interval(),
         us => Duration::from_micros(u64::from(us)),
     };
     let interval = asked().unwrap_or(asked_by_title);
@@ -144,7 +164,7 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: asked().unwrap_or(SIXTIETH),
+        interval: asked().unwrap_or_else(default_interval),
         first: 0,
     });
     if c.interval.is_zero() {
@@ -339,6 +359,15 @@ mod tests {
         assert_eq!(parse_ms("1001"), None);
         assert_eq!(parse_ms("NaN"), None);
         assert_eq!(parse_ms("fast"), None);
+    }
+
+    #[test]
+    fn zero_interval_uses_host_refresh_only_when_enabled() {
+        let hz144 = Duration::from_nanos(6_944_444);
+        assert_eq!(interval_for(0, false, Some(hz144)), SIXTIETH);
+        assert_eq!(interval_for(0, true, Some(hz144)), hz144);
+        assert_eq!(interval_for(0, true, None), SIXTIETH);
+        assert_eq!(interval_for(33_333, true, Some(hz144)), Duration::from_micros(33_333));
     }
 
     #[test]

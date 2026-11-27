@@ -599,6 +599,116 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    fn mip_span_in_slice(&self, m: &Mip, slice_base: u64) -> (u64, u64) {
+        if m.tail.is_some() {
+            (slice_base, slice_base + self.alignment.min(self.slice_size))
+        } else {
+            let mip_bytes = u64::from(m.pitch)
+                * u64::from(m.rows)
+                * u64::from(self.block[2])
+                * u64::from(self.desc.element_bytes)
+                * u64::from(self.desc.samples);
+            (slice_base + m.offset, slice_base + m.offset + mip_bytes)
+        }
+    }
+
+    /// Half-open byte range `[start, end)` inside tiled memory when `(mip, slice)`
+    /// lies in a single contiguous byte span (all 1D, 2D, 2D-array, cubemap, and
+    /// single-slice/single-slab 3D subresources). Returns `None` for invalid
+    /// coordinates or 3D subresources spanning multiple slices/slabs.
+    pub fn subresource_byte_span(&self, mip: u32, slice: u32) -> Option<(u64, u64)> {
+        let m = self.mips.get(mip as usize)?;
+        if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 || m.depth.div_ceil(self.block[2]) > 1 {
+                return None;
+            }
+            Some(self.mip_span_in_slice(m, 0))
+        } else {
+            if slice >= self.slices {
+                return None;
+            }
+            Some(self.mip_span_in_slice(m, u64::from(slice) * self.slice_size))
+        }
+    }
+
+    /// Returns `true` iff any byte of subresource `(mip, slice)` overlaps the
+    /// half-open range `[dirty_start, dirty_end)`, including multi-slice/multi-slab
+    /// 3D subresources.
+    pub fn subresource_overlaps(
+        &self,
+        mip: u32,
+        slice: u32,
+        dirty_start: u64,
+        dirty_end: u64,
+    ) -> bool {
+        if dirty_start >= dirty_end {
+            return false;
+        }
+        let Some(m) = self.mips.get(mip as usize) else {
+            return false;
+        };
+        let (rel_start, rel_end) = self.mip_span_in_slice(m, 0);
+        if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return false;
+            }
+            let slab_count = u64::from(m.depth.div_ceil(self.block[2]));
+            let first_slab = if dirty_start < rel_end {
+                0
+            } else {
+                (dirty_start - rel_end) / self.slice_size + 1
+            };
+            first_slab < slab_count && first_slab * self.slice_size + rel_start < dirty_end
+        } else {
+            if slice >= self.slices {
+                return false;
+            }
+            let base = u64::from(slice) * self.slice_size;
+            base + rel_start < dirty_end && dirty_start < base + rel_end
+        }
+    }
+
+    /// Packed per-axis coordinate-bit-to-address-bit shift tables for addressable
+    /// tiled layouts (not linear, not XOR, `samples == 1`).
+    ///
+    /// Returns `Some(([x_shifts, y_shifts, z_shifts], [x_nbits, y_nbits, z_nbits]))`
+    /// where nibble `i` of `shifts[axis]` holds the destination address bit position
+    /// (`0..16`) of coordinate bit `i`, matching `pattern(kind, element_log2, block_log2)`.
+    pub fn swizzle_shifts(&self) -> Option<([u32; 3], [u32; 3])> {
+        if self.pattern[0].is_empty() {
+            return None;
+        }
+        let kind = if self.thick {
+            2
+        } else {
+            usize::from(self.desc.swizzle.display())
+        };
+        let element_log2 = self.desc.element_bytes.trailing_zeros();
+        let block_log2 = self.alignment.trailing_zeros();
+        let micro = MICRO[kind][element_log2 as usize];
+        let mut shifts = [0u32; 3];
+        let mut nbits = [0u32; 3];
+        for bit in 0..8u32 {
+            let (axis, index) = (micro[2 * bit as usize], micro[2 * bit as usize + 1]);
+            let axis = match axis {
+                b'x' => 0,
+                b'y' => 1,
+                b'z' => 2,
+                _ => continue,
+            };
+            let index = u32::from(index - b'0');
+            shifts[axis] |= (bit & 0xf) << (index * 4);
+            nbits[axis] = nbits[axis].max(index + 1);
+        }
+        let order: &[usize] = if kind == 2 { &[1, 0, 2] } else { &[1, 0] };
+        for (bit, &axis) in (8..block_log2).zip(order.iter().cycle()) {
+            let index = nbits[axis];
+            shifts[axis] |= (bit & 0xf) << (index * 4);
+            nbits[axis] = index + 1;
+        }
+        Some((shifts, nbits))
+    }
+
     /// The bytes from the texture's start that mip `first` and the smaller
     /// ones take: the smaller a mip, the nearer the start it lies, so a
     /// title that streams textures has memory for the smaller mips only and
@@ -710,52 +820,154 @@ impl Layout {
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
-        let mut runs = Vec::new();
+        let mut stack_runs = [(0u32, 0u32, 0u32); 512];
+        let mut heap_runs = Vec::new();
+        let mut run_count = 0usize;
         if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
+            let mut push_run = |tiled: u32, lin: u32, len: u32| {
+                if !heap_runs.is_empty() {
+                    heap_runs.push((tiled, lin, len));
+                } else if run_count < stack_runs.len() {
+                    stack_runs[run_count] = (tiled, lin, len);
+                    run_count += 1;
+                } else {
+                    heap_runs.reserve(m.width as usize);
+                    heap_runs.extend_from_slice(&stack_runs);
+                    heap_runs.push((tiled, lin, len));
+                }
+            };
+            let mut first_linear = 0u32;
+            let mut first_tiled = self.column(m, 0) as u32;
             for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
+                let offset = self.column(m, x) as u32;
+                let at = x * n as u32;
                 if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
+                    push_run(first_tiled, first_linear, at - first_linear);
                     first_tiled = offset;
                     first_linear = at;
                 }
             }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
+            push_run(first_tiled, first_linear, bytes as u32 - first_linear);
         }
-        // A mip can end partway through the last run. Check the other runs
-        // once so each row can copy them as fixed-size chunks.
-        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
-        let chunk_size = body.first().map(|run| run.2).filter(|&size| {
-            body.iter()
-                .all(|&(offset, _, len)| len == size && offset.is_multiple_of(size))
-        });
+        let runs: &[(u32, u32, u32)] = if heap_runs.is_empty() {
+            &stack_runs[..run_count]
+        } else {
+            &heap_runs
+        };
+        // A mip can end partway through the last run. Split it off only if its
+        // length differs so full-width textures keep every run in the fast path.
+        let (body, last) = match runs.split_last() {
+            Some((tail, head)) if !head.is_empty() && tail.2 != head[0].2 => {
+                (head, std::slice::from_ref(tail))
+            }
+            _ => (runs, &[][..]),
+        };
+        let chunk_size = body
+            .first()
+            .map(|run| run.2 as usize)
+            .filter(|&size| body.iter().all(|&(_, _, len)| len as usize == size));
+        let max_body_offset = body.iter().map(|&(off, _, _)| off as usize).max().unwrap_or(0);
+        // Thin S (all bpp) and Thin D (2B/4B) place 4 consecutive rows of each
+        // 16-byte column run contiguously in one 64-byte cache line (+0/+16/+32/+48).
+        let quad_row_16 = !linear
+            && !self.thick
+            && chunk_size == Some(16)
+            && self.block[1] >= 4
+            && self.pattern[1].len() >= 4
+            && self.pattern[1][1] == 16
+            && self.pattern[1][2] == 32
+            && self.pattern[1][3] == 48;
+        // Thin D 16-byte places 2 consecutive rows of each 32-byte column run
+        // contiguously in one 64-byte cache line (+0/+32).
+        let pair_row_32 = !linear
+            && !self.thick
+            && chunk_size == Some(32)
+            && self.block[1] >= 2
+            && self.pattern[1].len() >= 2
+            && self.pattern[1][1] == 32;
+        let tail_y = m.tail.map_or(0, |t| t.y);
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
+            if linear {
+                for y in 0..m.height {
+                    let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
-                } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    match chunk_size {
-                        Some(8) if tiled_row.is_multiple_of(8) => {
-                            copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(16) if tiled_row.is_multiple_of(16) => {
-                            copy_runs::<16, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        Some(32) if tiled_row.is_multiple_of(32) => {
-                            copy_runs::<32, DETILE>(src, dst, body, tiled_row, linear_row)
-                        }
-                        _ => copy_runs::<0, DETILE>(src, dst, body, tiled_row, linear_row),
-                    }
-                    copy_runs::<0, DETILE>(src, dst, last, tiled_row, linear_row);
                 }
+                continue;
+            }
+            let mut y = 0;
+            while y < m.height {
+                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                let tiled_row = (base + self.row(m, y, inner)) as usize;
+                if quad_row_16 && y + 4 <= m.height && (y + tail_y).is_multiple_of(4) {
+                    copy_runs_16x4::<DETILE>(
+                        src,
+                        dst,
+                        body,
+                        max_body_offset,
+                        tiled_row,
+                        linear_row,
+                        row_pitch,
+                    );
+                    if !last.is_empty() {
+                        for dy in 0..4 {
+                            copy_runs_generic::<DETILE>(
+                                src,
+                                dst,
+                                last,
+                                tiled_row + dy * 16,
+                                linear_row + dy * row_pitch,
+                            );
+                        }
+                    }
+                    y += 4;
+                    continue;
+                }
+                if pair_row_32 && y + 2 <= m.height && (y + tail_y).is_multiple_of(2) {
+                    copy_runs_32x2::<DETILE>(
+                        src,
+                        dst,
+                        body,
+                        max_body_offset,
+                        tiled_row,
+                        linear_row,
+                        row_pitch,
+                    );
+                    if !last.is_empty() {
+                        for dy in 0..2 {
+                            copy_runs_generic::<DETILE>(
+                                src,
+                                dst,
+                                last,
+                                tiled_row + dy * 32,
+                                linear_row + dy * row_pitch,
+                            );
+                        }
+                    }
+                    y += 2;
+                    continue;
+                }
+                match chunk_size {
+                    Some(4) => {
+                        copy_runs_fixed::<4, DETILE>(src, dst, body, max_body_offset, tiled_row, linear_row)
+                    }
+                    Some(8) => {
+                        copy_runs_fixed::<8, DETILE>(src, dst, body, max_body_offset, tiled_row, linear_row)
+                    }
+                    Some(16) => {
+                        copy_runs_fixed::<16, DETILE>(src, dst, body, max_body_offset, tiled_row, linear_row)
+                    }
+                    Some(32) => {
+                        copy_runs_fixed::<32, DETILE>(src, dst, body, max_body_offset, tiled_row, linear_row)
+                    }
+                    _ => copy_runs_generic::<DETILE>(src, dst, body, tiled_row, linear_row),
+                }
+                if !last.is_empty() {
+                    copy_runs_generic::<DETILE>(src, dst, last, tiled_row, linear_row);
+                }
+                y += 1;
             }
         }
         Ok(())
@@ -777,31 +989,217 @@ fn copy_run<const DETILE: bool>(
     dst[to..][..len].copy_from_slice(&src[from..][..len]);
 }
 
-/// A row of equal runs is contiguous in linear memory. Treat it as a
-/// slice of arrays so only the tiled chunk needs a bounds check per copy.
-/// Use the byte ranges for irregular runs and the last run of each row.
-fn copy_runs<const N: usize, const DETILE: bool>(
+fn copy_runs_generic<const DETILE: bool>(
     src: &[u8],
     dst: &mut [u8],
-    runs: &[(usize, usize, usize)],
+    runs: &[(u32, u32, u32)],
     tiled_row: usize,
     linear_row: usize,
 ) {
-    if N == 0 {
-        for &(tiled, linear, len) in runs {
-            copy_run::<DETILE>(src, dst, tiled_row + tiled, linear_row + linear, len);
-        }
-    } else if DETILE {
-        let tiled = src.as_chunks::<N>().0;
-        let linear = dst[linear_row..][..runs.len() * N].as_chunks_mut::<N>().0;
-        for (out, &(offset, ..)) in linear.iter_mut().zip(runs) {
-            *out = tiled[(tiled_row + offset) / N];
-        }
+    for &(tiled, linear, len) in runs {
+        copy_run::<DETILE>(
+            src,
+            dst,
+            tiled_row + tiled as usize,
+            linear_row + linear as usize,
+            len as usize,
+        );
+    }
+}
+
+/// Copies a row of uniform `N`-byte runs after validating the full row's tiled
+/// and linear bounds once.
+fn copy_runs_fixed<const N: usize, const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    runs: &[(u32, u32, u32)],
+    max_offset: usize,
+    tiled_row: usize,
+    linear_row: usize,
+) {
+    if runs.is_empty() {
+        return;
+    }
+    debug_assert!(
+        runs.iter()
+            .all(|&(off, _, len)| off as usize <= max_offset && len as usize == N)
+    );
+    let linear_bytes = runs.len() * N;
+    let (tiled_len, linear_len) = if DETILE {
+        (src.len(), dst.len())
     } else {
-        let tiled = dst.as_chunks_mut::<N>().0;
-        let linear = src[linear_row..][..runs.len() * N].as_chunks::<N>().0;
-        for (input, &(offset, ..)) in linear.iter().zip(runs) {
-            tiled[(tiled_row + offset) / N] = *input;
+        (dst.len(), src.len())
+    };
+    assert!(
+        tiled_row
+            .checked_add(max_offset + N)
+            .is_some_and(|end| end <= tiled_len)
+    );
+    assert!(
+        linear_row
+            .checked_add(linear_bytes)
+            .is_some_and(|end| end <= linear_len)
+    );
+    // SAFETY: Every `off` satisfies `off <= max_offset`, so `tiled_row + off..tiled_row + off + N`
+    // is within `tiled_len`, and `linear_row..linear_row + runs.len() * N` is within `linear_len`.
+    // `src` and `dst` are disjoint slices.
+    unsafe {
+        if DETILE {
+            let src_base = src.as_ptr().add(tiled_row);
+            let mut dst_ptr = dst.as_mut_ptr().add(linear_row);
+            for &(off, _, _) in runs {
+                std::ptr::copy_nonoverlapping(src_base.add(off as usize), dst_ptr, N);
+                dst_ptr = dst_ptr.add(N);
+            }
+        } else {
+            let mut src_ptr = src.as_ptr().add(linear_row);
+            let dst_base = dst.as_mut_ptr().add(tiled_row);
+            for &(off, _, _) in runs {
+                std::ptr::copy_nonoverlapping(src_ptr, dst_base.add(off as usize), N);
+                src_ptr = src_ptr.add(N);
+            }
+        }
+    }
+}
+
+/// 4-row micro-tile fast path where 4 consecutive rows of each 16-byte run sit
+/// consecutively in one 64-byte cache line (`+0, +16, +32, +48`).
+fn copy_runs_16x4<const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    runs: &[(u32, u32, u32)],
+    max_offset: usize,
+    tiled_row: usize,
+    linear_row: usize,
+    row_pitch: usize,
+) {
+    if runs.is_empty() {
+        return;
+    }
+    debug_assert!(
+        runs.iter()
+            .all(|&(off, _, len)| off as usize <= max_offset && len == 16)
+    );
+    let linear_bytes = runs.len() * 16;
+    let (tiled_len, linear_len) = if DETILE {
+        (src.len(), dst.len())
+    } else {
+        (dst.len(), src.len())
+    };
+    assert!(
+        tiled_row
+            .checked_add(max_offset + 64)
+            .is_some_and(|end| end <= tiled_len)
+    );
+    assert!(
+        linear_row
+            .checked_add(3 * row_pitch)
+            .and_then(|r| r.checked_add(linear_bytes))
+            .is_some_and(|end| end <= linear_len)
+    );
+    // SAFETY: Every `off <= max_offset`, so `tiled_row + off..tiled_row + off + 64` is within
+    // `tiled_len`, and all four rows `linear_row + dy * row_pitch..+linear_bytes` (`dy in 0..4`)
+    // are within `linear_len`. `src` and `dst` are disjoint slices.
+    unsafe {
+        if DETILE {
+            let src_base = src.as_ptr().add(tiled_row);
+            let mut d0 = dst.as_mut_ptr().add(linear_row);
+            let mut d1 = d0.add(row_pitch);
+            let mut d2 = d1.add(row_pitch);
+            let mut d3 = d2.add(row_pitch);
+            for &(off, _, _) in runs {
+                let s = src_base.add(off as usize);
+                std::ptr::copy_nonoverlapping(s, d0, 16);
+                std::ptr::copy_nonoverlapping(s.add(16), d1, 16);
+                std::ptr::copy_nonoverlapping(s.add(32), d2, 16);
+                std::ptr::copy_nonoverlapping(s.add(48), d3, 16);
+                d0 = d0.add(16);
+                d1 = d1.add(16);
+                d2 = d2.add(16);
+                d3 = d3.add(16);
+            }
+        } else {
+            let dst_base = dst.as_mut_ptr().add(tiled_row);
+            let mut s0 = src.as_ptr().add(linear_row);
+            let mut s1 = s0.add(row_pitch);
+            let mut s2 = s1.add(row_pitch);
+            let mut s3 = s2.add(row_pitch);
+            for &(off, _, _) in runs {
+                let d = dst_base.add(off as usize);
+                std::ptr::copy_nonoverlapping(s0, d, 16);
+                std::ptr::copy_nonoverlapping(s1, d.add(16), 16);
+                std::ptr::copy_nonoverlapping(s2, d.add(32), 16);
+                std::ptr::copy_nonoverlapping(s3, d.add(48), 16);
+                s0 = s0.add(16);
+                s1 = s1.add(16);
+                s2 = s2.add(16);
+                s3 = s3.add(16);
+            }
+        }
+    }
+}
+
+/// 2-row micro-tile fast path where 2 consecutive rows of each 32-byte run sit
+/// consecutively in one 64-byte cache line (`+0, +32`).
+fn copy_runs_32x2<const DETILE: bool>(
+    src: &[u8],
+    dst: &mut [u8],
+    runs: &[(u32, u32, u32)],
+    max_offset: usize,
+    tiled_row: usize,
+    linear_row: usize,
+    row_pitch: usize,
+) {
+    if runs.is_empty() {
+        return;
+    }
+    debug_assert!(
+        runs.iter()
+            .all(|&(off, _, len)| off as usize <= max_offset && len == 32)
+    );
+    let linear_bytes = runs.len() * 32;
+    let (tiled_len, linear_len) = if DETILE {
+        (src.len(), dst.len())
+    } else {
+        (dst.len(), src.len())
+    };
+    assert!(
+        tiled_row
+            .checked_add(max_offset + 64)
+            .is_some_and(|end| end <= tiled_len)
+    );
+    assert!(
+        linear_row
+            .checked_add(row_pitch)
+            .and_then(|r| r.checked_add(linear_bytes))
+            .is_some_and(|end| end <= linear_len)
+    );
+    // SAFETY: Every `off <= max_offset`, so `tiled_row + off..tiled_row + off + 64` is within
+    // `tiled_len`, and both rows `linear_row + dy * row_pitch..+linear_bytes` (`dy in 0..2`)
+    // are within `linear_len`. `src` and `dst` are disjoint slices.
+    unsafe {
+        if DETILE {
+            let src_base = src.as_ptr().add(tiled_row);
+            let mut d0 = dst.as_mut_ptr().add(linear_row);
+            let mut d1 = d0.add(row_pitch);
+            for &(off, _, _) in runs {
+                let s = src_base.add(off as usize);
+                std::ptr::copy_nonoverlapping(s, d0, 32);
+                std::ptr::copy_nonoverlapping(s.add(32), d1, 32);
+                d0 = d0.add(32);
+                d1 = d1.add(32);
+            }
+        } else {
+            let dst_base = dst.as_mut_ptr().add(tiled_row);
+            let mut s0 = src.as_ptr().add(linear_row);
+            let mut s1 = s0.add(row_pitch);
+            for &(off, _, _) in runs {
+                let d = dst_base.add(off as usize);
+                std::ptr::copy_nonoverlapping(s0, d, 32);
+                std::ptr::copy_nonoverlapping(s1, d.add(32), 32);
+                s0 = s0.add(32);
+                s1 = s1.add(32);
+            }
         }
     }
 }
@@ -1343,7 +1741,7 @@ mod tests {
             let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
             assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
             assert!(needs[3] * 4 < l.size, "{needs:?}");
-            let tiled: Vec<u8> = (0..l.size).map(|i| (i * 7 >> 3) as u8).collect();
+            let tiled: Vec<u8> = (0..l.size).map(|i| ((i * 7) >> 3) as u8).collect();
             for mip in 1..9 {
                 let m = l.mips[mip as usize];
                 let pitch = m.width as usize * 8;
@@ -1509,5 +1907,284 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn subresource_byte_span_and_overlaps_cover_all_elements() {
+        use Dimension::{Tex1d, Tex3d};
+        let cases = [
+            // 1D linear and tiled
+            Desc {
+                dimension: Tex1d,
+                width: 300,
+                height: 1,
+                depth: 1,
+                mips: 6,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            },
+            Desc {
+                dimension: Tex1d,
+                width: 300,
+                height: 1,
+                depth: 3,
+                mips: 6,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_S,
+            },
+            // 2D standard + tail mips
+            desc(100, 60, 7, 4, Swizzle::SW_64KB_D),
+            desc(64, 64, 7, 16, Swizzle::SW_64KB_S),
+            desc(73, 39, 7, 8, Swizzle::SW_4KB_S),
+            desc(30, 20, 5, 4, Swizzle::LINEAR),
+            // 2D array / cubemap
+            Desc {
+                depth: 6,
+                ..desc(64, 64, 7, 16, Swizzle::SW_64KB_S)
+            },
+            // 3D thin (linear) - multi-slice mips + single-slice last mip
+            Desc {
+                dimension: Tex3d,
+                depth: 5,
+                ..desc(16, 12, 4, 4, Swizzle::LINEAR)
+            },
+            // 3D thick (4KB_S and 64KB_S) - multi-slab, single-slab, and tail mips
+            Desc {
+                dimension: Tex3d,
+                depth: 16,
+                ..desc(32, 24, 6, 4, Swizzle::SW_4KB_S)
+            },
+            Desc {
+                dimension: Tex3d,
+                depth: 64,
+                ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
+            },
+            Desc {
+                dimension: Tex3d,
+                depth: 4,
+                ..desc(16, 16, 3, 16, Swizzle::SW_64KB_S)
+            },
+        ];
+
+        for d in cases {
+            let l = Layout::new(&d).unwrap();
+            let bpe = u64::from(d.element_bytes);
+            let sub_slices = if d.dimension == Tex3d { 1 } else { l.slices };
+            // Invalid mip/slice checks
+            assert_eq!(l.subresource_byte_span(d.mips, 0), None);
+            assert!(!l.subresource_overlaps(d.mips, 0, 0, l.size));
+            assert_eq!(l.subresource_byte_span(0, sub_slices), None);
+            assert!(!l.subresource_overlaps(0, sub_slices, 0, l.size));
+
+            for slice in 0..sub_slices {
+                for (mip, m) in l.mips.iter().enumerate() {
+                    let mip = mip as u32;
+                    let span = l.subresource_byte_span(mip, slice);
+                    let multi_slab_3d =
+                        d.dimension == Tex3d && m.depth.div_ceil(l.block[2]) > 1;
+                    if multi_slab_3d {
+                        assert_eq!(span, None, "{d:?} mip {mip}");
+                    } else {
+                        let (start, end) = span.expect("expected contiguous span");
+                        assert!(start < end && end <= l.size, "{d:?} mip {mip} slice {slice}");
+                        // Empty and non-overlapping boundary checks
+                        assert!(!l.subresource_overlaps(mip, slice, start, start));
+                        assert!(!l.subresource_overlaps(mip, slice, end, end + 16));
+                        if start > 0 {
+                            assert!(!l.subresource_overlaps(mip, slice, 0, start));
+                        }
+                        assert!(l.subresource_overlaps(mip, slice, start, start + 1));
+                        assert!(l.subresource_overlaps(mip, slice, end - 1, end));
+                    }
+
+                    for z in 0..m.depth {
+                        for y in 0..m.height {
+                            for x in 0..m.width {
+                                let off = l.offset(mip, x, y, slice + z).unwrap();
+                                if let Some((start, end)) = span {
+                                    assert!(
+                                        off >= start && off + bpe <= end,
+                                        "{d:?} mip {mip} slice {slice} ({x},{y},{z}) off={off} not in [{start},{end})"
+                                    );
+                                }
+                                assert!(
+                                    l.subresource_overlaps(mip, slice, off, off + bpe),
+                                    "{d:?} mip {mip} slice {slice} ({x},{y},{z}) off={off}"
+                                );
+                            }
+                        }
+                    }
+
+                    // For multi-slab 3D, check gap between slabs does NOT overlap when standard mip
+                    if multi_slab_3d && m.tail.is_none() && m.offset > 0 {
+                        let slab0_end = m.offset
+                            + u64::from(m.pitch)
+                                * u64::from(m.rows)
+                                * u64::from(l.block[2])
+                                * bpe;
+                        let slab1_start = l.slice_size + m.offset;
+                        if slab0_end < slab1_start {
+                            assert!(
+                                !l.subresource_overlaps(mip, 0, slab0_end, slab1_start),
+                                "{d:?} mip {mip} gap [{slab0_end},{slab1_start})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also check thin 3D non-addressable (SW_64KB_R_X) multi-slice and single-slice spans
+        let thin_3d = Layout::new(&Desc {
+            dimension: Tex3d,
+            depth: 4,
+            ..desc(32, 32, 3, 4, Swizzle::SW_64KB_R_X)
+        })
+        .unwrap();
+        assert!(!thin_3d.thick);
+        assert_eq!(thin_3d.subresource_byte_span(0, 0), None);
+        assert_eq!(thin_3d.subresource_byte_span(1, 0), None);
+        assert!(thin_3d.subresource_byte_span(2, 0).is_some());
+        assert!(thin_3d.subresource_overlaps(0, 0, 3 * thin_3d.slice_size, 4 * thin_3d.slice_size));
+        assert!(!thin_3d.subresource_overlaps(1, 0, 2 * thin_3d.slice_size, 4 * thin_3d.slice_size));
+    }
+
+    #[test]
+    fn swizzle_shifts_reconstruct_offsets_bit_for_bit() {
+        fn scatter(coord: u32, shifts: u32, nbits: u32) -> u32 {
+            let mut out = 0u32;
+            for i in 0..nbits {
+                if (coord >> i) & 1 != 0 {
+                    out |= 1u32 << ((shifts >> (i * 4)) & 0xf);
+                }
+            }
+            out
+        }
+
+        // Linear, XOR, and MSAA return None.
+        assert_eq!(
+            Layout::new(&desc(64, 64, 1, 4, Swizzle::LINEAR))
+                .unwrap()
+                .swizzle_shifts(),
+            None
+        );
+        assert_eq!(
+            Layout::new(&desc(64, 64, 1, 4, Swizzle::SW_64KB_S_X))
+                .unwrap()
+                .swizzle_shifts(),
+            None
+        );
+        assert_eq!(
+            Layout::new(&Desc {
+                samples: 4,
+                ..desc(64, 64, 1, 4, Swizzle::SW_64KB_S)
+            })
+            .unwrap()
+            .swizzle_shifts(),
+            None
+        );
+
+        let configs = [
+            (Dimension::Tex2d, Swizzle::SW_256B_S, 1u32),
+            (Dimension::Tex2d, Swizzle::SW_256B_D, 1),
+            (Dimension::Tex2d, Swizzle::SW_4KB_S, 1),
+            (Dimension::Tex2d, Swizzle::SW_4KB_D, 1),
+            (Dimension::Tex2d, Swizzle::SW_64KB_S, 1),
+            (Dimension::Tex2d, Swizzle::SW_64KB_D, 1),
+            (Dimension::Tex3d, Swizzle::SW_4KB_S, 12),
+            (Dimension::Tex3d, Swizzle::SW_64KB_S, 20),
+        ];
+
+        for (dimension, swizzle, depth) in configs {
+            for bpe in [1u32, 2, 4, 8, 16] {
+                let l = Layout::new(&Desc {
+                    dimension,
+                    width: 67,
+                    height: 35,
+                    depth,
+                    mips: 6,
+                    element_bytes: bpe,
+                    block: 1,
+                    samples: 1,
+                    swizzle,
+                })
+                .unwrap();
+                let (shifts, nbits) = l.swizzle_shifts().expect("addressable tiled");
+                let [bw, bh, _] = l.block;
+                let block_log2 = l.alignment.trailing_zeros();
+
+                for (mip, m) in l.mips.iter().enumerate() {
+                    let mip = mip as u32;
+                    let (tx, ty) = m.tail.map_or((0, 0), |t| (t.x, t.y));
+                    let slices = if dimension == Dimension::Tex3d {
+                        m.depth
+                    } else {
+                        l.slices
+                    };
+                    for z in 0..slices {
+                        let (s, iz) = l.split(z);
+                        let base = u64::from(s) * l.slice_size + m.offset;
+                        let z_off = scatter(iz, shifts[2], nbits[2]);
+                        // Sample coordinates across block boundaries and edges.
+                        let ys: Vec<u32> = (0..m.height.min(18))
+                            .chain(m.height.saturating_sub(4)..m.height)
+                            .collect();
+                        let xs: Vec<u32> = (0..m.width.min(18))
+                            .chain(m.width.saturating_sub(4)..m.width)
+                            .collect();
+                        for &y in &ys {
+                            let ey = y + ty;
+                            let by = ey / bh;
+                            let y_off = scatter(ey % bh, shifts[1], nbits[1]);
+                            for &x in &xs {
+                                let ex = x + tx;
+                                let bx = ex / bw;
+                                let x_off = scatter(ex % bw, shifts[0], nbits[0]);
+                                let block_idx = u64::from(by) * u64::from(m.pitch / bw) + u64::from(bx);
+                                let got = base
+                                    + (block_idx << block_log2)
+                                    + u64::from(x_off | y_off | z_off);
+                                let want = l.offset(mip, x, y, z).unwrap();
+                                assert_eq!(
+                                    got, want,
+                                    "{dimension:?} {swizzle:?} bpe={bpe} mip={mip} ({x},{y},{z})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_texture_spills_runs_buffer_and_round_trips() {
+        // Width > 512 elements exercises the heap-spill path for runs as well as
+        // the 4-row 16B and 2-row 32B micro-tile fast paths.
+        for (swizzle, bpe) in [
+            (Swizzle::SW_64KB_S, 16),
+            (Swizzle::SW_64KB_D, 16),
+            (Swizzle::SW_4KB_S, 8),
+        ] {
+            let l = Layout::new(&desc(600, 9, 1, bpe, swizzle)).unwrap();
+            let n = bpe as usize;
+            let row_pitch = 600 * n + 5;
+            let linear: Vec<u8> = (0..9 * row_pitch)
+                .map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8)
+                .collect();
+            let mut tiled = vec![0u8; l.size as usize];
+            let mut back = vec![0xaa; linear.len()];
+            l.tile(&mut tiled, 0, 0, &linear, row_pitch, linear.len()).unwrap();
+            l.detile(&tiled, 0, 0, &mut back, row_pitch, linear.len()).unwrap();
+            for y in 0..9 {
+                let start = y * row_pitch;
+                assert_eq!(back[start..start + 600 * n], linear[start..start + 600 * n]);
+                assert!(back[start + 600 * n..start + row_pitch].iter().all(|&b| b == 0xaa));
+            }
+        }
     }
 }

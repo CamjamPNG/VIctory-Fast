@@ -22,8 +22,8 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -36,6 +36,8 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Number of threads currently waiting in [`wait`] for `made`.
+    waiters: AtomicU32,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -57,6 +59,9 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !shaders.iter().any(|s| s.stage == "compute") {
+        return None;
+    }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -117,6 +122,15 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+struct Blake3Writer<'a>(&'a mut blake3::Hasher);
+
+impl std::fmt::Write for Blake3Writer<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.update(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
@@ -124,7 +138,9 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        if let Some(g) = graphics.as_deref() {
+            let _ = g.describe_into(&mut Blake3Writer(&mut key));
+        }
         let scene_input = scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
@@ -138,6 +154,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            waiters: AtomicU32::new(0),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -169,9 +186,7 @@ impl Pending {
             };
             let _ = self.made.set(made);
         }
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
+        notify_done(self);
     }
 }
 
@@ -183,29 +198,37 @@ static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 /// (`warm-bad.txt` beside the pipeline library, one key to a line, then
 /// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
 /// leaves the file unread.
-static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+static BAD_KEYS: OnceLock<RwLock<std::collections::HashSet<String>>> = OnceLock::new();
 
-fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
-    let mut keys = BAD_KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    let keys = keys.get_or_insert_with(|| {
+fn bad_keys_lock() -> &'static RwLock<std::collections::HashSet<String>> {
+    BAD_KEYS.get_or_init(|| {
         if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
-            return Default::default();
+            return RwLock::new(Default::default());
         }
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
             .unwrap_or_default();
-        listed
-            .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
-            .collect()
-    });
-    f(keys)
+        RwLock::new(
+            listed
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .filter_map(|l| l.split_whitespace().next())
+                .map(str::to_owned)
+                .collect(),
+        )
+    })
+}
+
+fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+    let mut keys = bad_keys_lock().write().unwrap_or_else(|e| e.into_inner());
+    f(&mut keys)
 }
 
 fn is_bad_key(key: &str) -> bool {
-    bad_keys(|keys| keys.contains(key))
+    bad_keys_lock()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(key)
 }
 
 /// Whether the driver's compiler crashes are caught
@@ -381,13 +404,9 @@ fn lost(slot: usize) {
     if p.was_slow.swap(false, Ordering::Relaxed) {
         let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         queue.slow_now = queue.slow_now.saturating_sub(1);
-        AVAILABLE.notify_all();
+        GENERAL_AVAILABLE.notify_one();
     }
-    {
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
-    }
+    notify_done(&p);
     if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
         drained();
     }
@@ -425,8 +444,25 @@ pub(crate) fn hashes(p: &Pending) -> String {
     hashes.join("+")
 }
 
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+/// Sharded completion condvars: avoids thundering-herd wakeups and allows
+/// [`Pending::make`] to skip locking completely when no thread is waiting.
+const DONE_SHARDS: usize = 16;
+static DONE: [(Mutex<()>, Condvar); DONE_SHARDS] =
+    [const { (Mutex::new(()), Condvar::new()) }; DONE_SHARDS];
+
+fn done_shard(p: &Pending) -> &'static (Mutex<()>, Condvar) {
+    &DONE[((p as *const Pending as usize) >> 6) & (DONE_SHARDS - 1)]
+}
+
+fn notify_done(p: &Pending) {
+    // Pairs with `wait()` incrementing `p.waiters` with SeqCst before checking `p.made`.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if p.waiters.load(Ordering::SeqCst) > 0 {
+        let (lock, done) = done_shard(p);
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+    }
+}
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -475,10 +511,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    if p.made.get().is_none() {
-        start(p, REQUESTED);
-        wait(p, crate::frame::current());
+    if let Some(made) = p.made.get() {
+        return made.as_ref();
     }
+    start(p, REQUESTED);
+    wait(p, crate::frame::current());
     p.made.get()?.as_ref()
 }
 
@@ -518,6 +555,31 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Waits up to `left` for `p.made` to be populated, tracking active waiters so
+/// [`notify_done`] skips locking when no thread is waiting.
+fn wait_for_made(p: &Pending, left: Duration) {
+    let started = Instant::now();
+    struct WaiterGuard<'a>(&'a AtomicU32);
+    impl Drop for WaiterGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    p.waiters.fetch_add(1, Ordering::SeqCst);
+    let _waiter = WaiterGuard(&p.waiters);
+    if p.made.get().is_none() {
+        let (lock, done) = done_shard(p);
+        let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while p.made.get().is_none() {
+            let rest = left.saturating_sub(started.elapsed());
+            if rest.is_zero() {
+                break;
+            }
+            held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
@@ -545,16 +607,7 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
-    let (lock, done) = &DONE;
-    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
-        let rest = left.saturating_sub(started.elapsed());
-        if rest.is_zero() {
-            break;
-        }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    drop(held);
+    wait_for_made(p, left);
     let waited = started.elapsed().min(left);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
@@ -619,6 +672,9 @@ struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
     screen: VecDeque<Arc<Pending>>,
+    /// Prewarmed passes over the screen, prioritized ahead of depth/other
+    /// prewarmed pipelines on general workers without blocking [`SCREEN_WORKERS`].
+    early_screen: VecDeque<Arc<Pending>>,
     /// Prewarmed depth-only passes (shadow maps and depth prepasses), prioritized
     /// ahead of other prewarmed pipelines when no draw is waiting.
     early_depth: VecDeque<Arc<Pending>>,
@@ -634,6 +690,7 @@ impl Queue {
     const fn new() -> Self {
         Self {
             screen: VecDeque::new(),
+            early_screen: VecDeque::new(),
             early_depth: VecDeque::new(),
             early: VecDeque::new(),
             slow: VecDeque::new(),
@@ -644,8 +701,10 @@ impl Queue {
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
+    #[cfg(test)]
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        let is_slow = priority == EARLY && slow_limit() != usize::MAX && super::library::slow(&p.key);
+        self.push_as(p, priority, is_slow)
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
@@ -660,6 +719,8 @@ impl Queue {
             self.requested.push_back(p.clone());
         } else if slow {
             self.slow.push_back(p.clone());
+        } else if p.screen {
+            self.early_screen.push_back(p.clone());
         } else if p.graphics.as_ref().is_some_and(|state| writes_depth_only(state)) {
             self.early_depth.push_back(p.clone());
         } else {
@@ -678,6 +739,7 @@ impl Queue {
             p = self
                 .requested
                 .pop_front()
+                .or_else(|| unclaimed(&mut self.early_screen))
                 .or_else(|| unclaimed(&mut self.early_depth))
                 .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
@@ -695,7 +757,8 @@ impl Queue {
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
-static AVAILABLE: Condvar = Condvar::new();
+static SCREEN_AVAILABLE: Condvar = Condvar::new();
+static GENERAL_AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -709,14 +772,18 @@ fn start(p: &Arc<Pending>, priority: u8) {
         }
         return;
     }
+    let is_slow = priority == EARLY && slow_limit() != usize::MAX && super::library::slow(&p.key);
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    if let Some(new) = queue.push_as(p, priority, is_slow) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
-        // (One woken could be a worker that takes passes over the screen
-        // alone: it would leave the pipeline to nobody.)
-        AVAILABLE.notify_all();
+        if priority == REQUESTED && p.screen && screens_first() {
+            SCREEN_AVAILABLE.notify_one();
+            GENERAL_AVAILABLE.notify_one();
+        } else if !is_slow || queue.slow_now < slow_limit() {
+            GENERAL_AVAILABLE.notify_one();
+        }
     }
 }
 
@@ -724,12 +791,17 @@ fn start(p: &Arc<Pending>, priority: u8) {
 const SCREEN_WORKERS: usize = 2;
 
 fn next(screens_only: bool) -> Arc<Pending> {
+    let cv = if screens_only {
+        &SCREEN_AVAILABLE
+    } else {
+        &GENERAL_AVAILABLE
+    };
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some(p) = queue.pop(screens_only, slow_limit()) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = cv.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -801,7 +873,7 @@ fn spawn_worker(screens_only: bool) -> bool {
                 if p.was_slow.load(Ordering::Relaxed) {
                     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                     queue.slow_now -= 1;
-                    AVAILABLE.notify_all();
+                    GENERAL_AVAILABLE.notify_one();
                 }
                 if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                     drained();
@@ -976,5 +1048,134 @@ mod tests {
             assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), expected));
         }
         assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn pending_key_matches_reference_describe_hash() {
+        use std::ffi::CString;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::PCSTR;
+
+        let mut complex = Box::new(GraphicsState {
+            sample_mask: 0x0f0f,
+            depth_bounds: true,
+            ..Default::default()
+        });
+        complex.targets.NumRenderTargets = 2;
+        complex.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        complex.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        complex.depth_format = DXGI_FORMAT_D32_FLOAT;
+        complex.names = vec![
+            CString::new("POSITION").unwrap(),
+            CString::new("TEX\"COORD\\0'").unwrap(),
+        ];
+        complex.inputs = complex
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: i as u32,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: i as u32,
+                AlignedByteOffset: D3D12_APPEND_ALIGNED_ELEMENT,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            })
+            .collect();
+
+        let states: [Option<Box<GraphicsState>>; 3] = [
+            None,
+            Some(Box::new(GraphicsState::default())),
+            Some(complex),
+        ];
+        for state in states {
+            let expected_desc = state.as_ref().map(|g| g.describe()).unwrap_or_default();
+            let expected_key = blake3::hash(expected_desc.as_bytes()).to_hex()[..32].to_owned();
+            let p = Pending::new(Vec::new(), state);
+            assert_eq!(p.key(), expected_key);
+        }
+    }
+
+    #[test]
+    fn early_screen_priority_and_screen_workers_isolation() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+
+        let make_screen = || {
+            let mut p = Pending::new(Vec::new(), None);
+            p.screen = true;
+            Arc::new(p)
+        };
+        let make_depth = || {
+            let mut depth = Box::new(GraphicsState::default());
+            let format = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+            // SAFETY: a complete depth-format subobject.
+            unsafe { depth.read(16, format.as_ptr().cast()) };
+            Arc::new(Pending::new(Vec::new(), Some(depth)))
+        };
+        let make_plain = || Arc::new(Pending::new(Vec::new(), None));
+
+        let req_screen = make_screen();
+        let req_normal = make_plain();
+        let early_screen = make_screen();
+        let early_depth = make_depth();
+        let early_normal = make_plain();
+        let early_slow = make_plain();
+
+        let mut queue = Queue::new();
+        assert_eq!(queue.push_as(&early_slow, EARLY, true), Some(true));
+        assert_eq!(queue.push_as(&early_normal, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&early_depth, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&early_screen, EARLY, false), Some(true));
+        assert_eq!(queue.push_as(&req_normal, REQUESTED, false), Some(true));
+        assert_eq!(queue.push_as(&req_screen, REQUESTED, false), Some(true));
+
+        // Dedicated screen workers only take REQUESTED screen passes, never early_screen or others.
+        assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &req_screen));
+        assert!(queue.pop(true, 1).is_none());
+
+        // General workers drain in strict priority: REQUESTED > early_screen > early_depth > early > slow.
+        for expected in [&req_normal, &early_screen, &early_depth, &early_normal, &early_slow] {
+            assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), expected));
+        }
+        assert!(queue.pop(false, 1).is_none());
+    }
+
+    #[test]
+    fn pending_wait_and_make_concurrent_stress() {
+        use std::sync::Barrier;
+
+        // First exercise unwaited make (fast path with waiters == 0).
+        let unwaited = Arc::new(Pending::new(Vec::new(), None));
+        assert_eq!(unwaited.waiters.load(Ordering::SeqCst), 0);
+        unwaited.make();
+        assert!(matches!(unwaited.made.get(), Some(None)));
+        assert_eq!(unwaited.waiters.load(Ordering::SeqCst), 0);
+
+        // Now stress concurrent waiters racing with `Pending::make()` so no wakeup is ever lost.
+        const ROUNDS: usize = 64;
+        const WAITERS: usize = 4;
+        for _ in 0..ROUNDS {
+            let p = Arc::new(Pending::new(Vec::new(), None));
+            let barrier = Arc::new(Barrier::new(WAITERS + 1));
+            let handles: Vec<_> = (0..WAITERS)
+                .map(|_| {
+                    let p = p.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        wait_for_made(&p, Duration::from_secs(5));
+                        assert!(p.made.get().is_some(), "waiter returned without observing made");
+                    })
+                })
+                .collect();
+            barrier.wait();
+            p.make();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(p.waiters.load(Ordering::SeqCst), 0);
+        }
     }
 }

@@ -42,6 +42,48 @@ use crate::host::{HostList, host, transition};
 
 pub(crate) mod batch;
 
+pub(crate) const KIND_DRAW: u32 = 0;
+pub(crate) const KIND_DRAW_INDEXED: u32 = 1;
+pub(crate) const KIND_DISPATCH: u32 = 2;
+pub(crate) const KIND_CONSTANT: u32 = 5;
+pub(crate) const KIND_CBV: u32 = 6;
+pub(crate) const KIND_SRV: u32 = 7;
+pub(crate) const KIND_UAV: u32 = 8;
+pub(crate) const KIND_DISPATCH_MESH: u32 = 10;
+/// Internal clamp kind for 1D `DispatchMeshX` GPU-indirect arguments: loads a
+/// single `u32` `ThreadGroupCountX` and emits a 12-byte D3D12
+/// `D3D12_DISPATCH_MESH_ARGUMENTS` `[x, 1, 1]` (or `[0, 0, 0]` when `x == 0`
+/// or `x > 65535`).
+pub(crate) const KIND_DISPATCH_MESH_1D: u32 = 11;
+pub(crate) const KIND_DISPATCH_SINGLE: u32 = 105;
+
+/// Whether indirect argument clamping is active (on by default;
+/// `VICTORY_INDIRECT_CLAMP=0` executes plain single-argument indirect records
+/// directly from the title buffer's host copy without running the clamp pass).
+/// shortcut: disabling clamping risks a GPU TDR if the title leaves unfilled
+/// garbage slots or out-of-range counts in its indirect argument buffers.
+pub(crate) fn clamp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| clamp_enabled_for(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
+}
+
+fn clamp_enabled_for(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// Whether a plain single-argument indirect execution can safely bypass the
+/// clamp pass under `VICTORY_INDIRECT_CLAMP=0` (only native PC record layouts
+/// whose stride and offsets are valid).
+pub(crate) fn can_bypass_clamp(
+    kind: u32,
+    stride: u32,
+    src_offset: u64,
+    count_offset: Option<u64>,
+) -> bool {
+    matches!(kind, KIND_DRAW | KIND_DRAW_INDEXED | KIND_DISPATCH | KIND_DISPATCH_MESH)
+        && validate_layout((kind, stride, 1), src_offset, count_offset).is_some()
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
@@ -82,17 +124,21 @@ groupshared uint largest_asked;
 groupshared uint all_asked;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     bool ahead = (has_count & 2u) != 0;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
+    uint first = gid.x * 64u;
+    if (first >= eff_count) {
+        return;
+    }
     // Threads past the records take part in the group's charge (cost 0)
     // and store nothing.
     bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = id.x * (kind == 11u ? max(stride, 12u) : stride);
     bool spread = (has_count & 8u) != 0;
     uint row = 0;
     uint asked_x = 0;
@@ -154,6 +200,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
         cost = g.x * g.y * g.z * 64u;
         groups = g;
+    } else if (active && kind == 11) {
+        // 1D indirect mesh dispatch (`DispatchMeshX`): 1 word in, 3 words (x, 1, 1) out.
+        uint x = src_args.Load(src_at);
+        if (x == 0u || x > 65535u) {
+            groups = uint3(0, 0, 0);
+        } else {
+            asked = x;
+            groups = uint3(x, 1u, 1u);
+        }
+        cost = groups.x * 128u;
     } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
@@ -179,59 +235,65 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
-    // The group's own records: none for a group past a count buffer's
-    // count (an execution may ask for thousands and count a few), which
-    // touches the budget not at all, as its threads did not before.
-    uint first = id.x - gi;
-    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
-    if (gi == 0 && n > 0) {
-        // What the records charge, from `before` on, in lane order: a
-        // record that does not fit whole runs empty and takes the rest
-        // (`rest`).
-        // Only the group's own records are walked (one, clamped alone).
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = before;
-            for (uint j = 0; j < n; j++) {
-                uint c = costs[j];
-                if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+    uint n = min(64u, eff_count - first);
+    if (gi == 0) {
+        uint group_cost = 0;
+        for (uint ci = 0; ci < n; ci++) {
+            group_cost |= costs[ci];
+        }
+        if (group_cost == 0) {
+            for (uint k = 0; k < n; k++) {
+                fits[k] = 1u;
+            }
+        } else {
+            // What the records charge, from `before` on, in lane order: a
+            // record that does not fit whole runs empty and takes the rest
+            // (`rest`).
+            // Only the group's own records are walked (one, clamped alone).
+            uint before;
+            budget.InterlockedOr(0, 0, before);
+            [allow_uav_condition]
+            while (before < BUDGET) {
+                uint next = before;
+                for (uint j = 0; j < n; j++) {
+                    uint c = costs[j];
+                    if (c > 0 && next < BUDGET) {
+                        next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+                    }
                 }
+                if (next == before) break;
+                uint prev;
+                budget.InterlockedCompareExchange(0, before, next, prev);
+                if (prev == before) break;
+                before = prev;
             }
-            if (next == before) break;
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        uint at = before;
-        uint refused = 0;
-        uint biggest = 0;
-        for (uint k = 0; k < n; k++) {
-            uint c = costs[k];
-            uint fit = 1;
-            if (c > 0) {
-                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
-                refused += 1 - fit;
-                biggest = max(biggest, c);
+            uint at = before;
+            uint refused = 0;
+            uint biggest = 0;
+            for (uint k = 0; k < n; k++) {
+                uint c = costs[k];
+                uint fit = 1;
+                if (c > 0) {
+                    fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                    at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+                    refused += 1 - fit;
+                    biggest = max(biggest, c);
+                }
+                fits[k] = fit;
             }
-            fits[k] = fit;
-        }
-        // Diagnostics: the records that run empty for want of budget, and
-        // the largest cost there was (small ones are not told).
-        uint told;
-        if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
-        }
-        if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            // Diagnostics: the records that run empty for want of budget, and
+            // the largest cost there was (small ones are not told).
+            uint told;
+            if (refused > 0) {
+                budget.InterlockedAdd(12, refused, told);
+            }
+            if (biggest >= (1u << 22)) {
+                budget.InterlockedMax(16, biggest, told);
+            }
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind >= 2 && n > 0) {
+    if (gi == 0 && kind >= 2 && all_asked > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
@@ -390,17 +452,19 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
     }
 }
 
-/// Minimum record byte stride for a supported PC indirect argument `kind`.
+/// Minimum record byte stride for a supported PC indirect argument `kind`
+/// (plus internal `KIND_DISPATCH_MESH_1D = 11` for 1-word `DispatchMeshX`).
 fn min_stride(kind: u32) -> Option<u32> {
     match kind {
-        0 => Some(16),
-        1 => Some(20),
-        2 | 10 => Some(12),
+        KIND_DRAW => Some(16),
+        KIND_DRAW_INDEXED => Some(20),
+        KIND_DISPATCH | KIND_DISPATCH_MESH => Some(12),
+        KIND_DISPATCH_MESH_1D => Some(4),
         _ => None,
     }
 }
 
-/// Validates record alignment and returns the scratch byte size `stride * records`.
+/// Validates record alignment and returns the source byte size `stride * records`.
 fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
@@ -415,6 +479,20 @@ fn validate_layout(
     }
     let bytes = u64::from(stride).checked_mul(u64::from(records))?;
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
+}
+
+/// Scratch output bytes required for `(kind, stride, records)` with optional `spread`.
+fn scratch_bytes((kind, stride, records): (u32, u32, u32), spread: bool) -> Option<u64> {
+    let dst_stride = if spread && kind == KIND_DISPATCH {
+        20u32
+    } else if kind == KIND_DISPATCH_MESH_1D {
+        stride.max(12)
+    } else {
+        stride
+    };
+    u64::from(dst_stride)
+        .checked_mul(u64::from(records))
+        .filter(|&b| b <= u64::from(u32::MAX))
 }
 
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
@@ -433,15 +511,8 @@ pub(crate) fn bound(
     spread: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    // Spread dispatch records are 20 bytes each ([row, asked x, x, y, z]);
-    // keep `id.x * 20u` inside 32-bit byte offsets in the clamp shader.
-    let bytes = if spread && spec.0 == 2 {
-        let spread_bytes = 20u64.checked_mul(u64::from(spec.2)).filter(|&b| b <= u64::from(u32::MAX))?;
-        bytes.max(spread_bytes)
-    } else {
-        bytes
-    };
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let dst_bytes = bytes.max(scratch_bytes(spec, spread)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
     clamp_into(list, c, &dst, budget, src, count, spec, false, spread).then_some(dst)
 }
 
@@ -461,7 +532,8 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let dst_bytes = bytes.max(scratch_bytes(spec, false)?);
+    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
     clamp_into(list, c, &dst, budget, src, None, spec, true, false).then_some(dst)
 }
 
@@ -530,13 +602,26 @@ fn record_clamp_with(
     ) else {
         return false;
     };
-    if spread && kind == 2 && u64::from(records).checked_mul(20).is_none_or(|b| b > u64::from(u32::MAX)) {
+    if scratch_bytes((kind, stride, records), spread).is_none() {
         return false;
     }
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
+    }
+    if records == 0 {
+        if before != D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
+            // SAFETY: an open list and a live scratch buffer.
+            unsafe {
+                l.ResourceBarrier(&[transition(
+                    dst,
+                    before,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+        }
+        return true;
     }
     let (src_gpu, args_offset) = match src_offset
         .checked_add(bytes)
@@ -687,7 +772,7 @@ pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12R
     make_from(device, batch::SOURCE).map(|c| (c.root, c.pso))
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -697,6 +782,849 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
             }),
         },
     }
+}
+
+/// Translated stage bindings needed to map console indirect root arguments to
+/// host root parameters.
+pub(crate) struct StageBinding<'a> {
+    pub(crate) user_data_param: Option<u32>,
+    pub(crate) user_data: &'a [victory_shader::emit::UserData],
+    pub(crate) root_cbvs: &'a [(u8, u32)],
+    pub(crate) root_srvs: &'a [(u8, u32)],
+    pub(crate) root_uavs: &'a [(u8, u32)],
+}
+
+/// A single argument in a translated host multi-argument command signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HostIndirectArg {
+    Constant {
+        param: u32,
+        dest_offset: u32,
+        count: u32,
+    },
+    Cbv {
+        param: u32,
+    },
+    Srv {
+        param: u32,
+    },
+    Uav {
+        param: u32,
+    },
+    Exec {
+        kind: u32,
+    },
+}
+
+/// Translated multi-argument indirect execution plan: host command signature
+/// layout plus the per-record copy/VA-rebase ops for [`REPACK_SOURCE`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MultiArgPlan {
+    pub(crate) exec_kind: u32,
+    pub(crate) src_stride: u32,
+    pub(crate) dst_stride: u32,
+    pub(crate) src_exec_off: u32,
+    pub(crate) dst_exec_off: u32,
+    pub(crate) host_args: Vec<HostIndirectArg>,
+    /// Packed `[op_kind, src_off, dst_off, count]` ops for [`REPACK_SOURCE`]:
+    /// 0 = copy 1 dword, 1 = copy `count` dwords, 2 = rebase CBV VA,
+    /// 3 = rebase SRV VA, 4 = rebase UAV VA.
+    pub(crate) ops: Vec<[u32; 4]>,
+    pub(crate) needs_rebase: bool,
+    pub(crate) has_root_args: bool,
+    pub(crate) skipped_tabled_views: bool,
+}
+
+const OP_COPY_DWORD: u32 = 0;
+const OP_COPY_DWORDS: u32 = 1;
+const OP_REBASE_CBV: u32 = 2;
+const OP_REBASE_SRV: u32 = 3;
+const OP_REBASE_UAV: u32 = 4;
+
+fn console_arg_bytes(arg: [u32; 4]) -> Option<u32> {
+    match arg[0] {
+        KIND_DRAW => Some(16),
+        KIND_DRAW_INDEXED => Some(20),
+        KIND_DISPATCH | KIND_DISPATCH_SINGLE | KIND_DISPATCH_MESH => Some(12),
+        KIND_CONSTANT => arg[3].checked_mul(4),
+        KIND_CBV | KIND_SRV | KIND_UAV => Some(8),
+        _ => None,
+    }
+}
+
+/// Translates a console multi-argument command signature (`stride`, `args`)
+/// against the bound pipeline's `stages` into a packed host command signature
+/// and repack op list.
+///
+/// Supports any prefix of `CONSTANT` (5), `CBV` (6), `SRV` (7), `UAV` (8)
+/// followed by a single final `DRAW` (0), `DRAW_INDEXED` (1), `DISPATCH` (2 or
+/// 105), or `DISPATCH_MESH` (10). Returns `None` for unsupported argument types
+/// or invalid strides/layouts.
+pub(crate) fn translate_signature(
+    stride: u32,
+    args: &[[u32; 4]],
+    stages: &[StageBinding<'_>],
+    bounded_root_srvs: bool,
+) -> Option<MultiArgPlan> {
+    use victory_shader::RootType;
+    use victory_shader::emit::USER_ROOT_ADDRESS;
+
+    if args.is_empty() || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let (&last, prefix) = args.split_last()?;
+    let exec_kind = match last[0] {
+        KIND_DRAW => KIND_DRAW,
+        KIND_DRAW_INDEXED => KIND_DRAW_INDEXED,
+        KIND_DISPATCH | KIND_DISPATCH_SINGLE => KIND_DISPATCH,
+        KIND_DISPATCH_MESH => KIND_DISPATCH_MESH,
+        _ => return None,
+    };
+    let exec_bytes = console_arg_bytes(last)?;
+
+    // Walk prefix arguments to compute exact console record byte offsets and
+    // collect every host constant / root descriptor target.
+    let mut src_off = 0u32;
+    // (host_param, dst_dword, src_byte_off)
+    let mut const_writes: Vec<(u32, u32, u32)> = Vec::new();
+    // (op_kind [CBV=2, SRV=3, UAV=4], host_param, src_byte_off)
+    let mut desc_writes: Vec<(u32, u32, u32)> = Vec::new();
+    let mut skipped_tabled_views = false;
+
+    for &arg in prefix {
+        let arg_bytes = console_arg_bytes(arg)?;
+        match arg[0] {
+            KIND_CONSTANT => {
+                let console_slot = arg[1];
+                let dest_offset = arg[2];
+                let num_dwords = arg[3];
+                let end_dword = dest_offset.checked_add(num_dwords)?;
+                for stage in stages {
+                    let Some(host_param) = stage.user_data_param else {
+                        continue;
+                    };
+                    for u in stage.user_data {
+                        if u.root == RootType::Constants
+                            && u32::from(u.slot) == console_slot
+                            && u.dword >= dest_offset
+                            && u.dword < end_dword
+                        {
+                            let word_src = src_off.checked_add((u.dword - dest_offset).checked_mul(4)?)?;
+                            const_writes.push((host_param, u.index, word_src));
+                        }
+                    }
+                }
+            }
+            KIND_CBV | KIND_SRV | KIND_UAV => {
+                let console_slot = arg[1];
+                // Shaders that read raw guest root addresses via user_data get
+                // the low/high 32 bits straight from the indirect record.
+                for stage in stages {
+                    if let Some(host_param) = stage.user_data_param {
+                        for u in stage.user_data {
+                            if u32::from(u.slot) == console_slot {
+                                if u.root == RootType::Other(USER_ROOT_ADDRESS) {
+                                    const_writes.push((host_param, u.index, src_off));
+                                } else if u.root == RootType::Other(USER_ROOT_ADDRESS + 1) {
+                                    const_writes.push((host_param, u.index, src_off.checked_add(4)?));
+                                }
+                            }
+                        }
+                    }
+                    match arg[0] {
+                        KIND_CBV => {
+                            for &(slot, host_param) in stage.root_cbvs {
+                                if u32::from(slot) == console_slot {
+                                    desc_writes.push((OP_REBASE_CBV, host_param, src_off));
+                                }
+                            }
+                        }
+                        KIND_SRV => {
+                            for &(slot, host_param) in stage.root_srvs {
+                                if u32::from(slot) == console_slot {
+                                    if bounded_root_srvs {
+                                        skipped_tabled_views = true;
+                                    } else {
+                                        desc_writes.push((OP_REBASE_SRV, host_param, src_off));
+                                    }
+                                }
+                            }
+                        }
+                        KIND_UAV => {
+                            for &(slot, host_param) in stage.root_uavs {
+                                if u32::from(slot) == console_slot {
+                                    if bounded_root_srvs {
+                                        skipped_tabled_views = true;
+                                    } else {
+                                        desc_writes.push((OP_REBASE_UAV, host_param, src_off));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => return None,
+        }
+        src_off = src_off.checked_add(arg_bytes)?;
+    }
+
+    let src_exec_off = src_off;
+    let total_src = src_exec_off.checked_add(exec_bytes)?;
+    if stride < total_src {
+        return None;
+    }
+
+    // Deduplicate constant writes by `(host_param, dst_dword)` keeping the last
+    // console argument that wrote that slot, then sort by `(host_param, dst_dword)`.
+    let mut dedup_const: Vec<(u32, u32, u32)> = Vec::with_capacity(const_writes.len());
+    for (param, dst, src) in const_writes {
+        if let Some(existing) = dedup_const.iter_mut().find(|(p, d, _)| *p == param && *d == dst) {
+            existing.2 = src;
+        } else {
+            dedup_const.push((param, dst, src));
+        }
+    }
+    dedup_const.sort_unstable_by_key(|&(p, d, _)| (p, d));
+
+    // Deduplicate descriptor writes by `(op_kind, host_param)` keeping the last.
+    let mut dedup_desc: Vec<(u32, u32, u32)> = Vec::with_capacity(desc_writes.len());
+    for (kind, param, src) in desc_writes {
+        if let Some(existing) = dedup_desc.iter_mut().find(|(k, p, _)| *k == kind && *p == param) {
+            existing.2 = src;
+        } else {
+            dedup_desc.push((kind, param, src));
+        }
+    }
+    dedup_desc.sort_unstable_by_key(|&(k, p, _)| (k, p));
+
+    let mut host_args = Vec::new();
+    let mut ops = Vec::new();
+    let mut dst_off = 0u32;
+
+    // Coalesce contiguous `(host_param, dst_dword)` runs into single
+    // `D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT` entries and contiguous source
+    // runs into `OP_COPY_DWORDS`.
+    let mut i = 0;
+    while i < dedup_const.len() {
+        let param = dedup_const[i].0;
+        let run_start = dedup_const[i].1;
+        let mut j = i + 1;
+        while j < dedup_const.len()
+            && dedup_const[j].0 == param
+            && dedup_const[j].1 == run_start + (j - i) as u32
+        {
+            j += 1;
+        }
+        let count = (j - i) as u32;
+        host_args.push(HostIndirectArg::Constant {
+            param,
+            dest_offset: run_start,
+            count,
+        });
+        let mut k = i;
+        while k < j {
+            let src0 = dedup_const[k].2;
+            let dst0 = dst_off;
+            let mut run = 1u32;
+            while k + (run as usize) < j && dedup_const[k + run as usize].2 == src0 + run * 4 {
+                run += 1;
+            }
+            if run == 1 {
+                ops.push([OP_COPY_DWORD, src0, dst0, 1]);
+            } else {
+                ops.push([OP_COPY_DWORDS, src0, dst0, run]);
+            }
+            dst_off = dst_off.checked_add(run.checked_mul(4)?)?;
+            k += run as usize;
+        }
+        i = j;
+    }
+
+    let needs_rebase = !dedup_desc.is_empty();
+    for (op_kind, param, desc_src) in dedup_desc {
+        let arg = match op_kind {
+            OP_REBASE_CBV => HostIndirectArg::Cbv { param },
+            OP_REBASE_SRV => HostIndirectArg::Srv { param },
+            OP_REBASE_UAV => HostIndirectArg::Uav { param },
+            _ => unreachable!(),
+        };
+        host_args.push(arg);
+        ops.push([op_kind, desc_src, dst_off, 0]);
+        dst_off = dst_off.checked_add(8)?;
+    }
+
+    let has_root_args = !host_args.is_empty();
+    let dst_exec_off = dst_off;
+    host_args.push(HostIndirectArg::Exec { kind: exec_kind });
+    let dst_stride = dst_exec_off.checked_add(exec_bytes)?;
+
+    Some(MultiArgPlan {
+        exec_kind,
+        src_stride: stride,
+        dst_stride,
+        src_exec_off,
+        dst_exec_off,
+        host_args,
+        ops,
+        needs_rebase,
+        has_root_args,
+        skipped_tabled_views,
+    })
+}
+
+/// Builds a sorted, non-overlapping GPU VA-rebase table for [`REPACK_SOURCE`]
+/// from `(guest_start, len, host_gpu, writable)` shadow ranges.
+///
+/// When two ranges overlap (e.g. a sub-buffer inside a larger buffer), the
+/// smaller (innermost) range takes precedence and the outer range is split
+/// around it so GPU binary search is exact in O(log N).
+pub(crate) fn build_rebase_table(ranges: &[(u64, u64, u64, bool)]) -> Vec<[u32; 8]> {
+    #[derive(Clone, Copy)]
+    struct Span {
+        start: u64,
+        end: u64,
+        host: u64,
+        writable: bool,
+    }
+    let mut valid: Vec<Span> = ranges
+        .iter()
+        .filter_map(|&(start, len, host, writable)| {
+            if start == 0 || len == 0 || host == 0 {
+                return None;
+            }
+            let end = start.checked_add(len)?;
+            host.checked_add(len)?;
+            Some(Span { start, end, host, writable })
+        })
+        .collect();
+    if valid.is_empty() {
+        return Vec::new();
+    }
+    // Sort largest first, then split/overlay smaller (innermost) spans on top
+    // so narrower buffers win on overlapping regions.
+    valid.sort_unstable_by(|a, b| {
+        (b.end - b.start)
+            .cmp(&(a.end - a.start))
+            .then_with(|| a.start.cmp(&b.start))
+    });
+    // Fast path when sorted by start has no overlaps at all.
+    let mut by_start = valid.clone();
+    by_start.sort_unstable_by_key(|s| s.start);
+    let has_overlap = by_start.windows(2).any(|w| w[0].end > w[1].start);
+    let resolved: Vec<Span> = if !has_overlap {
+        by_start
+    } else {
+        let mut pieces: Vec<Span> = Vec::with_capacity(valid.len());
+        for span in valid {
+            let mut next = Vec::with_capacity(pieces.len() + 2);
+            for p in pieces {
+                if p.end <= span.start || p.start >= span.end {
+                    next.push(p);
+                } else {
+                    if p.start < span.start {
+                        next.push(Span {
+                            start: p.start,
+                            end: span.start,
+                            host: p.host,
+                            writable: p.writable,
+                        });
+                    }
+                    if p.end > span.end {
+                        next.push(Span {
+                            start: span.end,
+                            end: p.end,
+                            host: p.host + (span.end - p.start),
+                            writable: p.writable,
+                        });
+                    }
+                }
+            }
+            next.push(span);
+            pieces = next;
+        }
+        pieces.sort_unstable_by_key(|s| s.start);
+        pieces
+    };
+    resolved
+        .into_iter()
+        .map(|s| {
+            [
+                s.start as u32,
+                (s.start >> 32) as u32,
+                s.end as u32,
+                (s.end >> 32) as u32,
+                s.host as u32,
+                (s.host >> 32) as u32,
+                u32::from(s.writable),
+                0,
+            ]
+        })
+        .collect()
+}
+
+const REPACK_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=13, b0), SRV(t0), SRV(t1), SRV(t2), SRV(t3), UAV(u0), UAV(u1)"
+cbuffer Repack : register(b0) {
+    uint kind;
+    uint src_stride;
+    uint dst_stride;
+    uint records;
+    uint src_exec_off;
+    uint dst_exec_off;
+    uint args_offset;
+    uint flags;
+    uint count_offset;
+    uint op_count;
+    uint rebase_count;
+    uint fallback_lo;
+    uint fallback_hi;
+};
+ByteAddressBuffer src_args : register(t0);
+ByteAddressBuffer count_buf : register(t1);
+ByteAddressBuffer ops : register(t2);
+ByteAddressBuffer rebase : register(t3);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+static const uint BUDGET = 1u << 27;
+static const uint MOST_DRAW = 1u << 23;
+static const uint GROUPS = 1u << 20;
+groupshared uint costs[64];
+groupshared uint fits[64];
+groupshared uint largest_asked;
+groupshared uint all_asked;
+
+bool u64_lt(uint2 a, uint2 b) {
+    return (a.y < b.y) || (a.y == b.y && a.x < b.x);
+}
+bool u64_ge(uint2 a, uint2 b) {
+    return (a.y > b.y) || (a.y == b.y && a.x >= b.x);
+}
+uint2 u64_sub(uint2 a, uint2 b) {
+    uint lo = a.x - b.x;
+    uint borrow = (a.x < b.x) ? 1u : 0u;
+    uint hi = a.y - b.y - borrow;
+    return uint2(lo, hi);
+}
+uint2 u64_add(uint2 a, uint2 b) {
+    uint lo = a.x + b.x;
+    uint carry = (lo < a.x) ? 1u : 0u;
+    uint hi = a.y + b.y + carry;
+    return uint2(lo, hi);
+}
+
+bool rebase_va(uint2 guest, uint op_kind, out uint2 out_va) {
+    out_va = uint2(fallback_lo, fallback_hi);
+    if (rebase_count == 0u || (guest.x == 0u && guest.y == 0u)) {
+        return false;
+    }
+    uint lo = 0u;
+    uint hi = rebase_count;
+    [loop]
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1;
+        uint4 r0 = rebase.Load4(mid * 32u);
+        uint2 g_start = r0.xy;
+        uint2 g_end = r0.zw;
+        if (u64_lt(guest, g_start)) {
+            hi = mid;
+        } else if (u64_ge(guest, g_end)) {
+            lo = mid + 1u;
+        } else {
+            uint4 r1 = rebase.Load4(mid * 32u + 16u);
+            if (op_kind == 4u && (r1.z & 1u) == 0u) {
+                return false;
+            }
+            uint2 host_va = u64_add(r1.xy, u64_sub(guest, g_start));
+            uint align_mask = (op_kind == 2u) ? 255u : 3u;
+            if ((host_va.x & align_mask) != 0u) {
+                return false;
+            }
+            out_va = host_va;
+            return true;
+        }
+    }
+    return false;
+}
+
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
+    uint eff_count = records;
+    if ((flags & 1u) != 0) {
+        eff_count = min(eff_count, count_buf.Load(count_offset));
+    }
+    uint first = gid.x * 64u;
+    if (first >= eff_count) {
+        return;
+    }
+    bool active = id.x < eff_count;
+    uint src_at = args_offset + id.x * src_stride;
+    uint dst_at = id.x * dst_stride;
+    uint cost = 0;
+    uint asked = 0;
+    uint2 draw_counts = uint2(0, 0);
+    uint3 groups = uint3(0, 0, 0);
+    bool record_valid = true;
+    if (gi == 0) {
+        largest_asked = 0;
+        all_asked = 0;
+    }
+    if (active) {
+        [loop]
+        for (uint oi = 0; oi < op_count; oi++) {
+            uint4 op = ops.Load4(oi * 16u);
+            if (op.x == 0u) {
+                dst_args.Store(dst_at + op.z, src_args.Load(src_at + op.y));
+            } else if (op.x == 1u) {
+                [loop]
+                for (uint w = 0; w < op.w; w++) {
+                    dst_args.Store(dst_at + op.z + w * 4u, src_args.Load(src_at + op.y + w * 4u));
+                }
+            } else {
+                uint2 guest_va = src_args.Load2(src_at + op.y);
+                uint2 host_va;
+                if (!rebase_va(guest_va, op.x, host_va)) {
+                    record_valid = false;
+                }
+                dst_args.Store2(dst_at + op.z, host_va);
+            }
+        }
+        uint exec_src = src_at + src_exec_off;
+        if (!record_valid) {
+            // An unmapped/unaligned root descriptor forces a no-op execution
+            // so the GPU never faults on an invalid VA.
+            cost = 0;
+        } else if (kind <= 1u) {
+            uint2 want = src_args.Load2(exec_src);
+            if (want.x >= MOST_DRAW) {
+                want = uint2(0, 0);
+            }
+            uint count = want.x;
+            uint instances = min(want.y, (1u << 26) / max(count, 1u));
+            cost = count * instances;
+            draw_counts = uint2(count, instances);
+        } else if (kind == 2u) {
+            uint3 raw = src_args.Load3(exec_src);
+            asked = max(raw.x, max(raw.y, raw.z));
+            uint3 g = min(raw, uint3(raw.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64u;
+            groups = g;
+        } else {
+            uint3 g = src_args.Load3(exec_src);
+            if (g.x > 65535u) {
+                g = uint3(0, 0, 0);
+            }
+            asked = g.x;
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+            cost = g.x * g.y * g.z * 128u;
+            groups = g;
+        }
+    }
+    costs[gi] = cost;
+    GroupMemoryBarrierWithGroupSync();
+    if (active && kind >= 2u) {
+        uint was;
+        InterlockedMax(largest_asked, asked, was);
+        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+    }
+    uint n = min(64u, eff_count - first);
+    if (gi == 0) {
+        uint group_cost = 0;
+        for (uint ci = 0; ci < n; ci++) {
+            group_cost |= costs[ci];
+        }
+        if (group_cost == 0) {
+            for (uint k = 0; k < n; k++) {
+                fits[k] = 1u;
+            }
+        } else {
+            uint before;
+            budget.InterlockedOr(0, 0, before);
+            [allow_uav_condition]
+            while (before < BUDGET) {
+                uint next = before;
+                for (uint j = 0; j < n; j++) {
+                    uint c = costs[j];
+                    if (c > 0 && next < BUDGET) {
+                        next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+                    }
+                }
+                if (next == before) break;
+                uint prev;
+                budget.InterlockedCompareExchange(0, before, next, prev);
+                if (prev == before) break;
+                before = prev;
+            }
+            uint at = before;
+            uint refused = 0;
+            uint biggest = 0;
+            for (uint k = 0; k < n; k++) {
+                uint c = costs[k];
+                uint fit = 1;
+                if (c > 0) {
+                    fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                    at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+                    refused += 1 - fit;
+                    biggest = max(biggest, c);
+                }
+                fits[k] = fit;
+            }
+            uint told;
+            if (refused > 0) {
+                budget.InterlockedAdd(12, refused, told);
+            }
+            if (biggest >= (1u << 22)) {
+                budget.InterlockedMax(16, biggest, told);
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && kind >= 2u && all_asked > 0) {
+        uint was;
+        budget.InterlockedMax(4, largest_asked, was);
+        budget.InterlockedAdd(8, all_asked, was);
+    }
+    if (!active) {
+        return;
+    }
+    bool over = !record_valid || fits[gi] == 0;
+    uint exec_src = src_at + src_exec_off;
+    uint exec_dst = dst_at + dst_exec_off;
+    if (kind <= 1u) {
+        if (over) {
+            draw_counts = uint2(0, 0);
+        }
+        dst_args.Store2(exec_dst, draw_counts);
+        uint tail = (kind == 0u) ? 16u : 20u;
+        for (uint off = 8u; off < tail; off += 4u) {
+            dst_args.Store(exec_dst + off, src_args.Load(exec_src + off));
+        }
+    } else {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        dst_args.Store3(exec_dst, groups);
+    }
+}
+"#;
+
+fn repack_clamp() -> Option<&'static Clamp> {
+    static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    CLAMP
+        .get_or_init(|| {
+            let made = host()
+                .ok_or_else(windows::core::Error::empty)
+                .and_then(|h| make_from(&h.device, REPACK_SOURCE));
+            match made {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no multi-argument repack clamp: multi-arg indirect dropped");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Repacks and clamps up to `records` multi-argument console indirect records
+/// into `list`'s indirect scratch buffer according to `plan` and `rebase`.
+/// Leaves the scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
+pub(crate) fn repack(
+    list: &HostList,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    plan: &MultiArgPlan,
+    rebase: &[[u32; 8]],
+    records: u32,
+) -> Option<ID3D12Resource> {
+    if !src.1.is_multiple_of(4) || count.is_some_and(|(_, off)| !off.is_multiple_of(4)) {
+        return None;
+    }
+    let src_bytes = u64::from(plan.src_stride)
+        .checked_mul(u64::from(records))
+        .filter(|&b| b <= u64::from(u32::MAX))?;
+    let dst_bytes = u64::from(plan.dst_stride)
+        .checked_mul(u64::from(records))
+        .filter(|&b| b <= u64::from(u32::MAX))?;
+    let (c, budget, dst) = (repack_clamp()?, list.budget()?, list.indirect_scratch(dst_bytes)?);
+    let ops_bytes = ((plan.ops.len().max(1)) * 16) as u64;
+    let (ops_gpu, ops_ptr) = list.scratch(ops_bytes)?;
+    // SAFETY: `ops_ptr` is freshly allocated mapped upload memory of `ops_bytes`.
+    unsafe {
+        if plan.ops.is_empty() {
+            std::ptr::write_bytes(ops_ptr, 0, 16);
+        } else {
+            std::ptr::copy_nonoverlapping(
+                plan.ops.as_ptr().cast::<u8>(),
+                ops_ptr,
+                plan.ops.len() * 16,
+            );
+        }
+    }
+    let rebase_bytes = ((rebase.len().max(1)) * 32) as u64;
+    let (rebase_gpu, rebase_ptr) = list.scratch(rebase_bytes)?;
+    // SAFETY: `rebase_ptr` is freshly allocated mapped upload memory of `rebase_bytes`.
+    unsafe {
+        if rebase.is_empty() {
+            std::ptr::write_bytes(rebase_ptr, 0, 32);
+        } else {
+            std::ptr::copy_nonoverlapping(
+                rebase.as_ptr().cast::<u8>(),
+                rebase_ptr,
+                rebase.len() * 32,
+            );
+        }
+    }
+    let before = list.indirect_state(&dst);
+    let recorded = record_repack_with(
+        c,
+        &list.list,
+        (&dst, before),
+        budget,
+        src,
+        src_bytes,
+        count,
+        plan,
+        (ops_gpu, plan.ops.len() as u32),
+        (rebase_gpu, rebase.len() as u32),
+        records,
+    );
+    if recorded {
+        list.indirect_readable(&dst);
+        Some(dst)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_repack_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    src_bytes: u64,
+    count: Option<(&ID3D12Resource, u64)>,
+    plan: &MultiArgPlan,
+    (ops_gpu, op_count): (u64, u32),
+    (rebase_gpu, rebase_count): (u64, u32),
+    records: u32,
+) -> bool {
+    if !src_offset.is_multiple_of(4) || count.is_some_and(|(_, off)| !off.is_multiple_of(4)) {
+        return false;
+    }
+    // SAFETY: live D3D12 buffer resources.
+    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    if !src_base.is_multiple_of(4)
+        || !dst_gpu.is_multiple_of(4)
+        || !budget.is_multiple_of(4)
+        || !ops_gpu.is_multiple_of(4)
+        || !rebase_gpu.is_multiple_of(4)
+    {
+        return false;
+    }
+    if records == 0 {
+        if before != D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
+            // SAFETY: an open list and live scratch buffer.
+            unsafe {
+                l.ResourceBarrier(&[transition(
+                    dst,
+                    before,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+            }
+        }
+        return true;
+    }
+    let (src_gpu, args_offset) = match src_offset
+        .checked_add(src_bytes)
+        .filter(|&end| end <= u64::from(u32::MAX))
+    {
+        Some(_) => (src_base, src_offset as u32),
+        None => {
+            let Some(rebased) = src_base.checked_add(src_offset) else {
+                return false;
+            };
+            (rebased, 0)
+        }
+    };
+    let (count_gpu, flags, count_offset) = match count {
+        Some((buf, off)) => {
+            // SAFETY: live buffer.
+            let base = unsafe { buf.GetGPUVirtualAddress() };
+            if !base.is_multiple_of(4) {
+                return false;
+            }
+            match off.checked_add(4).filter(|&end| end <= u64::from(u32::MAX)) {
+                Some(_) => (base, 1u32, off as u32),
+                None => {
+                    let Some(rebased) = base.checked_add(off) else {
+                        return false;
+                    };
+                    (rebased, 1u32, 0u32)
+                }
+            }
+        }
+        None => (src_gpu, 0u32, 0u32),
+    };
+    // `dst_gpu` is a committed D3D12 buffer (64 KiB aligned), so it is always a
+    // valid 256-byte-aligned fallback VA for zeroed invalid records.
+    let constants = [
+        plan.exec_kind,
+        plan.src_stride,
+        plan.dst_stride,
+        records,
+        plan.src_exec_off,
+        plan.dst_exec_off,
+        args_offset,
+        flags,
+        count_offset,
+        op_count,
+        rebase_count,
+        dst_gpu as u32,
+        (dst_gpu >> 32) as u32,
+    ];
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
+    #[cfg(feature = "diagnostics")]
+    let waits = crate::copystat::barrier_test() & 2 == 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let waits = true;
+    let first = [
+        uav_barrier(),
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    ];
+    let second = [
+        uav_barrier(),
+        transition(
+            dst,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        ),
+    ];
+    let skip = usize::from(!waits);
+    // SAFETY: an open list, live resources, matching root signature & pipeline.
+    unsafe {
+        l.ResourceBarrier(&first[skip..]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootShaderResourceView(3, ops_gpu);
+        l.SetComputeRootShaderResourceView(4, rebase_gpu);
+        l.SetComputeRootUnorderedAccessView(5, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(6, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&second[skip..]);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -3445,6 +4373,675 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             }
             let what = if run == 0 { "each clamped on its own".to_owned() } else { format!("a batch every {run}") };
             println!("{EXECUTIONS} indirect dispatches, {what}: {best:.2} ms");
+        }
+    }
+
+    #[test]
+    fn clamp_escape_hatch_and_bypass_validation() {
+        use std::ffi::OsStr;
+        assert!(clamp_enabled_for(None));
+        assert!(clamp_enabled_for(Some(OsStr::new("1"))));
+        assert!(clamp_enabled_for(Some(OsStr::new(""))));
+        assert!(!clamp_enabled_for(Some(OsStr::new("0"))));
+
+        // Native PC single-arg kinds with valid stride & alignment can bypass.
+        assert!(can_bypass_clamp(KIND_DRAW, 16, 0, None));
+        assert!(can_bypass_clamp(KIND_DRAW_INDEXED, 20, 64, Some(128)));
+        assert!(can_bypass_clamp(KIND_DISPATCH, 12, 4, None));
+        assert!(can_bypass_clamp(KIND_DISPATCH_MESH, 12, 0, None));
+        // 1D mesh indirect MUST NOT bypass (requires 1->3 word expansion).
+        assert!(!can_bypass_clamp(KIND_DISPATCH_MESH_1D, 4, 0, None));
+        // Undersized / unaligned layouts cannot bypass.
+        assert!(!can_bypass_clamp(KIND_DRAW, 12, 0, None));
+        assert!(!can_bypass_clamp(KIND_DISPATCH, 12, 2, None));
+        assert!(!can_bypass_clamp(KIND_DISPATCH, 12, 0, Some(6)));
+    }
+
+    #[test]
+    fn translate_signature_maps_constants_descriptors_and_rejects_invalid() {
+        use victory_shader::RootType;
+        use victory_shader::emit::{USER_ROOT_ADDRESS, UserData};
+
+        let vs_user = [
+            // Console slot 1, dwords 2..4 -> host param 0, indices 5..7 (contiguous)
+            UserData { index: 5, slot: 1, root: RootType::Constants, dword: 2 },
+            UserData { index: 6, slot: 1, root: RootType::Constants, dword: 3 },
+            // Console slot 1, dword 0 -> host param 0, index 7 (contiguous dst, non-contiguous src)
+            UserData { index: 7, slot: 1, root: RootType::Constants, dword: 0 },
+            // Console slot 2 root SRV raw guest VA -> host param 0, indices 10..12
+            UserData { index: 10, slot: 2, root: RootType::Other(USER_ROOT_ADDRESS), dword: 0 },
+            UserData { index: 11, slot: 2, root: RootType::Other(USER_ROOT_ADDRESS + 1), dword: 0 },
+        ];
+        let ps_user = [
+            // Pixel stage also reads console slot 1, dword 2 -> host param 3, index 0
+            UserData { index: 0, slot: 1, root: RootType::Constants, dword: 2 },
+        ];
+        let vs_cbvs = [(0u8, 1u32)];
+        let vs_srvs = [(2u8, 2u32)];
+        let ps_uavs = [(3u8, 4u32)];
+        let stages = [
+            StageBinding {
+                user_data_param: Some(0),
+                user_data: &vs_user,
+                root_cbvs: &vs_cbvs,
+                root_srvs: &vs_srvs,
+                root_uavs: &[],
+            },
+            StageBinding {
+                user_data_param: Some(3),
+                user_data: &ps_user,
+                root_cbvs: &[],
+                root_srvs: &[],
+                root_uavs: &ps_uavs,
+            },
+        ];
+
+        // Console record layout:
+        // [0..8)   CBV slot 0
+        // [8..24)  CONSTANT slot 1, dest_offset=0, num=4 (dwords 0,1,2,3; dword 1 is unused!)
+        // [24..32) SRV slot 2
+        // [32..40) UAV slot 3
+        // [40..48) CONSTANT slot 9 (completely unused by shader -> skipped cleanly)
+        // [48..64) DRAW (16 bytes)
+        let args = [
+            [KIND_CBV, 0, 0, 0],
+            [KIND_CONSTANT, 1, 0, 4],
+            [KIND_SRV, 2, 0, 0],
+            [KIND_UAV, 3, 0, 0],
+            [KIND_CONSTANT, 9, 0, 2],
+            [KIND_DRAW, 0, 0, 0],
+        ];
+
+        // With direct root SRVs/UAVs (`bounded_root_srvs = false`): CBV, SRV, UAV all translated.
+        let plan = translate_signature(64, &args, &stages, false).expect("valid multi-arg signature");
+        assert_eq!(plan.exec_kind, KIND_DRAW);
+        assert_eq!(plan.src_exec_off, 48);
+        assert!(plan.needs_rebase);
+        assert!(plan.has_root_args);
+        assert!(!plan.skipped_tabled_views);
+        assert_eq!(
+            plan.host_args,
+            vec![
+                HostIndirectArg::Constant { param: 0, dest_offset: 5, count: 3 },
+                HostIndirectArg::Constant { param: 0, dest_offset: 10, count: 2 },
+                HostIndirectArg::Constant { param: 3, dest_offset: 0, count: 1 },
+                HostIndirectArg::Cbv { param: 1 },
+                HostIndirectArg::Srv { param: 2 },
+                HostIndirectArg::Uav { param: 4 },
+                HostIndirectArg::Exec { kind: KIND_DRAW },
+            ]
+        );
+        // 6 constant dwords (24 bytes) + 3 descriptors (24 bytes) = 48 bytes before DRAW.
+        assert_eq!(plan.dst_exec_off, 48);
+        assert_eq!(plan.dst_stride, 64);
+        assert_eq!(
+            plan.ops,
+            vec![
+                [OP_COPY_DWORDS, 16, 0, 2],  // slot 1 dwords 2..4 -> dst 0..8
+                [OP_COPY_DWORD, 8, 8, 1],    // slot 1 dword 0 -> dst 8..12
+                [OP_COPY_DWORDS, 24, 12, 2], // slot 2 guest VA -> USER_ROOT_ADDRESS dst 12..20
+                [OP_COPY_DWORD, 16, 20, 1],  // PS slot 1 dword 2 -> dst 20..24
+                [OP_REBASE_CBV, 0, 24, 0],   // CBV slot 0 -> dst 24..32
+                [OP_REBASE_SRV, 24, 32, 0],  // SRV slot 2 -> dst 32..40
+                [OP_REBASE_UAV, 32, 40, 0],  // UAV slot 3 -> dst 40..48
+            ]
+        );
+
+        // With `bounded_root_srvs = true`: SRV/UAV are flagged as skipped tabled views,
+        // while CBV, constants, and USER_ROOT_ADDRESS still translate cleanly.
+        let bounded = translate_signature(64, &args, &stages, true).expect("valid bounded plan");
+        assert!(bounded.skipped_tabled_views);
+        assert!(bounded.needs_rebase); // CBV still needs rebase
+        assert_eq!(
+            bounded.host_args,
+            vec![
+                HostIndirectArg::Constant { param: 0, dest_offset: 5, count: 3 },
+                HostIndirectArg::Constant { param: 0, dest_offset: 10, count: 2 },
+                HostIndirectArg::Constant { param: 3, dest_offset: 0, count: 1 },
+                HostIndirectArg::Cbv { param: 1 },
+                HostIndirectArg::Exec { kind: KIND_DRAW },
+            ]
+        );
+
+        // All-unused constants collapse to a root-arg-free signature (pRootSignature = None)
+        // and normalize DISPATCH_SINGLE (105) -> DISPATCH (2).
+        let dead_only = [[KIND_CONSTANT, 9, 0, 2], [KIND_DISPATCH_SINGLE, 0, 0, 0]];
+        let dead_plan = translate_signature(24, &dead_only, &stages, true).expect("dead constants ok");
+        assert_eq!(dead_plan.exec_kind, KIND_DISPATCH);
+        assert!(!dead_plan.has_root_args);
+        assert!(!dead_plan.needs_rebase);
+        assert_eq!(dead_plan.src_exec_off, 8);
+        assert_eq!(dead_plan.dst_exec_off, 0);
+        assert_eq!(dead_plan.dst_stride, 12);
+        assert!(dead_plan.ops.is_empty());
+
+        // Reject undersized stride, unaligned stride, or unsupported arg kind (VB=3).
+        assert!(translate_signature(60, &args, &stages, false).is_none());
+        assert!(translate_signature(66, &args, &stages, false).is_none());
+        assert!(translate_signature(32, &[[3, 0, 0, 0], [KIND_DRAW, 0, 0, 0]], &stages, false).is_none());
+        assert!(translate_signature(16, &[], &stages, false).is_none());
+    }
+
+    #[test]
+    fn build_rebase_table_resolves_nested_overlaps() {
+        // Outer buffer [0x1000, 0x5000) -> host 0xA0000 (read-only),
+        // nested sub-buffer [0x2000, 0x3000) -> host 0xB0000 (writable).
+        let table = build_rebase_table(&[
+            (0x1000, 0x4000, 0xA_0000, false),
+            (0x2000, 0x1000, 0xB_0000, true),
+            (0, 0x1000, 0xC_0000, true), // invalid guest=0 filtered
+        ]);
+        assert_eq!(table.len(), 3);
+        let decode = |e: [u32; 8]| {
+            (
+                u64::from(e[0]) | (u64::from(e[1]) << 32),
+                u64::from(e[2]) | (u64::from(e[3]) << 32),
+                u64::from(e[4]) | (u64::from(e[5]) << 32),
+                e[6] != 0,
+            )
+        };
+        assert_eq!(decode(table[0]), (0x1000, 0x2000, 0xA_0000, false));
+        assert_eq!(decode(table[1]), (0x2000, 0x3000, 0xB_0000, true));
+        assert_eq!(decode(table[2]), (0x3000, 0x5000, 0xA_2000, false));
+    }
+
+    /// Verifies 1D indirect mesh dispatch clamping (`KIND_DISPATCH_MESH_1D = 11`,
+    /// used by `DispatchMeshX`) in both `SOURCE` and `batch::SOURCE`:
+    /// - 1-word records followed by zeros (`y=0, z=0`) or garbage expand to `[x, 1, 1]`
+    /// - `x == 0`, `x == 65536`, and `u32::MAX` zero out to `[0, 0, 0]` at 0 budget cost
+    /// - budget cap is enforced across large mesh dispatches
+    #[test]
+    fn warp_mesh_1d_clamp_valid_garbage_and_budget() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let batch_pass = make_from(&warp.device, batch::SOURCE).expect("batch clamp compiles on WARP");
+        // 5 records spaced 16 bytes apart; words 1..3 hold zeros or garbage that
+        // `KIND_DISPATCH_MESH_1D` must ignore.
+        let inputs: [[u32; 4]; 5] = [
+            [7, 0, 0, 0],                        // valid 1D with trailing zeros -> [7, 1, 1]
+            [65_535, 0xDEAD_BEEF, 0, 0x1234],    // max valid 1D with garbage y/z -> [65535, 1, 1]
+            [0, 1, 1, 0],                        // zero x -> [0, 0, 0]
+            [65_536, 1, 1, 0],                   // over 65535 -> [0, 0, 0]
+            [u32::MAX, u32::MAX, u32::MAX, 0],   // unfilled garbage -> [0, 0, 0]
+        ];
+        let expected: [[u32; 3]; 5] = [
+            [7, 1, 1],
+            [65_535, 1, 1],
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+        ];
+        let (src, src_ptr, src_gpu) = warp.shared_buffer(1024);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(1024);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst = warp.default_uav(4096);
+        // SAFETY: mapped buffers with ample capacity.
+        unsafe {
+            for (i, rec) in inputs.iter().enumerate() {
+                for (w, &v) in rec.iter().enumerate() {
+                    src_ptr.cast::<u32>().add(i * 4 + w).write_volatile(v);
+                }
+            }
+        }
+        // Test 1: single-record clamp (`SOURCE`) with stride=4 per record.
+        for (i, want) in expected.iter().enumerate() {
+            // SAFETY: mapped buffers.
+            unsafe {
+                std::ptr::write_bytes(budget_ptr, 0, 256);
+                std::ptr::write_bytes(back_ptr, 0xAA, 64);
+            }
+            assert!(record_clamp_as(
+                &warp.clamp,
+                &warp.list,
+                (&dst, D3D12_RESOURCE_STATE_COMMON),
+                budget_gpu,
+                (&src, (i * 16) as u64),
+                None,
+                (KIND_DISPATCH_MESH_1D, 4, 1),
+                false,
+            ));
+            // SAFETY: open list, live buffers.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                warp.list.CopyBufferRegion(&back, 0, &dst, 0, 12);
+                warp.list.ResourceBarrier(&[transition(
+                    &dst,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            warp.submit_and_wait();
+            // SAFETY: completed work, mapped buffers.
+            let (out, spent) = unsafe {
+                let r = back_ptr.cast::<u32>();
+                ([r.read_volatile(), r.add(1).read_volatile(), r.add(2).read_volatile()], budget_ptr.cast::<u32>().read_volatile())
+            };
+            assert_eq!(out, *want, "single KIND_DISPATCH_MESH_1D record {i}");
+            assert_eq!(spent, want[0] * 128, "single KIND_DISPATCH_MESH_1D budget {i}");
+        }
+
+        // Test 2: batched clamp (`batch::SOURCE`) with all 5 records + budget exhaustion check.
+        // SAFETY: mapped buffers.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(back_ptr, 0xBB, 512);
+        }
+        batch::record(
+            &batch_pass,
+            &warp.list,
+            (&dst, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            [src_gpu; batch::SOURCES],
+            table_gpu,
+        );
+        // SAFETY: mapped table before submission.
+        let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
+        let places: Vec<u64> = (0..inputs.len())
+            .map(|i| table.place(1, (i * 16) as u64, KIND_DISPATCH_MESH_1D).unwrap())
+            .collect();
+        // SAFETY: open list, live buffers.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, (inputs.len() as u64) * u64::from(batch::SLOT));
+        }
+        warp.submit_and_wait();
+        for (i, (&at, want)) in places.iter().zip(&expected).enumerate() {
+            // SAFETY: completed work, mapped buffer.
+            let out = unsafe {
+                let r = back_ptr.add(at as usize).cast::<u32>();
+                [r.read_volatile(), r.add(1).read_volatile(), r.add(2).read_volatile()]
+            };
+            assert_eq!(out, *want, "batched KIND_DISPATCH_MESH_1D record {i}");
+        }
+        // SAFETY: completed work.
+        let (spent, largest) = unsafe {
+            (budget_ptr.cast::<u32>().read_volatile(), budget_ptr.cast::<u32>().add(1).read_volatile())
+        };
+        assert_eq!(spent, (7 + 65_535) * 128);
+        assert_eq!(largest, 65_535);
+    }
+
+    /// End-to-end WARP GPU execution test of multi-argument `ExecuteIndirect`
+    /// with `D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT` + `DISPATCH`:
+    /// repacks console records containing unused constants + remapped constants
+    /// + dispatch counts (plus a garbage record), executes them on WARP, and
+    /// verifies the compute shader receives the exact indirect root constants
+    /// while preserving statically bound root constants!
+    #[test]
+    fn warp_repack_root_constants_and_execute_indirect() {
+        use victory_shader::RootType;
+        use victory_shader::emit::UserData;
+
+        const CONST_WORKER_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0)"
+cbuffer Params : register(b0) {
+    uint base_slot;
+    uint tag_a;
+    uint tag_b;
+    uint static_magic;
+};
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 gid : SV_GroupID) {
+    uint prev;
+    out_buf.InterlockedAdd(0, 1, prev);
+    uint slot = base_slot + gid.x;
+    out_buf.Store(16 + slot * 16, tag_a);
+    out_buf.Store(16 + slot * 16 + 4, tag_b);
+    out_buf.Store(16 + slot * 16 + 8, static_magic);
+}
+"#;
+
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let repack = make_from(&warp.device, REPACK_SOURCE).expect("REPACK_SOURCE compiles on WARP");
+        let worker = compile_cs(&warp.device, CONST_WORKER_CS).expect("const worker compiles on WARP");
+
+        // Console signature:
+        // [0..16) CONSTANT console_slot=1, dest=0, num=4 (dwords 0,1,2,3; dword 3 unused!)
+        // [16..28) DISPATCH (x, y, z)
+        // Stride = 32 (4 bytes trailing padding)
+        let console_args = [[KIND_CONSTANT, 1, 0, 4], [KIND_DISPATCH, 0, 0, 0]];
+        let user_data = [
+            // dword 0 -> host b0[0] (`base_slot`)
+            UserData { index: 0, slot: 1, root: RootType::Constants, dword: 0 },
+            // dword 1 -> host b0[1] (`tag_a`)
+            UserData { index: 1, slot: 1, root: RootType::Constants, dword: 1 },
+            // dword 2 -> host b0[2] (`tag_b`)
+            UserData { index: 2, slot: 1, root: RootType::Constants, dword: 2 },
+        ];
+        let stages = [StageBinding {
+            user_data_param: Some(0),
+            user_data: &user_data,
+            root_cbvs: &[],
+            root_srvs: &[],
+            root_uavs: &[],
+        }];
+        let plan = translate_signature(32, &console_args, &stages, true).expect("valid plan");
+        assert_eq!(
+            plan.host_args,
+            vec![
+                HostIndirectArg::Constant { param: 0, dest_offset: 0, count: 3 },
+                HostIndirectArg::Exec { kind: KIND_DISPATCH },
+            ]
+        );
+        assert_eq!(plan.dst_stride, 24);
+
+        let sig_args = [
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: 0,
+                        DestOffsetIn32BitValues: 0,
+                        Num32BitValuesToSet: 3,
+                    },
+                },
+            },
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+                ..Default::default()
+            },
+        ];
+        let sig_desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: plan.dst_stride,
+            NumArgumentDescs: sig_args.len() as u32,
+            pArgumentDescs: sig_args.as_ptr(),
+            NodeMask: 0,
+        };
+        let mut sig: Option<ID3D12CommandSignature> = None;
+        // SAFETY: valid command signature against worker's root signature.
+        unsafe {
+            warp.device
+                .CreateCommandSignature(&sig_desc, Some(&worker.root), &mut sig)
+                .unwrap();
+        }
+        let sig = sig.unwrap();
+
+        // 3 records (32 bytes each):
+        // rec 0: base_slot=0, tag_a=0x1111, tag_b=0x2222, unused=0xDEAD, dispatch (2, 1, 1)
+        // rec 1: base_slot=2, tag_a=0x3333, tag_b=0x4444, unused=0xBEEF, dispatch (3, 1, 1)
+        // rec 2: garbage > GROUPS -> clamped to (0, 0, 0) so never runs
+        let records: [[u32; 8]; 3] = [
+            [0, 0x1111, 0x2222, 0xDEAD, 2, 1, 1, 0],
+            [2, 0x3333, 0x4444, 0xBEEF, 3, 1, 1, 0],
+            [5, 0x9999, 0x8888, 0xFFFF, 65_535, 65_535, 1, 0],
+        ];
+        let (src, src_ptr, _) = warp.shared_buffer(256);
+        let (_ops, ops_ptr, ops_gpu) = warp.shared_buffer(256);
+        let (_rebase, rebase_ptr, rebase_gpu) = warp.shared_buffer(256);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_out, out_ptr, out_gpu) = warp.shared_buffer(1024);
+        let dst = warp.default_uav(1024);
+        // SAFETY: mapped buffers with ample capacity.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::write_bytes(out_ptr, 0, 1024);
+            std::ptr::write_bytes(rebase_ptr, 0, 256);
+            for (i, r) in records.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(r.as_ptr().cast::<u8>(), src_ptr.add(i * 32), 32);
+            }
+            std::ptr::copy_nonoverlapping(
+                plan.ops.as_ptr().cast::<u8>(),
+                ops_ptr,
+                plan.ops.len() * 16,
+            );
+        }
+
+        assert!(record_repack_with(
+            &repack,
+            &warp.list,
+            (&dst, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src, 0),
+            96,
+            None,
+            &plan,
+            (ops_gpu, plan.ops.len() as u32),
+            (rebase_gpu, 0),
+            3,
+        ));
+        // Bind static constant index 3 (`static_magic = 0xCAFE_BABE`) before ExecuteIndirect;
+        // ExecuteIndirect must overwrite only 0..3 and preserve index 3!
+        let init_consts = [0u32, 0, 0, 0xCAFE_BABE];
+        // SAFETY: open list, live worker pipeline/root/buffers.
+        unsafe {
+            warp.list.SetComputeRootSignature(&worker.root);
+            warp.list.SetPipelineState(&worker.pso);
+            warp.list
+                .SetComputeRoot32BitConstants(0, 4, init_consts.as_ptr().cast(), 0);
+            warp.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+            warp.list.ExecuteIndirect(&sig, 3, &dst, 0, None, 0);
+        }
+        warp.submit_and_wait();
+
+        // SAFETY: completed GPU work, mapped output buffer.
+        let (total_groups, slots) = unsafe {
+            let r = out_ptr.cast::<u32>();
+            let total = r.read_volatile();
+            let slots: Vec<[u32; 3]> = (0..6)
+                .map(|s| {
+                    let base = 4 + s * 4;
+                    [
+                        r.add(base).read_volatile(),
+                        r.add(base + 1).read_volatile(),
+                        r.add(base + 2).read_volatile(),
+                    ]
+                })
+                .collect();
+            (total, slots)
+        };
+        assert_eq!(total_groups, 5, "only 2+3 valid groups should run (garbage clamped to 0)");
+        assert_eq!(slots[0], [0x1111, 0x2222, 0xCAFE_BABE]);
+        assert_eq!(slots[1], [0x1111, 0x2222, 0xCAFE_BABE]);
+        assert_eq!(slots[2], [0x3333, 0x4444, 0xCAFE_BABE]);
+        assert_eq!(slots[3], [0x3333, 0x4444, 0xCAFE_BABE]);
+        assert_eq!(slots[4], [0x3333, 0x4444, 0xCAFE_BABE]);
+        assert_eq!(slots[5], [0, 0, 0], "garbage record 2 must not execute");
+    }
+
+    /// WARP GPU test for 64-bit guest VA -> host GPU VA rebasing in `REPACK_SOURCE`:
+    /// verifies valid CBV/SRV/UAV VAs rebase across 32-bit boundaries (including
+    /// nested shadow ranges), while unaligned CBVs, read-only UAVs, and unmapped
+    /// VAs fall back safely and zero out the trailing draw counts.
+    #[test]
+    fn warp_repack_root_descriptors_rebase_and_guard() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let repack = make_from(&warp.device, REPACK_SOURCE).expect("REPACK_SOURCE compiles on WARP");
+
+        let stages = [StageBinding {
+            user_data_param: None,
+            user_data: &[],
+            root_cbvs: &[(0, 0)],
+            root_srvs: &[(1, 1)],
+            root_uavs: &[(2, 2)],
+        }];
+        // [0..8) CBV, [8..16) SRV, [16..24) UAV, [24..40) DRAW
+        let console_args = [
+            [KIND_CBV, 0, 0, 0],
+            [KIND_SRV, 1, 0, 0],
+            [KIND_UAV, 2, 0, 0],
+            [KIND_DRAW, 0, 0, 0],
+        ];
+        let plan = translate_signature(40, &console_args, &stages, false).expect("valid plan");
+        assert!(plan.needs_rebase);
+        assert_eq!(plan.dst_exec_off, 24);
+        assert_eq!(plan.dst_stride, 40);
+
+        // Two overlapping ranges above 4 GiB to exercise full 64-bit arithmetic!
+        let rebase = build_rebase_table(&[
+            (0x1_0000_0000, 0x10_0000, 0x2_0000_0000, false), // outer read-only
+            (0x1_0004_0000, 0x01_0000, 0x3_0000_0000, true),  // inner writable
+        ]);
+
+        // 4 records:
+        // 0: valid CBV (256B aligned in outer), valid SRV (4B aligned in outer), valid UAV (in inner writable) -> kept
+        // 1: CBV not 256B aligned (+16) -> invalid, draw zeroed
+        // 2: UAV pointing to read-only outer -> invalid, draw zeroed
+        // 3: unmapped guest VA -> invalid, draw zeroed
+        let mut src_bytes = vec![0u8; 4 * 40];
+        let mut put_rec = |idx: usize, cbv: u64, srv: u64, uav: u64, draw: [u32; 4]| {
+            let b = idx * 40;
+            src_bytes[b..b + 8].copy_from_slice(&cbv.to_le_bytes());
+            src_bytes[b + 8..b + 16].copy_from_slice(&srv.to_le_bytes());
+            src_bytes[b + 16..b + 24].copy_from_slice(&uav.to_le_bytes());
+            for (w, v) in draw.into_iter().enumerate() {
+                src_bytes[b + 24 + w * 4..b + 28 + w * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        put_rec(0, 0x1_0000_0200, 0x1_0000_0104, 0x1_0004_0080, [36, 2, 10, 5]);
+        put_rec(1, 0x1_0000_0010, 0x1_0000_0104, 0x1_0004_0080, [36, 2, 10, 5]);
+        put_rec(2, 0x1_0000_0200, 0x1_0000_0104, 0x1_0000_0080, [36, 2, 10, 5]);
+        put_rec(3, 0x9_9999_0000, 0x1_0000_0104, 0x1_0004_0080, [36, 2, 10, 5]);
+
+        let (src, src_ptr, _) = warp.shared_buffer(512);
+        let (_ops, ops_ptr, ops_gpu) = warp.shared_buffer(256);
+        let (_rebase_buf, rebase_ptr, rebase_gpu) = warp.shared_buffer(256);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(512);
+        let dst = warp.default_uav(1024);
+        // SAFETY: live resource.
+        let dst_gpu = unsafe { dst.GetGPUVirtualAddress() };
+        // SAFETY: mapped buffers with ample capacity.
+        unsafe {
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::copy_nonoverlapping(src_bytes.as_ptr(), src_ptr, src_bytes.len());
+            std::ptr::copy_nonoverlapping(plan.ops.as_ptr().cast::<u8>(), ops_ptr, plan.ops.len() * 16);
+            std::ptr::copy_nonoverlapping(rebase.as_ptr().cast::<u8>(), rebase_ptr, rebase.len() * 32);
+        }
+
+        assert!(record_repack_with(
+            &repack,
+            &warp.list,
+            (&dst, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src, 0),
+            src_bytes.len() as u64,
+            None,
+            &plan,
+            (ops_gpu, plan.ops.len() as u32),
+            (rebase_gpu, rebase.len() as u32),
+            4,
+        ));
+        // SAFETY: open list, live buffers.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, src_bytes.len() as u64);
+        }
+        warp.submit_and_wait();
+
+        let read_rec = |idx: usize| -> (u64, u64, u64, [u32; 4]) {
+            // SAFETY: completed work, mapped buffer.
+            let slice = unsafe { std::slice::from_raw_parts(back_ptr.add(idx * 40).cast_const(), 40) };
+            let u64_at = |o: usize| u64::from_le_bytes(slice[o..o + 8].try_into().unwrap());
+            let u32_at = |o: usize| u32::from_le_bytes(slice[o..o + 4].try_into().unwrap());
+            (
+                u64_at(0),
+                u64_at(8),
+                u64_at(16),
+                [u32_at(24), u32_at(28), u32_at(32), u32_at(36)],
+            )
+        };
+
+        assert_eq!(
+            read_rec(0),
+            (0x2_0000_0200, 0x2_0000_0104, 0x3_0000_0080, [36, 2, 10, 5]),
+            "valid 64-bit guest VAs must rebase cleanly"
+        );
+        // Invalid records must zero draw counts and substitute valid fallback GPU VA.
+        let r1 = read_rec(1);
+        assert_eq!(r1.0, dst_gpu, "unaligned CBV must use fallback VA");
+        assert_eq!(r1.3, [0, 0, 10, 5], "unaligned CBV must zero draw");
+
+        let r2 = read_rec(2);
+        assert_eq!(r2.2, dst_gpu, "read-only UAV must use fallback VA");
+        assert_eq!(r2.3, [0, 0, 10, 5], "read-only UAV must zero draw");
+
+        let r3 = read_rec(3);
+        assert_eq!(r3.0, dst_gpu, "unmapped CBV must use fallback VA");
+        assert_eq!(r3.3, [0, 0, 10, 5], "unmapped CBV must zero draw");
+
+        // Only record 0 charged the budget (36 * 2 = 72).
+        // SAFETY: completed work.
+        let spent = unsafe { budget_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(spent, 72);
+    }
+
+    /// Verifies the zero-cost group fast path (skipping global budget atomics)
+    /// and early group exit past `count` in both `SOURCE` and `batch::SOURCE`.
+    #[test]
+    fn warp_zero_cost_and_empty_tail_groups_leave_budget_untouched() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let batch_pass = make_from(&warp.device, batch::SOURCE).expect("batch clamp compiles on WARP");
+        let (_src, src_ptr, src_gpu) = warp.shared_buffer(4096);
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (back, back_ptr, _) = warp.shared_buffer(4096);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+        let dst = warp.default_uav(8192);
+        // SAFETY: mapped buffers.
+        unsafe {
+            // 4 zero-vertex draws -> cost 0 each (group_cost == 0); tail groups 1..3 exit early.
+            std::ptr::write_bytes(src_ptr, 0, 4096);
+            for i in 0..4usize {
+                src_ptr.cast::<u32>().add(i * 4 + 2).write_volatile(100 + i as u32);
+            }
+            // Pre-seed budget word 0 to a known value; zero-cost group must not alter it.
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            budget_ptr.cast::<u32>().write_volatile(1234);
+        }
+        batch::record(
+            &batch_pass,
+            &warp.list,
+            (&dst, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            [src_gpu; batch::SOURCES],
+            table_gpu,
+        );
+        // SAFETY: mapped table.
+        let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
+        for i in 0..4u64 {
+            assert!(table.place(1, i * 16, KIND_DRAW).is_some());
+        }
+        // SAFETY: open list.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, 4 * u64::from(batch::SLOT));
+        }
+        warp.submit_and_wait();
+        // SAFETY: completed work.
+        let spent = unsafe { budget_ptr.cast::<u32>().read_volatile() };
+        assert_eq!(spent, 1234, "zero-cost batch group must not modify budget");
+        for i in 0..4usize {
+            // SAFETY: completed work.
+            let rec = unsafe {
+                let r = back_ptr.add(i * batch::SLOT as usize).cast::<u32>();
+                [r.read_volatile(), r.add(1).read_volatile(), r.add(2).read_volatile()]
+            };
+            assert_eq!(rec, [0, 0, 100 + i as u32]);
         }
     }
 }

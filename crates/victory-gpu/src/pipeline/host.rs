@@ -5,8 +5,9 @@
 //! user data, root views for the title's root views, static samplers for
 //! the immediate samplers, and directly indexed heaps.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -247,28 +248,88 @@ impl GraphicsState {
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
-        let inputs: Vec<String> = self
-            .inputs
-            .iter()
-            .zip(&self.names)
-            .map(|(e, name)| {
-                format!(
-                    "{name:?} {} {} {} {} {} {}",
-                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
-                )
-            })
-            .collect();
+        let mut out = String::new();
+        let _ = self.describe_into(&mut out);
+        out
+    }
+
+    /// Writes the exact same bytes as [`Self::describe`] into `out` without
+    /// allocating a `Vec<String>` for input elements.
+    pub(crate) fn describe_into(&self, out: &mut impl std::fmt::Write) -> std::fmt::Result {
+        struct StackBuf {
+            buf: [u8; 128],
+            len: usize,
+            overflow: Option<String>,
+        }
+        impl StackBuf {
+            fn new() -> Self {
+                Self {
+                    buf: [0; 128],
+                    len: 0,
+                    overflow: None,
+                }
+            }
+            fn as_str(&self) -> &str {
+                match &self.overflow {
+                    Some(s) => s.as_str(),
+                    // SAFETY: only valid UTF-8 from `fmt::Write::write_str` is written.
+                    None => unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) },
+                }
+            }
+        }
+        impl std::fmt::Write for StackBuf {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                if let Some(overflow) = &mut self.overflow {
+                    overflow.push_str(s);
+                    return Ok(());
+                }
+                let bytes = s.as_bytes();
+                if self.len + bytes.len() <= self.buf.len() {
+                    self.buf[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+                    self.len += bytes.len();
+                } else {
+                    let mut out = String::with_capacity(self.len + bytes.len());
+                    // SAFETY: only valid UTF-8 was written into `self.buf[..self.len]`.
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len]) });
+                    out.push_str(s);
+                    self.overflow = Some(out);
+                }
+                Ok(())
+            }
+        }
+
         let bounds = if self.depth_bounds {
             " depth-bounds"
         } else {
             ""
         };
-        format!(
-            "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
-            self.sample_mask,
-            self.rasterizer,
-            self.depth,
+        write!(
+            out,
+            "{:?} {} {:?} {:?}{bounds} [",
+            self.blend, self.sample_mask, self.rasterizer, self.depth,
+        )?;
+        for (i, (e, name)) in self.inputs.iter().zip(&self.names).enumerate() {
+            if i > 0 {
+                out.write_str(", ")?;
+            }
+            let mut elem = StackBuf::new();
+            std::fmt::Write::write_fmt(
+                &mut elem,
+                format_args!(
+                    "{name:?} {} {} {} {} {} {}",
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
+                ),
+            )?;
+            write!(out, "{:?}", elem.as_str())?;
+        }
+        write!(
+            out,
+            "] {} {} {:?} {} {:?}",
             self.strip_cut.0,
             self.topology.0,
             self.targets,
@@ -400,6 +461,25 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
+/// Cached `D3D12_FEATURE_D3D12_OPTIONS19::AnisoFilterWithPointMipSupported`.
+fn aniso_point_mip_supported(device: &ID3D12Device) -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        // Older runtimes may not recognize OPTIONS19; that means no support.
+        unsafe {
+            device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool()
+    })
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -454,18 +534,7 @@ impl HostPipeline {
         }
         let host = host()?;
 
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
-        // SAFETY: the feature query writes the structure of the given size.
-        // Older runtimes may not recognize OPTIONS19; that means no support.
-        let aniso_point_mip_supported = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS19,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        }
-        .is_ok()
-            && options.AnisoFilterWithPointMipSupported.as_bool();
+        let aniso_point_mip_supported = aniso_point_mip_supported(&host.device);
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -609,13 +678,14 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            let cs = code(0);
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-                CS: code(0),
+                CS: cs,
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[code_bytes(&cs)], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -670,13 +740,15 @@ impl HostPipeline {
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
             // looked up again.
+            let ms = code(0);
+            let ps = code(1);
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[code_bytes(&ms), code_bytes(&ps)],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
+            let pso = match mesh_pipeline(&host.device, &root, ms, ps, g, depth_bounds, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -713,11 +785,13 @@ impl HostPipeline {
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
         }
+        let vs = code(0);
+        let ps = code(1);
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-            VS: code(0),
-            PS: code(1),
+            VS: vs,
+            PS: ps,
             GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
                 D3D12_SHADER_BYTECODE {
                     pShaderBytecode: gs.as_ptr().cast(),
@@ -751,13 +825,13 @@ impl HostPipeline {
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[code_bytes(&vs), code_bytes(&ps), &gs[..]],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[code_bytes(&vs), code_bytes(&ps)],
                 &state,
             ),
         };
@@ -813,32 +887,39 @@ impl HostPipeline {
             inputs: g.elements(),
             rects: rect_gs.is_some(),
             state: {
-                let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
-                let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
+                    let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
+                        format!(
+                            "fail {} depth-fail {} pass {} func {}",
+                            f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                        )
+                    };
+                    let bounds = if depth_bounds { " bounds true" } else { "" };
                     format!(
-                        "fail {} depth-fail {} pass {} func {}",
-                        f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0
+                        "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
+                        d.DepthEnable.as_bool(),
+                        d.DepthWriteMask.0,
+                        d.DepthFunc.0,
+                        d.StencilEnable.as_bool(),
+                        d.StencilReadMask,
+                        d.StencilWriteMask,
+                        face(&d.FrontFace),
+                        face(&d.BackFace),
+                        r.CullMode.0,
+                        r.FrontCounterClockwise.as_bool(),
+                        b.BlendEnable.as_bool(),
+                        b.SrcBlend.0,
+                        b.DestBlend.0,
+                        b.BlendOp.0,
+                        b.RenderTargetWriteMask
                     )
-                };
-                let bounds = if depth_bounds { " bounds true" } else { "" };
-                format!(
-                    "depth {} write {} func {}{bounds}; stencil {} read {:#x} write {:#x} front [{}] back [{}]; cull {} front-ccw {}; blend {} src {} dst {} op {} mask {:#x}",
-                    d.DepthEnable.as_bool(),
-                    d.DepthWriteMask.0,
-                    d.DepthFunc.0,
-                    d.StencilEnable.as_bool(),
-                    d.StencilReadMask,
-                    d.StencilWriteMask,
-                    face(&d.FrontFace),
-                    face(&d.BackFace),
-                    r.CullMode.0,
-                    r.FrontCounterClockwise.as_bool(),
-                    b.BlendEnable.as_bool(),
-                    b.SrcBlend.0,
-                    b.DestBlend.0,
-                    b.BlendOp.0,
-                    b.RenderTargetWriteMask
-                )
+                }
+                #[cfg(not(feature = "diagnostics"))]
+                {
+                    String::new()
+                }
             },
         })
     }
@@ -1009,12 +1090,107 @@ fn mesh_pipeline(
 }
 
 /// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
+fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> &[u8] {
+    if code.pShaderBytecode.is_null() || code.BytecodeLength == 0 {
+        return &[];
     }
     // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }
+}
+
+/// Whether identical root signatures are deduplicated in memory. On by default;
+/// `VICTORY_ROOT_SIG_CACHE=0` creates a fresh root signature per pipeline.
+fn root_sig_cache_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SIG_CACHE").is_none_or(|v| v != "0"))
+}
+
+#[derive(Clone)]
+struct CachedRootSignature {
+    root: ID3D12RootSignature,
+    blob: Arc<[u8]>,
+}
+
+// SAFETY: D3D12 root signatures are immutable and free-threaded.
+unsafe impl Send for CachedRootSignature {}
+// SAFETY: as above.
+unsafe impl Sync for CachedRootSignature {}
+
+fn root_sig_cache() -> &'static RwLock<HashMap<(usize, [u8; 32]), CachedRootSignature>> {
+    static CACHE: OnceLock<RwLock<HashMap<(usize, [u8; 32]), CachedRootSignature>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn root_signature_hash(
+    params: &[D3D12_ROOT_PARAMETER1],
+    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    compute: bool,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&[u8::from(compute)]);
+    h.update(&(params.len() as u64).to_le_bytes());
+    for p in params {
+        h.update(&p.ParameterType.0.to_le_bytes());
+        h.update(&p.ShaderVisibility.0.to_le_bytes());
+        match p.ParameterType {
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
+                // SAFETY: `ParameterType` selects `DescriptorTable`.
+                let table = unsafe { p.Anonymous.DescriptorTable };
+                h.update(&table.NumDescriptorRanges.to_le_bytes());
+                if table.NumDescriptorRanges > 0 && !table.pDescriptorRanges.is_null() {
+                    // SAFETY: `table` points to `NumDescriptorRanges` live ranges.
+                    let ranges = unsafe {
+                        std::slice::from_raw_parts(
+                            table.pDescriptorRanges,
+                            table.NumDescriptorRanges as usize,
+                        )
+                    };
+                    for r in ranges {
+                        h.update(&r.RangeType.0.to_le_bytes());
+                        h.update(&r.NumDescriptors.to_le_bytes());
+                        h.update(&r.BaseShaderRegister.to_le_bytes());
+                        h.update(&r.RegisterSpace.to_le_bytes());
+                        h.update(&r.Flags.0.to_le_bytes());
+                        h.update(&r.OffsetInDescriptorsFromTableStart.to_le_bytes());
+                    }
+                }
+            }
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => {
+                // SAFETY: `ParameterType` selects `Constants`.
+                let c = unsafe { p.Anonymous.Constants };
+                h.update(&c.ShaderRegister.to_le_bytes());
+                h.update(&c.RegisterSpace.to_le_bytes());
+                h.update(&c.Num32BitValues.to_le_bytes());
+            }
+            D3D12_ROOT_PARAMETER_TYPE_CBV
+            | D3D12_ROOT_PARAMETER_TYPE_SRV
+            | D3D12_ROOT_PARAMETER_TYPE_UAV => {
+                // SAFETY: `ParameterType` selects `Descriptor`.
+                let d = unsafe { p.Anonymous.Descriptor };
+                h.update(&d.ShaderRegister.to_le_bytes());
+                h.update(&d.RegisterSpace.to_le_bytes());
+                h.update(&d.Flags.0.to_le_bytes());
+            }
+            _ => {}
+        }
+    }
+    h.update(&(samplers.len() as u64).to_le_bytes());
+    for s in samplers {
+        h.update(&s.Filter.0.to_le_bytes());
+        h.update(&s.AddressU.0.to_le_bytes());
+        h.update(&s.AddressV.0.to_le_bytes());
+        h.update(&s.AddressW.0.to_le_bytes());
+        h.update(&s.MipLODBias.to_bits().to_le_bytes());
+        h.update(&s.MaxAnisotropy.to_le_bytes());
+        h.update(&s.ComparisonFunc.0.to_le_bytes());
+        h.update(&s.BorderColor.0.to_le_bytes());
+        h.update(&s.MinLOD.to_bits().to_le_bytes());
+        h.update(&s.MaxLOD.to_bits().to_le_bytes());
+        h.update(&s.ShaderRegister.to_le_bytes());
+        h.update(&s.RegisterSpace.to_le_bytes());
+        h.update(&s.ShaderVisibility.0.to_le_bytes());
+    }
+    *h.finalize().as_bytes()
 }
 
 fn root_signature(
@@ -1022,7 +1198,24 @@ fn root_signature(
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> windows::core::Result<(ID3D12RootSignature, Arc<[u8]>)> {
+    let cache_key = if root_sig_cache_on() {
+        use windows::core::Interface;
+        let key = (
+            device.as_raw() as usize,
+            root_signature_hash(params, samplers, compute),
+        );
+        if let Some(hit) = root_sig_cache()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok((hit.root.clone(), hit.blob.clone()));
+        }
+        Some(key)
+    } else {
+        None
+    };
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -1044,7 +1237,7 @@ fn root_signature(
     };
     // SAFETY: the description points at live arrays; the blob is read in
     // full before it is released.
-    unsafe {
+    let (root, blob) = unsafe {
         let mut blob: Option<ID3DBlob> = None;
         let mut error: Option<ID3DBlob> = None;
         if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
@@ -1060,8 +1253,20 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        (
+            device.CreateRootSignature::<ID3D12RootSignature>(0, bytes)?,
+            Arc::<[u8]>::from(bytes),
+        )
+    };
+    if let Some(key) = cache_key {
+        let mut cache = root_sig_cache().write().unwrap_or_else(|e| e.into_inner());
+        let entry = cache.entry(key).or_insert_with(|| CachedRootSignature {
+            root: root.clone(),
+            blob: blob.clone(),
+        });
+        return Ok((entry.root.clone(), entry.blob.clone()));
     }
+    Ok((root, blob))
 }
 
 #[cfg(test)]
@@ -1520,5 +1725,218 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    /// Reference implementation of the original `GraphicsState::describe`
+    /// format to verify zero-alloc `describe_into` stays bit-for-bit identical.
+    fn reference_describe(g: &GraphicsState) -> String {
+        let inputs: Vec<String> = g
+            .inputs
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| {
+                format!(
+                    "{name:?} {} {} {} {} {} {}",
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
+                )
+            })
+            .collect();
+        let bounds = if g.depth_bounds { " depth-bounds" } else { "" };
+        format!(
+            "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
+            g.blend,
+            g.sample_mask,
+            g.rasterizer,
+            g.depth,
+            g.strip_cut.0,
+            g.topology.0,
+            g.targets,
+            g.depth_format.0,
+            g.samples
+        )
+    }
+
+    #[test]
+    fn describe_into_matches_describe_bit_for_bit() {
+        struct HashWriter<'a>(&'a mut blake3::Hasher);
+        impl std::fmt::Write for HashWriter<'_> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0.update(s.as_bytes());
+                Ok(())
+            }
+        }
+
+        let make_state = |depth_bounds: bool, names: &[&str]| {
+            let mut g = GraphicsState {
+                sample_mask: 0x1234_5678,
+                depth_bounds,
+                ..Default::default()
+            };
+            g.targets.NumRenderTargets = 2;
+            g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            g.depth_format = DXGI_FORMAT_D32_FLOAT;
+            g.names = names.iter().map(|n| CString::new(*n).unwrap()).collect();
+            g.inputs = g
+                .names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| D3D12_INPUT_ELEMENT_DESC {
+                    SemanticName: PCSTR(name.as_ptr().cast()),
+                    SemanticIndex: i as u32,
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    InputSlot: (i % 4) as u32,
+                    AlignedByteOffset: if i == 0 { 0 } else { D3D12_APPEND_ALIGNED_ELEMENT },
+                    InputSlotClass: if i % 2 == 0 {
+                        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+                    } else {
+                        D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                    },
+                    InstanceDataStepRate: i as u32,
+                })
+                .collect();
+            g
+        };
+
+        let long_name = "SEMANTIC_".repeat(20);
+        let cases = [
+            GraphicsState::default(),
+            make_state(false, &[]),
+            make_state(true, &["POSITION", "NORMAL", "TEXCOORD"]),
+            make_state(true, &["A\"B\\C'D\tE", long_name.as_str()]),
+        ];
+        for g in &cases {
+            let expected = reference_describe(g);
+            assert_eq!(g.describe(), expected);
+            let mut h = blake3::Hasher::new();
+            g.describe_into(&mut HashWriter(&mut h)).unwrap();
+            assert_eq!(h.finalize(), blake3::hash(expected.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn root_signature_hash_sensitivity() {
+        let range1 = Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 2,
+            RegisterSpace: ROOT_CBV_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        });
+        let range1_copy = Box::new(*range1);
+        let range2 = Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            BaseShaderRegister: 3,
+            ..*range1
+        });
+
+        let table_param = |r: &D3D12_DESCRIPTOR_RANGE1| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: r,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+        let const_param = |n: u32| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: n,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_VERTEX,
+        };
+        let sampler = |reg: u32, bias: f32| D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MipLODBias: bias,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            BorderColor: D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK,
+            MinLOD: 0.0,
+            MaxLOD: f32::MAX,
+            ShaderRegister: reg,
+            RegisterSpace: SAMPLER_SPACE,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        };
+
+        let base_params = [const_param(4), table_param(&range1)];
+        let same_params = [const_param(4), table_param(&range1_copy)];
+        let diff_const = [const_param(8), table_param(&range1)];
+        let diff_range = [const_param(4), table_param(&range2)];
+        let base_samplers = [sampler(0, 0.0)];
+        let diff_sampler = [sampler(0, 0.5)];
+
+        let h_base = root_signature_hash(&base_params, &base_samplers, false);
+        // Equal contents at different heap addresses must hash identically.
+        assert_eq!(h_base, root_signature_hash(&same_params, &base_samplers, false));
+        // Every semantic change must alter the hash.
+        assert_ne!(h_base, root_signature_hash(&base_params, &base_samplers, true));
+        assert_ne!(h_base, root_signature_hash(&diff_const, &base_samplers, false));
+        assert_ne!(h_base, root_signature_hash(&diff_range, &base_samplers, false));
+        assert_ne!(h_base, root_signature_hash(&base_params, &diff_sampler, false));
+        assert_ne!(h_base, root_signature_hash(&base_params, &[], false));
+    }
+
+    #[test]
+    fn root_signature_cache_hits_return_same_root_and_blob() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let range = Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 0,
+            RegisterSpace: ROOT_CBV_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        });
+        let params = [
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: USER_DATA_SPACE,
+                        Num32BitValues: 4,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &*range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let (root_a, blob_a) = root_signature(&host.device, &params, &[], true).unwrap();
+        let (root_b, blob_b) = root_signature(&host.device, &params, &[], true).unwrap();
+        assert_eq!(&*blob_a, &*blob_b);
+        if root_sig_cache_on() {
+            assert_eq!(root_a.as_raw(), root_b.as_raw());
+            assert!(Arc::ptr_eq(&blob_a, &blob_b));
+        }
+        let (root_c, blob_c) = root_signature(&host.device, &params, &[], false).unwrap();
+        assert_ne!(root_a.as_raw(), root_c.as_raw());
+        assert_ne!(&*blob_a, &*blob_c);
     }
 }

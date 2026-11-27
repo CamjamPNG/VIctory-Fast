@@ -196,7 +196,9 @@ fn exports_from_module(module: HMODULE, image: Option<LoadedImage>) -> RealExpor
 }
 
 extern "system" fn ctor(this: *mut c_void, device: *mut c_void, flag: u8) -> *mut c_void {
-    if let Some(real) = real_exports().and_then(|r| r.ctor) {
+    if !this.is_null()
+        && let Some(real) = real_exports().and_then(|r| r.ctor)
+    {
         // SAFETY: forwarded to real `XboxBvhBuilder::XboxBvhBuilder`.
         return unsafe { real(this, device, flag) };
     }
@@ -204,9 +206,28 @@ extern "system" fn ctor(this: *mut c_void, device: *mut c_void, flag: u8) -> *mu
 }
 
 extern "system" fn dtor(this: *mut c_void) {
-    if let Some(real) = real_exports().and_then(|r| r.dtor) {
+    if !this.is_null()
+        && let Some(real) = real_exports().and_then(|r| r.dtor)
+    {
         // SAFETY: forwarded to real `XboxBvhBuilder::~XboxBvhBuilder`.
         unsafe { real(this) };
+    }
+}
+
+fn dispatch_build_batched_2x(
+    suppress: bool,
+    real: Option<FnBuildBatched2X>,
+    this: *mut c_void,
+    cmd_list: *const c_void,
+    num_descs: u32,
+    descs: *const GuestBatchedDesc2,
+) {
+    if !suppress
+        && !this.is_null()
+        && let Some(real) = real
+    {
+        // SAFETY: forwarded to real `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X`.
+        unsafe { real(this, cmd_list, num_descs, descs) };
     }
 }
 
@@ -216,14 +237,34 @@ extern "system" fn build_batched_2x(
     num_descs: u32,
     descs: *const GuestBatchedDesc2,
 ) {
-    if !dxr::suppress_builder()
-        && let Some(real) = real_exports().and_then(|r| r.build_batched_2x)
-    {
-        // SAFETY: forwarded to real `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X`.
-        unsafe { real(this, cmd_list, num_descs, descs) };
-    }
+    dispatch_build_batched_2x(
+        dxr::suppress_builder(),
+        real_exports().and_then(|r| r.build_batched_2x),
+        this,
+        cmd_list,
+        num_descs,
+        descs,
+    );
     if dxr::enabled() {
         dxr::enqueue_build_batched(cmd_list, num_descs, descs);
+    }
+}
+
+fn dispatch_copy_as(
+    suppress: bool,
+    real: Option<FnCopy>,
+    this: *mut c_void,
+    cmd_list: *const c_void,
+    dest_va: u64,
+    src_va: u64,
+    mode: u32,
+) {
+    if !suppress
+        && !this.is_null()
+        && let Some(real) = real
+    {
+        // SAFETY: forwarded to real `XboxBvhBuilder::CopyRaytracingAccelerationStructure`.
+        unsafe { real(this, cmd_list, dest_va, src_va, mode) };
     }
 }
 
@@ -234,14 +275,67 @@ extern "system" fn copy_as(
     src_va: u64,
     mode: u32,
 ) {
-    if !dxr::suppress_builder()
-        && let Some(real) = real_exports().and_then(|r| r.copy)
-    {
-        // SAFETY: forwarded to real `XboxBvhBuilder::CopyRaytracingAccelerationStructure`.
-        unsafe { real(this, cmd_list, dest_va, src_va, mode) };
-    }
+    dispatch_copy_as(
+        dxr::suppress_builder(),
+        real_exports().and_then(|r| r.copy),
+        this,
+        cmd_list,
+        dest_va,
+        src_va,
+        mode,
+    );
     if dxr::enabled() {
         dxr::enqueue_copy(cmd_list, dest_va, src_va, mode);
+    }
+}
+
+fn dispatch_prebuild_info<F>(
+    suppress: bool,
+    real: Option<FnPrebuild>,
+    host_query: F,
+    this: *mut c_void,
+    inputs: *const GuestBuildAsInputs,
+    stream_desc: *const GuestStreamDesc,
+    out_info: *mut GuestPrebuildInfo,
+) where
+    F: Fn(&GuestBuildAsInputs, Option<&GuestStreamDesc>) -> Option<GuestPrebuildInfo>,
+{
+    if out_info.is_null() {
+        return;
+    }
+    // SAFETY: caller passes optional non-null stream descriptor.
+    let stream_opt = (!stream_desc.is_null()).then(|| unsafe { *stream_desc });
+    if suppress && !inputs.is_null() {
+        // SAFETY: caller passes valid input pointer.
+        let guest_inputs = unsafe { *inputs };
+        if let Some(info) = host_query(&guest_inputs, stream_opt.as_ref()) {
+            // SAFETY: non-null output pointer.
+            unsafe { out_info.write(info) };
+            return;
+        }
+        // When `host_query` returns `None` (e.g. non-empty `stream_desc` for
+        // packed static BVH4 rehydration), fall through to real `XboxBvhBuilder.dll`
+        // so unpacked console BVH4 buffers receive exact rehydration sizes.
+    }
+    if !this.is_null()
+        && let Some(real) = real
+    {
+        // SAFETY: forwarded to real `XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo`.
+        unsafe { real(this, inputs, stream_desc, out_info) };
+    } else if !inputs.is_null() {
+        // SAFETY: caller passes valid input pointer.
+        let guest_inputs = unsafe { *inputs };
+        let info = if suppress {
+            dxr::fallback_prebuild_info(&guest_inputs, stream_opt.as_ref())
+        } else {
+            host_query(&guest_inputs, stream_opt.as_ref())
+                .unwrap_or_else(|| dxr::fallback_prebuild_info(&guest_inputs, stream_opt.as_ref()))
+        };
+        // SAFETY: non-null output pointer.
+        unsafe { out_info.write(info) };
+    } else {
+        // SAFETY: non-null output pointer; zero-initialize on null inputs.
+        unsafe { out_info.write(GuestPrebuildInfo::default()) };
     }
 }
 
@@ -251,26 +345,15 @@ extern "system" fn get_prebuild_info(
     stream_desc: *const GuestStreamDesc,
     out_info: *mut GuestPrebuildInfo,
 ) {
-    if dxr::suppress_builder() && !inputs.is_null() && !out_info.is_null() {
-        // SAFETY: caller passes valid input and output pointers.
-        let guest_inputs = unsafe { *inputs };
-        if let Some(info) = dxr::prebuild_info(&guest_inputs) {
-            // SAFETY: non-null output pointer.
-            unsafe { out_info.write(info) };
-            return;
-        }
-    }
-    if let Some(real) = real_exports().and_then(|r| r.prebuild) {
-        // SAFETY: forwarded to real `XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo`.
-        unsafe { real(this, inputs, stream_desc, out_info) };
-    } else if !inputs.is_null() && !out_info.is_null() {
-        // SAFETY: caller passes valid input and output pointers.
-        let guest_inputs = unsafe { *inputs };
-        if let Some(info) = dxr::prebuild_info(&guest_inputs) {
-            // SAFETY: non-null output pointer.
-            unsafe { out_info.write(info) };
-        }
-    }
+    dispatch_prebuild_info(
+        dxr::suppress_builder(),
+        real_exports().and_then(|r| r.prebuild),
+        dxr::prebuild_info_with_stream,
+        this,
+        inputs,
+        stream_desc,
+        out_info,
+    );
 }
 
 extern "system" fn rehydrate_batched_2x(
@@ -280,9 +363,13 @@ extern "system" fn rehydrate_batched_2x(
     descs: *const GuestBuildAsDesc,
     sizes: *const u64,
 ) -> i32 {
-    // Always run the real console rehydrator so packed static BVH4s are unpacked
-    // into `memory.rs` before our GPU triangle extractor reads them.
-    let hr = if let Some(real) = real_exports().and_then(|r| r.rehydrate_batched_2x) {
+    // Always forward to the real console rehydrator when present: `memory.rs`
+    // uploads packed BVH4 pages to GPU arenas, while `XboxBvhBuilder.dll` runs
+    // the GPU compute passes that unpack them in place before `dxr.rs` extracts
+    // triangles.
+    let hr = if !this.is_null()
+        && let Some(real) = real_exports().and_then(|r| r.rehydrate_batched_2x)
+    {
         // SAFETY: forwarded to real `XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X`.
         unsafe { real(this, cmd_list, num_descs, descs, sizes) }
     } else {
@@ -295,7 +382,9 @@ extern "system" fn rehydrate_batched_2x(
 }
 
 extern "system" fn set_64bit_morton_codes(this: *mut c_void, enable: u8) {
-    if let Some(real) = real_exports().and_then(|r| r.set_64bit_morton) {
+    if !this.is_null()
+        && let Some(real) = real_exports().and_then(|r| r.set_64bit_morton)
+    {
         // SAFETY: forwarded to real `XboxBvhBuilder::Set64BitMortonCodes`.
         unsafe { real(this, enable) };
     }
@@ -335,5 +424,203 @@ pub(crate) fn module() -> HleModule {
                 address: set_64bit_morton_codes as *const () as usize,
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    static MOCK_BUILD_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MOCK_COPY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static MOCK_PREBUILD_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn mock_build(
+        _this: *mut c_void,
+        _cmd: *const c_void,
+        _num: u32,
+        _descs: *const GuestBatchedDesc2,
+    ) {
+        MOCK_BUILD_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn mock_copy(
+        _this: *mut c_void,
+        _cmd: *const c_void,
+        _dst: u64,
+        _src: u64,
+        _mode: u32,
+    ) {
+        MOCK_COPY_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe extern "system" fn mock_prebuild(
+        _this: *mut c_void,
+        _inputs: *const GuestBuildAsInputs,
+        _stream: *const GuestStreamDesc,
+        out_info: *mut GuestPrebuildInfo,
+    ) {
+        MOCK_PREBUILD_CALLS.fetch_add(1, Ordering::Relaxed);
+        if !out_info.is_null() {
+            // SAFETY: non-null test output pointer.
+            unsafe {
+                out_info.write(GuestPrebuildInfo {
+                    result_data_max_size_in_bytes: 0x2000,
+                    scratch_data_size_in_bytes: 0x1000,
+                    update_scratch_data_size_in_bytes: 0x400,
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn module_exports_all_seven_bvh_builder_symbols() {
+        let m = module();
+        assert_eq!(m.name, "bvh_builder");
+        assert_eq!(m.dlls, &["xboxbvhbuilder.dll"]);
+        assert_eq!(m.exports.len(), 7);
+        let expected = [
+            SYM_CTOR,
+            SYM_DTOR,
+            SYM_BUILD_BATCHED_2X,
+            SYM_COPY,
+            SYM_PREBUILD,
+            SYM_REHYDRATE_BATCHED_2X,
+            SYM_SET_64BIT_MORTON,
+        ];
+        for (exp, sym) in m.exports.iter().zip(expected) {
+            assert_eq!(exp.name, sym);
+            assert_ne!(exp.address, 0);
+        }
+    }
+
+    #[test]
+    fn exports_behave_cleanly_without_real_dll() {
+        let mut dummy = 0u64;
+        let this = (&mut dummy as *mut u64).cast::<c_void>();
+
+        assert_eq!(ctor(this, std::ptr::null_mut(), 1), this);
+        assert_eq!(ctor(std::ptr::null_mut(), std::ptr::null_mut(), 0), std::ptr::null_mut());
+        set_64bit_morton_codes(this, 1);
+        set_64bit_morton_codes(std::ptr::null_mut(), 0);
+        build_batched_2x(this, std::ptr::null(), 0, std::ptr::null());
+        copy_as(this, std::ptr::null(), 0, 0, 0);
+        assert_eq!(
+            rehydrate_batched_2x(this, std::ptr::null(), 0, std::ptr::null(), std::ptr::null()),
+            0
+        );
+
+        let inputs = GuestBuildAsInputs {
+            kind: 1,
+            flags: 0,
+            num_descs: 0,
+            descs_layout: 0,
+            ptr_or_va: 0,
+        };
+        let mut info = GuestPrebuildInfo::default();
+        get_prebuild_info(this, &inputs, std::ptr::null(), &mut info);
+        assert!(info.result_data_max_size_in_bytes >= 256);
+        assert_eq!(info.result_data_max_size_in_bytes % 256, 0);
+        assert_eq!(info.scratch_data_size_in_bytes % 256, 0);
+
+        let stream = GuestStreamDesc {
+            size_in_bytes: 1500,
+            data: std::ptr::null(),
+        };
+        let mut stream_info = GuestPrebuildInfo::default();
+        get_prebuild_info(this, &inputs, &stream, &mut stream_info);
+        assert!(stream_info.result_data_max_size_in_bytes >= 1536);
+        assert_eq!(stream_info.result_data_max_size_in_bytes % 256, 0);
+
+        // Null inputs / null out_info must not crash.
+        let mut zero_info = GuestPrebuildInfo {
+            result_data_max_size_in_bytes: 99,
+            scratch_data_size_in_bytes: 99,
+            update_scratch_data_size_in_bytes: 99,
+        };
+        get_prebuild_info(this, std::ptr::null(), std::ptr::null(), &mut zero_info);
+        assert_eq!(zero_info.result_data_max_size_in_bytes, 0);
+        get_prebuild_info(this, &inputs, std::ptr::null(), std::ptr::null_mut());
+
+        dtor(this);
+        dtor(std::ptr::null_mut());
+    }
+
+    #[test]
+    fn suppression_gates_real_builder_and_falls_back_on_stream_desc() {
+        let mut dummy = 0u64;
+        let this = (&mut dummy as *mut u64).cast::<c_void>();
+
+        let b0 = MOCK_BUILD_CALLS.load(Ordering::Relaxed);
+        dispatch_build_batched_2x(true, Some(mock_build), this, std::ptr::null(), 0, std::ptr::null());
+        assert_eq!(MOCK_BUILD_CALLS.load(Ordering::Relaxed), b0);
+        dispatch_build_batched_2x(false, Some(mock_build), this, std::ptr::null(), 0, std::ptr::null());
+        assert_eq!(MOCK_BUILD_CALLS.load(Ordering::Relaxed), b0 + 1);
+
+        let c0 = MOCK_COPY_CALLS.load(Ordering::Relaxed);
+        dispatch_copy_as(true, Some(mock_copy), this, std::ptr::null(), 0x100, 0x200, 0);
+        assert_eq!(MOCK_COPY_CALLS.load(Ordering::Relaxed), c0);
+        dispatch_copy_as(false, Some(mock_copy), this, std::ptr::null(), 0x100, 0x200, 0);
+        assert_eq!(MOCK_COPY_CALLS.load(Ordering::Relaxed), c0 + 1);
+
+        let inputs = GuestBuildAsInputs {
+            kind: 1,
+            flags: 0,
+            num_descs: 0,
+            descs_layout: 0,
+            ptr_or_va: 0,
+        };
+        let host_info = GuestPrebuildInfo {
+            result_data_max_size_in_bytes: 0x400,
+            scratch_data_size_in_bytes: 0x200,
+            update_scratch_data_size_in_bytes: 0x100,
+        };
+
+        // Suppressed + host query succeeds -> uses host result and does NOT invoke real builder.
+        let p0 = MOCK_PREBUILD_CALLS.load(Ordering::Relaxed);
+        let mut out = GuestPrebuildInfo::default();
+        dispatch_prebuild_info(
+            true,
+            Some(mock_prebuild),
+            |_, sd| sd.is_none_or(|s| s.size_in_bytes == 0).then_some(host_info),
+            this,
+            &inputs,
+            std::ptr::null(),
+            &mut out,
+        );
+        assert_eq!(MOCK_PREBUILD_CALLS.load(Ordering::Relaxed), p0);
+        assert_eq!(out.result_data_max_size_in_bytes, 0x400);
+
+        // Suppressed + non-empty stream_desc (host query returns None) -> falls back to real builder.
+        let stream = GuestStreamDesc {
+            size_in_bytes: 4096,
+            data: std::ptr::null(),
+        };
+        dispatch_prebuild_info(
+            true,
+            Some(mock_prebuild),
+            |_, sd| sd.is_none_or(|s| s.size_in_bytes == 0).then_some(host_info),
+            this,
+            &inputs,
+            &stream,
+            &mut out,
+        );
+        assert_eq!(MOCK_PREBUILD_CALLS.load(Ordering::Relaxed), p0 + 1);
+        assert_eq!(out.result_data_max_size_in_bytes, 0x2000);
+
+        // Unsuppressed -> invokes real builder directly.
+        dispatch_prebuild_info(
+            false,
+            Some(mock_prebuild),
+            |_, _| Some(host_info),
+            this,
+            &inputs,
+            std::ptr::null(),
+            &mut out,
+        );
+        assert_eq!(MOCK_PREBUILD_CALLS.load(Ordering::Relaxed), p0 + 2);
+        assert_eq!(out.result_data_max_size_in_bytes, 0x2000);
     }
 }

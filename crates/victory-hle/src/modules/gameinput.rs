@@ -1,8 +1,11 @@
-//! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! `gameinput.dll`: input devices from the host. On Windows, prefers the
+//! native PC `GameInput.dll` backend (low-latency gamepads with 4-motor
+//! impulse triggers, native mouse, and Unicode keyboard state) and falls back
+//! to XInput + Win32 keyboard/mouse when `VICTORY_GAMEINPUT_NATIVE=0` or the
+//! system DLL is unavailable. While no gamepad is connected, the keyboard
+//! drives one stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard and mouse
+//! are devices of their own too. A poll thread turns host state into readings
+//! (a new one per change) and runs device and reading callbacks.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
@@ -12,8 +15,10 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{
+    Condvar, LazyLock, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -30,10 +35,22 @@ const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
+const MOUSE_KIND: u32 = 0x20;
 const GAMEPAD_KIND: u32 = 0x4_0000;
 /// Device status of a connected device: connected, input enabled.
 const STATUS_CONNECTED: u32 = 0x3;
 const ASYNC_ENUMERATION: u32 = 1;
+
+/// `GameInputRumbleMotors` bitmasks.
+const RUMBLE_MOTORS_XINPUT: u32 = 0x3;
+const RUMBLE_MOTORS_ALL: u32 = 0xF;
+
+/// `GameInputMouseButtons` bitmasks.
+const MOUSE_LEFT: u32 = 0x01;
+const MOUSE_RIGHT: u32 = 0x02;
+const MOUSE_MIDDLE: u32 = 0x04;
+const MOUSE_BUTTON4: u32 = 0x08;
+const MOUSE_BUTTON5: u32 = 0x10;
 
 /// Gamepad buttons; the title maps each bit to one of its pad buttons.
 const MENU: u32 = 0x1;
@@ -51,11 +68,12 @@ const RIGHT_SHOULDER: u32 = 0x800;
 const LEFT_STICK: u32 = 0x1000;
 const RIGHT_STICK: u32 = 0x2000;
 
-/// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
+/// Devices: host pad slots, the keyboard's stand-in pad, the keyboard, the mouse.
 const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
-const DEVICES: usize = PADS + 2;
+const MOUSE: usize = PADS + 2;
+const DEVICES: usize = PADS + 3;
 
 /// Readings kept per device for next/previous lookups.
 const HISTORY: usize = 256;
@@ -95,7 +113,7 @@ struct PadState {
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct KeyState {
     scan_code: u32,
     code_point: u32,
@@ -103,16 +121,43 @@ struct KeyState {
     dead_key: bool,
 }
 
-const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
+/// A mouse reading (`GameInputMouseState`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MouseState {
+    buttons: u32,
+    position_x: i64,
+    position_y: i64,
+    wheel_x: i64,
+    wheel_y: i64,
+}
+
+const _: () = assert!(
+    size_of::<KeyState>() == 12
+        && size_of::<PadState>() == 28
+        && size_of::<MouseState>() == 40
+        && align_of::<MouseState>() == 8
+        && std::mem::offset_of!(MouseState, buttons) == 0
+        && std::mem::offset_of!(MouseState, position_x) == 8
+        && std::mem::offset_of!(MouseState, position_y) == 16
+        && std::mem::offset_of!(MouseState, wheel_x) == 24
+        && std::mem::offset_of!(MouseState, wheel_y) == 32
+);
 
 /// Host input, or a fake in tests.
 trait Source: Send {
+    /// Supported `GameInputRumbleMotors` bitmask advertised on pad devices.
+    fn rumble_motors(&self) -> u32 {
+        RUMBLE_MOTORS_XINPUT
+    }
     /// The pad in host slot `slot`, `None` when the slot is empty.
     fn pad(&mut self, slot: usize) -> Option<PadState>;
-    /// Keys held down; none while the title's window lacks focus.
-    fn keys(&mut self) -> Vec<KeyState>;
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Writes held keys into `out` (reusing its capacity); empty while unfocused.
+    fn keys(&mut self, out: &mut Vec<KeyState>);
+    /// Current mouse state, `None` when no mouse is present.
+    fn mouse(&mut self) -> Option<MouseState>;
+    /// Motor levels (`0.0..=1.0`): `[low, high, left_trigger, right_trigger]`.
+    fn rumble(&mut self, slot: usize, motors: [f32; 4]);
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -149,6 +194,14 @@ fn merged(a: PadState, b: PadState) -> PadState {
         left_y: further(a.left_y, b.left_y),
         right_x: further(a.right_x, b.right_x),
         right_y: further(a.right_y, b.right_y),
+    }
+}
+
+fn clamp_motor(level: f32) -> f32 {
+    if level.is_finite() {
+        level.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -207,18 +260,22 @@ struct DeviceInfo {
     rest: [u64; 26],
 }
 
-const _: () = assert!(std::mem::offset_of!(DeviceInfo, id) == 0x20);
+const _: () = assert!(
+    std::mem::offset_of!(DeviceInfo, id) == 0x20
+        && std::mem::offset_of!(DeviceInfo, supported_input) == 0x68
+        && std::mem::offset_of!(DeviceInfo, rumble_motors) == 0x6c
+);
 
 fn kind(index: usize) -> u32 {
-    if index == KEYBOARD {
-        KEYBOARD_KIND
-    } else {
-        GAMEPAD_KIND
+    match index {
+        KEYBOARD => KEYBOARD_KIND,
+        MOUSE => MOUSE_KIND,
+        _ => GAMEPAD_KIND,
     }
 }
 
 impl Device {
-    fn new(index: usize) -> Device {
+    fn new(index: usize, pad_rumble_motors: u32) -> Device {
         let mut id = [0; 32];
         id[..7].copy_from_slice(b"victory");
         id[31] = index as u8 + 1;
@@ -227,8 +284,11 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index <= FALLBACK { 0x3 } else { 0 },
+            rumble_motors: if index <= FALLBACK {
+                pad_rumble_motors
+            } else {
+                0
+            },
             ..Default::default()
         };
         Device {
@@ -249,6 +309,13 @@ impl Device {
 enum Value {
     Pad(PadState),
     Keys(Vec<KeyState>),
+    Mouse(MouseState),
+}
+
+impl Value {
+    fn matches_keys(&self, keys: &[KeyState]) -> bool {
+        matches!(self, Value::Keys(prev) if prev.as_slice() == keys)
+    }
 }
 
 #[repr(C)]
@@ -266,12 +333,19 @@ impl Reading {
         match self.value {
             Value::Pad(_) => GAMEPAD_KIND,
             Value::Keys(_) => KEYBOARD_KIND,
+            Value::Mouse(_) => MOUSE_KIND,
         }
     }
 }
 
 /// A counted reference to a reading.
 struct Ref(NonNull<Reading>);
+
+// SAFETY: `Reading` is immutable after creation except for its atomic refcount,
+// and `device` points into a permanently live `Hub`.
+unsafe impl Send for Ref {}
+// SAFETY: as above.
+unsafe impl Sync for Ref {}
 
 impl Ref {
     fn new(reading: Reading) -> Ref {
@@ -282,6 +356,13 @@ impl Ref {
     fn share(&self) -> *const Reading {
         reading_add_ref(self.0.as_ptr());
         self.0.as_ptr()
+    }
+}
+
+impl Clone for Ref {
+    fn clone(&self) -> Ref {
+        reading_add_ref(self.0.as_ptr());
+        Ref(self.0)
     }
 }
 
@@ -300,6 +381,7 @@ impl Drop for Ref {
 }
 
 type DeviceCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, u32, u32);
+type ReadingCallback = extern "system" fn(u64, *mut c_void, *const Reading, bool);
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -318,8 +400,8 @@ impl Registration {
             && (self.device == 0 || self.device == &devices[index] as *const Device as usize)
     }
 
-    fn event(&self, device: usize, timestamp: u64, current: u32, previous: u32) -> Event {
-        Event {
+    fn event(&self, device: usize, timestamp: u64, current: u32, previous: u32) -> DeviceEvent {
+        DeviceEvent {
             registration: *self,
             device,
             timestamp,
@@ -329,12 +411,68 @@ impl Registration {
     }
 }
 
-struct Event {
+struct ReadingRegistration {
+    token: u64,
+    /// One device's address, or 0 for any.
+    device: usize,
+    kind: u32,
+    threshold: f32,
+    context: usize,
+    callback: ReadingCallback,
+    last_pad: [Option<PadState>; PADS + 1],
+}
+
+fn pad_exceeds_threshold(prev: PadState, curr: PadState, threshold: f32) -> bool {
+    prev.buttons != curr.buttons
+        || (curr.left_trigger - prev.left_trigger).abs() >= threshold
+        || (curr.right_trigger - prev.right_trigger).abs() >= threshold
+        || (curr.left_x - prev.left_x).abs() >= threshold
+        || (curr.left_y - prev.left_y).abs() >= threshold
+        || (curr.right_x - prev.right_x).abs() >= threshold
+        || (curr.right_y - prev.right_y).abs() >= threshold
+}
+
+impl ReadingRegistration {
+    fn matches(&mut self, devices: &[Device; DEVICES], index: usize, reading: &Reading) -> bool {
+        if reading.kind() & self.kind == 0 {
+            return false;
+        }
+        if self.device != 0 && self.device != &devices[index] as *const Device as usize {
+            return false;
+        }
+        if let Value::Pad(pad) = reading.value
+            && index <= FALLBACK
+        {
+            if self.threshold > 0.0
+                && let Some(prev) = self.last_pad[index]
+                && !pad_exceeds_threshold(prev, pad, self.threshold)
+            {
+                return false;
+            }
+            self.last_pad[index] = Some(pad);
+        }
+        true
+    }
+}
+
+struct DeviceEvent {
     registration: Registration,
     device: usize,
     timestamp: u64,
     current: u32,
     previous: u32,
+}
+
+struct ReadingEvent {
+    token: u64,
+    context: usize,
+    callback: ReadingCallback,
+    reading: Ref,
+}
+
+enum Event {
+    Device(DeviceEvent),
+    Reading(ReadingEvent),
 }
 
 #[derive(Default)]
@@ -344,25 +482,38 @@ struct Slot {
     history: VecDeque<Ref>,
 }
 
-struct State {
-    slots: [Slot; DEVICES],
+#[derive(Default)]
+struct CallbackState {
     callbacks: Vec<Registration>,
+    reading_callbacks: Vec<ReadingRegistration>,
     /// Asynchronous enumerations, delivered by the next poll.
-    pending: Vec<Event>,
-    /// Device callbacks running now: token and thread.
+    pending: Vec<DeviceEvent>,
+    /// Callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+}
+
+struct Poller {
+    source: Box<dyn Source>,
+    keys_buf: Vec<KeyState>,
 }
 
 pub struct Hub {
     object: Object,
     devices: [Device; DEVICES],
-    /// Apart from the state: XInput can be slow, and the title reads
+    /// Lock order: `poller` -> `slots` -> `callbacks`.
+    /// Apart from `slots`: host polling can be slow, and the title reads
     /// readings every frame.
-    source: Mutex<Box<dyn Source>>,
+    poller: Mutex<Poller>,
     /// The title sees one pad ([`one_pad`]).
     one_pad: bool,
-    state: Mutex<State>,
-    /// A device callback returned.
+    /// Per-device reading history; read-shared on the per-frame hot path.
+    slots: RwLock<[Slot; DEVICES]>,
+    /// Lock-free mirror of `slots[i].connected` for `GetDeviceStatus`.
+    connected: [AtomicBool; DEVICES],
+    /// Set when `callbacks.pending` is non-empty so idle polls skip locking `callbacks`.
+    has_pending: AtomicBool,
+    callbacks: Mutex<CallbackState>,
+    /// A callback returned.
     returned: Condvar,
 }
 
@@ -370,8 +521,16 @@ fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn read_lock<T: ?Sized>(rw: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    rw.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write_lock<T: ?Sized>(rw: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    rw.write().unwrap_or_else(PoisonError::into_inner)
+}
+
 // SAFETY: the back pointers are set before the hub is shared and never
-// change; what changes sits behind the mutex or is atomic.
+// change; what changes sits behind locks or is atomic.
 unsafe impl Send for Hub {}
 // SAFETY: as above.
 unsafe impl Sync for Hub {}
@@ -385,20 +544,22 @@ fn now() -> u64 {
 
 impl Hub {
     fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
+        let motors = source.rumble_motors();
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
                 hub: std::ptr::null(),
             },
-            devices: std::array::from_fn(Device::new),
-            source: Mutex::new(source),
-            one_pad,
-            state: Mutex::new(State {
-                slots: Default::default(),
-                callbacks: Vec::new(),
-                pending: Vec::new(),
-                running: Vec::new(),
+            devices: std::array::from_fn(|i| Device::new(i, motors)),
+            poller: Mutex::new(Poller {
+                source,
+                keys_buf: Vec::new(),
             }),
+            one_pad,
+            slots: RwLock::new(Default::default()),
+            connected: std::array::from_fn(|_| AtomicBool::new(false)),
+            has_pending: AtomicBool::new(false),
+            callbacks: Mutex::new(CallbackState::default()),
             returned: Condvar::new(),
         }));
         // SAFETY: just allocated and never freed; nothing else sees it yet.
@@ -424,131 +585,282 @@ impl Hub {
         hub
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        lock(&self.state)
+    fn slots(&self) -> RwLockReadGuard<'_, [Slot; DEVICES]> {
+        read_lock(&self.slots)
     }
 
-    /// Reads the host once; device callbacks run on the calling thread.
+    fn callbacks(&self) -> MutexGuard<'_, CallbackState> {
+        lock(&self.callbacks)
+    }
+
+    /// Reads the host once; device and reading callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
-            let mut source = lock(&self.source);
+        let events = {
+            let mut poller = lock(&self.poller);
+            let Poller { source, keys_buf } = &mut *poller;
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            source.keys(keys_buf);
+            let mouse = source.mouse();
+
+            let pad_targets: [Option<PadState>; PADS + 1] = if self.one_pad {
+                let combined = pads.into_iter().flatten().fold(fallback(keys_buf), merged);
+                [None, None, None, None, Some(combined)]
+            } else {
+                let any_pad = pads.iter().any(Option::is_some);
+                let fb = (!any_pad).then(|| fallback(keys_buf));
+                [pads[0], pads[1], pads[2], pads[3], fb]
+            };
+
+            // Fast path: when no device connected/disconnected, no reading value
+            // changed, and no async enumeration is pending, avoid write locks,
+            // callback locks, and allocations entirely.
+            if !self.has_pending.load(Ordering::Acquire) {
+                let slots = self.slots();
+                let pads_same = (0..=FALLBACK).all(|i| slot_pad_unchanged(&slots[i], pad_targets[i]));
+                let keys_same = slots[KEYBOARD].connected
+                    && slots[KEYBOARD]
+                        .history
+                        .back()
+                        .is_some_and(|r| r.value.matches_keys(keys_buf));
+                let mouse_same = slot_mouse_unchanged(&slots[MOUSE], mouse);
+                if pads_same && keys_same && mouse_same {
+                    return;
+                }
+            }
+
+            let now = now();
+            let mut slots = write_lock(&self.slots);
+            let mut transitions: Vec<(usize, u32, u32)> = Vec::new();
+            let mut new_readings: Vec<(usize, Ref)> = Vec::new();
+
+            for (i, pad) in pad_targets.into_iter().enumerate() {
+                update_slot(
+                    &self.devices,
+                    &self.connected[i],
+                    &mut slots[i],
+                    i,
+                    pad.map(Value::Pad),
+                    now,
+                    &mut transitions,
+                    &mut new_readings,
+                );
+            }
+
+            let keys_changed = !slots[KEYBOARD].connected
+                || slots[KEYBOARD]
+                    .history
+                    .back()
+                    .is_none_or(|r| !r.value.matches_keys(keys_buf));
+            if keys_changed {
+                update_slot(
+                    &self.devices,
+                    &self.connected[KEYBOARD],
+                    &mut slots[KEYBOARD],
+                    KEYBOARD,
+                    Some(Value::Keys(keys_buf.clone())),
+                    now,
+                    &mut transitions,
+                    &mut new_readings,
+                );
+            }
+
+            update_slot(
+                &self.devices,
+                &self.connected[MOUSE],
+                &mut slots[MOUSE],
+                MOUSE,
+                mouse.map(Value::Mouse),
+                now,
+                &mut transitions,
+                &mut new_readings,
+            );
+
+            let mut events = Vec::new();
+            let need_cb = !transitions.is_empty()
+                || !new_readings.is_empty()
+                || self.has_pending.load(Ordering::Acquire);
+            if need_cb {
+                let mut cb = self.callbacks();
+                if !cb.pending.is_empty() {
+                    events.extend(cb.pending.drain(..).map(Event::Device));
+                    self.has_pending.store(false, Ordering::Release);
+                }
+                for (index, current, previous) in transitions {
+                    events.extend(
+                        cb.callbacks
+                            .iter()
+                            .filter(|r| {
+                                r.matches(&self.devices, index) && r.status & STATUS_CONNECTED != 0
+                            })
+                            .map(|r| Event::Device(r.event(index, now, current, previous))),
+                    );
+                }
+                if !cb.reading_callbacks.is_empty() {
+                    for (index, reading_ref) in &new_readings {
+                        for r in &mut cb.reading_callbacks {
+                            if r.matches(&self.devices, *index, reading_ref) {
+                                events.push(Event::Reading(ReadingEvent {
+                                    token: r.token,
+                                    context: r.context,
+                                    callback: r.callback,
+                                    reading: reading_ref.clone(),
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            events
         };
-        let events = self.state().poll(&self.devices, self.one_pad, pads, keys);
-        self.deliver(events);
+        if !events.is_empty() {
+            self.deliver(events);
+        }
     }
 
-    /// Runs callbacks, never under our lock: they call back into us. One
+    /// Runs callbacks, never under our locks: they call back into us. One
     /// unregistered since the event was taken does not run, and
     /// `UnregisterCallback` waits for one that runs.
     fn deliver(&self, events: Vec<Event>) {
         let me = std::thread::current().id();
-        for e in events {
-            let r = e.registration;
-            {
-                let mut state = self.state();
-                if !state.callbacks.iter().any(|c| c.token == r.token) {
-                    continue;
+        for event in events {
+            match event {
+                Event::Device(e) => {
+                    let r = e.registration;
+                    {
+                        let mut cb = self.callbacks();
+                        if !cb.callbacks.iter().any(|c| c.token == r.token) {
+                            continue;
+                        }
+                        cb.running.push((r.token, me));
+                    }
+                    (r.callback)(
+                        r.token,
+                        r.context as *mut c_void,
+                        &self.devices[e.device],
+                        e.timestamp,
+                        e.current,
+                        e.previous,
+                    );
+                    let mut cb = self.callbacks();
+                    if let Some(i) = cb.running.iter().position(|&x| x == (r.token, me)) {
+                        cb.running.swap_remove(i);
+                    }
+                    self.returned.notify_all();
                 }
-                state.running.push((r.token, me));
+                Event::Reading(e) => {
+                    {
+                        let mut cb = self.callbacks();
+                        if !cb.reading_callbacks.iter().any(|c| c.token == e.token) {
+                            continue;
+                        }
+                        cb.running.push((e.token, me));
+                    }
+                    (e.callback)(
+                        e.token,
+                        e.context as *mut c_void,
+                        e.reading.0.as_ptr(),
+                        false,
+                    );
+                    drop(e.reading);
+                    let mut cb = self.callbacks();
+                    if let Some(i) = cb.running.iter().position(|&x| x == (e.token, me)) {
+                        cb.running.swap_remove(i);
+                    }
+                    self.returned.notify_all();
+                }
             }
-            (r.callback)(
-                r.token,
-                r.context as *mut c_void,
-                &self.devices[e.device],
-                e.timestamp,
-                e.current,
-                e.previous,
-            );
-            let mut state = self.state();
-            if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
-                state.running.swap_remove(i);
-            }
-            self.returned.notify_all();
         }
     }
 
+    /// O(1) lookup of a device pointer belonging to this hub.
     fn index(&self, device: *const Device) -> Option<usize> {
-        self.devices.iter().position(|d| std::ptr::eq(d, device))
+        let base = self.devices.as_ptr() as usize;
+        let diff = (device as usize).checked_sub(base)?;
+        let stride = size_of::<Device>();
+        if diff.is_multiple_of(stride) {
+            let index = diff / stride;
+            if index < DEVICES {
+                return Some(index);
+            }
+        }
+        None
     }
 }
 
-impl State {
-    fn poll(
-        &mut self,
-        devices: &[Device; DEVICES],
-        one_pad: bool,
-        pads: [Option<PadState>; PADS],
-        keys: Vec<KeyState>,
-    ) -> Vec<Event> {
-        let now = now();
-        let mut events = std::mem::take(&mut self.pending);
-        if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys), merged);
-            self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
-            self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
-            return events;
+fn slot_pad_unchanged(slot: &Slot, target: Option<PadState>) -> bool {
+    match target {
+        None => !slot.connected,
+        Some(pad) => {
+            slot.connected
+                && slot
+                    .history
+                    .back()
+                    .is_some_and(|r| matches!(r.value, Value::Pad(p) if p == pad))
         }
-        let any_pad = pads.iter().any(Option::is_some);
-        for (slot, pad) in pads.into_iter().enumerate() {
-            self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
-        }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
-        self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
-        events
     }
+}
 
-    /// Records a device's state: a reading when it changed, callbacks when
-    /// the device came or went.
-    fn update(
-        &mut self,
-        devices: &[Device; DEVICES],
-        index: usize,
-        value: Option<Value>,
-        now: u64,
-        events: &mut Vec<Event>,
-    ) {
-        let slot = &mut self.slots[index];
-        let was = slot.connected;
-        slot.connected = value.is_some();
-        if let Some(value) = value
-            && (!was || slot.history.back().is_none_or(|r| r.value != value))
-        {
-            slot.sequence += 1;
-            if slot.history.len() == HISTORY {
-                slot.history.pop_front();
-            }
-            slot.history.push_back(Ref::new(Reading {
-                vtable: &READING,
-                refs: AtomicU32::new(1),
-                device: &devices[index],
-                sequence: slot.sequence,
-                timestamp: now,
-                value,
-            }));
+fn slot_mouse_unchanged(slot: &Slot, target: Option<MouseState>) -> bool {
+    match target {
+        None => !slot.connected,
+        Some(mouse) => {
+            slot.connected
+                && slot
+                    .history
+                    .back()
+                    .is_some_and(|r| matches!(r.value, Value::Mouse(m) if m == mouse))
         }
-        if was != slot.connected {
-            tracing::info!(device = index, connected = !was, "input device");
-            let (current, previous) = if was {
-                (0, STATUS_CONNECTED)
-            } else {
-                (STATUS_CONNECTED, 0)
-            };
-            events.extend(
-                self.callbacks
-                    .iter()
-                    .filter(|r| r.matches(devices, index) && r.status & STATUS_CONNECTED != 0)
-                    .map(|r| r.event(index, now, current, previous)),
-            );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_slot(
+    devices: &[Device; DEVICES],
+    connected_flag: &AtomicBool,
+    slot: &mut Slot,
+    index: usize,
+    value: Option<Value>,
+    now: u64,
+    transitions: &mut Vec<(usize, u32, u32)>,
+    new_readings: &mut Vec<(usize, Ref)>,
+) {
+    let was = slot.connected;
+    slot.connected = value.is_some();
+    if was != slot.connected {
+        connected_flag.store(slot.connected, Ordering::Release);
+    }
+    if let Some(value) = value
+        && (!was || slot.history.back().is_none_or(|r| r.value != value))
+    {
+        slot.sequence += 1;
+        if slot.history.len() == HISTORY {
+            slot.history.pop_front();
         }
+        let reading = Ref::new(Reading {
+            vtable: &READING,
+            refs: AtomicU32::new(1),
+            device: &devices[index],
+            sequence: slot.sequence,
+            timestamp: now,
+            value,
+        });
+        new_readings.push((index, reading.clone()));
+        slot.history.push_back(reading);
+    }
+    if was != slot.connected {
+        tracing::info!(device = index, connected = !was, "input device");
+        let (current, previous) = if was {
+            (0, STATUS_CONNECTED)
+        } else {
+            (STATUS_CONNECTED, 0)
+        };
+        transitions.push((index, current, previous));
     }
 }
 
 #[cfg(windows)]
 fn host() -> Box<dyn Source> {
-    Box::new(host::Host::default())
+    host::create_source(host::native_enabled())
 }
 
 #[cfg(not(windows))]
@@ -558,10 +870,13 @@ fn host() -> Box<dyn Source> {
         fn pad(&mut self, _: usize) -> Option<PadState> {
             None
         }
-        fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
+        fn keys(&mut self, out: &mut Vec<KeyState>) {
+            out.clear();
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn mouse(&mut self) -> Option<MouseState> {
+            None
+        }
+        fn rumble(&mut self, _: usize, _: [f32; 4]) {}
     }
     Box::new(Nothing)
 }
@@ -624,33 +939,35 @@ extern "system" fn timestamp(_: This) -> u64 {
 
 extern "system" fn current_reading(
     this: This,
-    kind: u32,
+    input_kind: u32,
     device: *const Device,
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
-    let newest = |i: usize| {
-        state.slots[i]
-            .history
-            .back()
-            .filter(|r| r.kind() & kind != 0)
-    };
-    let found = if device.is_null() {
-        (0..DEVICES)
-            .filter(|&i| state.slots[i].connected)
-            .filter_map(newest)
-            .max_by_key(|r| r.timestamp)
+    let dev_index = if device.is_null() {
+        None
     } else {
         match hub.index(device) {
+            Some(i) => Some(i),
             None => return fail(out, E_INVALIDARG),
-            Some(i) if !state.slots[i].connected => return fail(out, DEVICE_DISCONNECTED),
-            Some(i) => newest(i),
+        }
+    };
+    let slots = hub.slots();
+    let found = match dev_index {
+        None => (0..DEVICES)
+            .filter(|&i| kind(i) & input_kind != 0 && slots[i].connected)
+            .filter_map(|i| slots[i].history.back())
+            .max_by_key(|r| r.timestamp),
+        Some(i) => {
+            if !slots[i].connected {
+                return fail(out, DEVICE_DISCONNECTED);
+            }
+            slots[i].history.back().filter(|r| r.kind() & input_kind != 0)
         }
     };
     tracing::trace!(
-        kind = format_args!("{kind:#x}"),
-        device = ?hub.index(device),
+        kind = format_args!("{input_kind:#x}"),
+        device = ?dev_index,
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
@@ -661,7 +978,7 @@ extern "system" fn current_reading(
 fn relative(
     this: This,
     reference: *const Reading,
-    kind: u32,
+    input_kind: u32,
     device: *const Device,
     out: Out,
     forward: bool,
@@ -681,15 +998,15 @@ fn relative(
     if !device.is_null() && !std::ptr::eq(device, reference.device) {
         return fail(out, E_INVALIDARG);
     }
-    let state = hub.state();
-    let history = &state.slots[index].history;
+    let slots = hub.slots();
+    let history = &slots[index].history;
     if history
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
         return fail(out, REFERENCE_TOO_OLD);
     }
-    let wanted = |r: &&Ref| r.kind() & kind != 0;
+    let wanted = |r: &&Ref| r.kind() & input_kind != 0;
     let found = if forward {
         history
             .iter()
@@ -707,20 +1024,20 @@ fn relative(
 extern "system" fn next_reading(
     this: This,
     reference: *const Reading,
-    kind: u32,
+    input_kind: u32,
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    relative(this, reference, kind, device, out, true)
+    relative(this, reference, input_kind, device, out, true)
 }
 extern "system" fn previous_reading(
     this: This,
     reference: *const Reading,
-    kind: u32,
+    input_kind: u32,
     device: *const Device,
     out: Out,
 ) -> HRESULT {
-    relative(this, reference, kind, device, out, false)
+    relative(this, reference, input_kind, device, out, false)
 }
 /// The device's reading at `time`, among those still kept.
 extern "system" fn temporal_reading(
@@ -733,8 +1050,8 @@ extern "system" fn temporal_reading(
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
     };
-    let state = hub.state();
-    let history = &state.slots[index].history;
+    let slots = hub.slots();
+    let history = &slots[index].history;
     hand(out, history.iter().rev().find(|r| r.timestamp <= time))
 }
 
@@ -748,19 +1065,49 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; the title registers none
-// (it polls).
+fn fail_token(out: *mut u64, hr: HRESULT) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { out.write(0) };
+    }
+    hr
+}
+
 extern "system" fn register_reading(
-    _: This,
-    _device: *const c_void,
-    _kind: u32,
-    _threshold: f32,
-    _context: *mut c_void,
-    _callback: *const c_void,
+    this: This,
+    device: *const Device,
+    input_kind: u32,
+    threshold: f32,
+    context: *mut c_void,
+    callback: Option<ReadingCallback>,
     out: *mut u64,
 ) -> HRESULT {
-    tracing::warn!("input reading callbacks are never called");
-    token(out)
+    let Some(callback) = callback else {
+        return fail_token(out, E_INVALIDARG);
+    };
+    if input_kind == 0 || !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        return fail_token(out, E_INVALIDARG);
+    }
+    let hub = hub(this);
+    if !device.is_null() && hub.index(device).is_none() {
+        return fail_token(out, E_INVALIDARG);
+    }
+    let tok = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let registration = ReadingRegistration {
+        token: tok,
+        device: device as usize,
+        kind: input_kind,
+        threshold,
+        context: context as usize,
+        callback,
+        last_pad: [None; PADS + 1],
+    };
+    hub.callbacks().reading_callbacks.push(registration);
+    if !out.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { out.write(tok) };
+    }
+    S_OK
 }
 
 /// Device callbacks run on our poll thread when a device comes or goes.
@@ -770,7 +1117,7 @@ extern "system" fn register_reading(
 extern "system" fn register_device(
     this: This,
     device: *const Device,
-    kind: u32,
+    input_kind: u32,
     status: u32,
     enumeration: u32,
     context: *mut c_void,
@@ -778,43 +1125,48 @@ extern "system" fn register_device(
     out: *mut u64,
 ) -> HRESULT {
     let Some(callback) = callback else {
-        return E_INVALIDARG;
+        return fail_token(out, E_INVALIDARG);
     };
     let hub = hub(this);
     let registration = Registration {
         token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
         device: device as usize,
-        kind,
+        kind: input_kind,
         status,
         context: context as usize,
         callback,
     };
     let mut found = Vec::new();
     {
-        let mut state = hub.state();
+        // Respect lock order: `slots` -> `callbacks`.
+        let slots = hub.slots();
+        let mut cb = hub.callbacks();
         if enumeration != 0 && status & STATUS_CONNECTED != 0 {
             let now = now();
             found = (0..DEVICES)
-                .filter(|&i| state.slots[i].connected && registration.matches(&hub.devices, i))
+                .filter(|&i| slots[i].connected && registration.matches(&hub.devices, i))
                 .map(|i| registration.event(i, now, STATUS_CONNECTED, 0))
                 .collect();
         }
         tracing::info!(
-            kind = format_args!("{kind:#x}"),
+            kind = format_args!("{input_kind:#x}"),
             enumeration,
             devices = found.len(),
             "input device callback"
         );
-        state.callbacks.push(registration);
-        if enumeration == ASYNC_ENUMERATION {
-            state.pending.append(&mut found);
+        cb.callbacks.push(registration);
+        if enumeration == ASYNC_ENUMERATION && !found.is_empty() {
+            cb.pending.append(&mut found);
+            hub.has_pending.store(true, Ordering::Release);
         }
     }
     if !out.is_null() {
         // SAFETY: checked non-null.
         unsafe { out.write(registration.token) };
     }
-    hub.deliver(found);
+    if !found.is_empty() {
+        hub.deliver(found.into_iter().map(Event::Device).collect());
+    }
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
@@ -829,9 +1181,14 @@ extern "system" fn register_other(
 }
 
 fn forget(this: This, token: u64) {
-    let mut state = hub(this).state();
-    state.callbacks.retain(|r| r.token != token);
-    state.pending.retain(|e| e.registration.token != token);
+    let hub = hub(this);
+    let mut cb = hub.callbacks();
+    cb.callbacks.retain(|r| r.token != token);
+    cb.reading_callbacks.retain(|r| r.token != token);
+    cb.pending.retain(|e| e.registration.token != token);
+    if cb.pending.is_empty() {
+        hub.has_pending.store(false, Ordering::Release);
+    }
 }
 extern "system" fn stop_callback(this: This, token: u64) {
     forget(this, token);
@@ -844,22 +1201,22 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
     let hub = hub(this);
     let me = std::thread::current().id();
     let deadline = Instant::now().checked_add(Duration::from_micros(timeout));
-    let mut state = hub.state();
+    let mut cb = hub.callbacks();
     loop {
-        let running = state.running.iter().filter(|r| r.0 == token);
+        let running = cb.running.iter().filter(|r| r.0 == token);
         if running.clone().any(|r| r.1 == me) {
             return false;
         }
         if running.count() == 0 {
             return true;
         }
-        state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+        cb = match deadline {
+            None => hub.returned.wait(cb).unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
                 };
-                let waited = hub.returned.wait_timeout(state, left);
+                let waited = hub.returned.wait_timeout(cb, left);
                 waited.unwrap_or_else(PoisonError::into_inner).0
             }
         };
@@ -938,16 +1295,12 @@ extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
 extern "system" fn device_status(this: *const Device) -> u32 {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
-    if device.hub().state().slots[device.index].connected {
+    if device.hub().connected[device.index].load(Ordering::Acquire) {
         STATUS_CONNECTED
     } else {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -955,23 +1308,28 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if device.index >= PADS && !(one_pad && device.index == FALLBACK) {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let raw = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    let mut source = lock(&device.hub().source);
+    let motors = [
+        clamp_motor(raw[0]),
+        clamp_motor(raw[1]),
+        clamp_motor(raw[2]),
+        clamp_motor(raw[3]),
+    ];
+    let mut poller = lock(&device.hub().poller);
     if one_pad {
         // The one pad is every host pad.
         for slot in 0..PADS {
-            if source.pad(slot).is_some() {
-                source.rumble(slot, speed(low), speed(high));
+            if poller.source.pad(slot).is_some() {
+                poller.source.rumble(slot, motors);
             }
         }
     } else {
-        source.rumble(device.index, speed(low), speed(high));
+        poller.source.rumble(device.index, motors);
     }
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
@@ -1024,9 +1382,9 @@ extern "system" fn reading_release(this: *const Reading) -> u32 {
 extern "system" fn input_kind(this: *const Reading) -> u32 {
     reading(this).kind()
 }
-extern "system" fn sequence_number(this: *const Reading, kind: u32) -> u64 {
+extern "system" fn sequence_number(this: *const Reading, input_kind: u32) -> u64 {
     let reading = reading(this);
-    if reading.kind() & kind != 0 {
+    if reading.kind() & input_kind != 0 {
         reading.sequence
     } else {
         0
@@ -1044,7 +1402,7 @@ extern "system" fn reading_device(this: *const Reading, out: *mut *const Device)
 extern "system" fn key_count(this: *const Reading) -> u32 {
     match &reading(this).value {
         Value::Keys(keys) => keys.len() as u32,
-        Value::Pad(_) => 0,
+        Value::Pad(_) | Value::Mouse(_) => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
@@ -1058,6 +1416,16 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
     n as u32
+}
+extern "system" fn mouse_state(this: *const Reading, out: *mut MouseState) -> bool {
+    match &reading(this).value {
+        Value::Mouse(state) if !out.is_null() => {
+            // SAFETY: checked non-null.
+            unsafe { out.write(*state) };
+            true
+        }
+        _ => false,
+    }
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
     match &reading(this).value {
@@ -1091,7 +1459,7 @@ static READING: Table<25> = Table([
     nothing as *const (),           // 0x68
     key_count as *const (),         // 0x70
     key_state as *const (),         // 0x78
-    nothing as *const (),           // 0x80 mouse
+    mouse_state as *const (),       // 0x80 mouse
     nothing as *const (),           // 0x88 touch
     nothing as *const (),           // 0x90
     nothing as *const (),           // 0x98 motion
@@ -1114,14 +1482,23 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: native PC `GameInput.dll` when available, else XInput + Win32.
 #[cfg(windows)]
 mod host {
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyState, GetKeyboardLayout, GetKeyboardState, HKL,
+        MAPVK_VK_TO_VSC_EX, MapVirtualKeyW, ToUnicodeEx, VK_CAPITAL, VK_CONTROL, VK_LBUTTON,
+        VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MBUTTON, VK_MENU, VK_NUMLOCK, VK_RBUTTON,
+        VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1132,13 +1509,26 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
     };
 
     use super::*;
 
     /// Asking XInput about an empty slot is slow; look again this often.
     const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
+
+    /// Whether the native PC `GameInput.dll` backend is enabled (default true;
+    /// set `VICTORY_GAMEINPUT_NATIVE=0` to force XInput + Win32 fallback).
+    pub(super) fn native_enabled() -> bool {
+        std::env::var_os("VICTORY_GAMEINPUT_NATIVE").is_none_or(|v| v != "0")
+    }
+
+    pub(super) fn create_source(use_native: bool) -> Box<dyn Source> {
+        if use_native && let Some(native) = NativeGameInput::try_new() {
+            return Box::new(native);
+        }
+        Box::new(Host::default())
+    }
 
     const BUTTONS: [(u16, u32); 14] = [
         (XINPUT_GAMEPAD_START, MENU),
@@ -1174,9 +1564,573 @@ mod host {
         }
     }
 
+    /// Translates a virtual key + scan code into `(code_point, is_dead_key)`
+    /// without mutating OS dead-key state (`uFlags = 0x4`, Windows 10 1607+).
+    pub(super) fn translate_key(
+        vk: u8,
+        scan_code: u32,
+        key_state: &[u8; 256],
+        hkl: HKL,
+    ) -> (u32, bool) {
+        let mut buf = [0u16; 8];
+        // SAFETY: valid 256-byte key state and output buffer.
+        let ret = unsafe {
+            ToUnicodeEx(
+                u32::from(vk),
+                scan_code & 0xFF,
+                key_state.as_ptr(),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+                0x4,
+                hkl,
+            )
+        };
+        if ret == -1 {
+            let cp = char::decode_utf16(buf.iter().take_while(|&&u| u != 0).copied())
+                .next()
+                .and_then(Result::ok)
+                .map_or(0, u32::from);
+            (cp, true)
+        } else if ret > 0 {
+            let len = (ret as usize).min(buf.len());
+            let cp = char::decode_utf16(buf[..len].iter().copied())
+                .next()
+                .and_then(Result::ok)
+                .map_or(0, u32::from);
+            (cp, false)
+        } else {
+            (0, false)
+        }
+    }
+
+    fn build_keyboard_state(held_vks: &[u8]) -> [u8; 256] {
+        let mut state = [0u8; 256];
+        // SAFETY: 256-byte output buffer; poll threads have no message queue
+        // so we overlay held keys and global toggle bits below.
+        unsafe {
+            let _ = GetKeyboardState(state.as_mut_ptr());
+            if GetKeyState(i32::from(VK_CAPITAL)) & 1 != 0 {
+                state[usize::from(VK_CAPITAL)] |= 0x01;
+            }
+            if GetKeyState(i32::from(VK_NUMLOCK)) & 1 != 0 {
+                state[usize::from(VK_NUMLOCK)] |= 0x01;
+            }
+        }
+        for &vk in held_vks {
+            state[usize::from(vk)] |= 0x80;
+            match u16::from(vk) {
+                VK_LSHIFT | VK_RSHIFT => state[usize::from(VK_SHIFT)] |= 0x80,
+                VK_LCONTROL | VK_RCONTROL => state[usize::from(VK_CONTROL)] |= 0x80,
+                VK_LMENU | VK_RMENU => state[usize::from(VK_MENU)] |= 0x80,
+                _ => {}
+            }
+        }
+        state
+    }
+
+    fn push_win32_keys(vks: &[u8], fg_tid: Option<u32>, out: &mut Vec<KeyState>) {
+        if vks.is_empty() {
+            return;
+        }
+        let kbd_state = build_keyboard_state(vks);
+        // SAFETY: valid thread id or 0 for current thread.
+        let hkl = unsafe { GetKeyboardLayout(fg_tid.unwrap_or(0)) };
+        for &vk in vks {
+            // SAFETY: plain query.
+            let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+            let (code_point, dead_key) = translate_key(vk, scan_code, &kbd_state, hkl);
+            out.push(KeyState {
+                scan_code,
+                code_point,
+                virtual_key: vk,
+                dead_key,
+            });
+        }
+    }
+
+    fn apply_scripted_buttons(pad: &mut PadState, buf: &mut Vec<u8>) {
+        scripted_into(buf);
+        for &vk in buf.iter() {
+            if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+            {
+                pad.buttons |= button;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Native PC `GameInput.dll` COM backend (System32, SDK 10.0.26100.0 ABI)
+    // -------------------------------------------------------------------------
+
+    type NativeGameInputCreate = unsafe extern "system" fn(*mut *mut c_void) -> HRESULT;
+    type NativeDeviceCallback =
+        unsafe extern "system" fn(u64, *mut c_void, *mut c_void, u64, u32, u32);
+
+    /// Raw `GameInputKeyState` using `u8` for C `bool` to avoid invalid-bool UB.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct RawKeyState {
+        scan_code: u32,
+        code_point: u32,
+        virtual_key: u8,
+        dead_key: u8,
+        _pad: [u8; 2],
+    }
+
+    const _: () = assert!(size_of::<RawKeyState>() == size_of::<KeyState>());
+
+    /// RAII guard for native COM pointers returned by `GameInput.dll`.
+    struct ComPtr(*mut c_void);
+
+    impl ComPtr {
+        fn as_ptr(&self) -> *mut c_void {
+            self.0
+        }
+    }
+
+    impl Drop for ComPtr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: owned COM reference.
+                unsafe { com_release(self.0) };
+            }
+        }
+    }
+
+    unsafe fn vtable_fn<F: Copy>(obj: *mut c_void, slot: usize) -> F {
+        // SAFETY: COM object begins with a vtable pointer containing `slot`.
+        let vtable = unsafe { *(obj as *const *const *const ()) };
+        let f = unsafe { *vtable.add(slot) };
+        unsafe { std::mem::transmute_copy(&f) }
+    }
+
+    unsafe fn com_add_ref(obj: *mut c_void) -> u32 {
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { vtable_fn(obj, 1) };
+        unsafe { f(obj) }
+    }
+
+    unsafe fn com_release(obj: *mut c_void) -> u32 {
+        let f: unsafe extern "system" fn(*mut c_void) -> u32 = unsafe { vtable_fn(obj, 2) };
+        unsafe { f(obj) }
+    }
+
+    unsafe fn gi_get_current_reading(
+        gi: *mut c_void,
+        input_kind: u32,
+        device: *mut c_void,
+    ) -> Result<ComPtr, HRESULT> {
+        type Fn = unsafe extern "system" fn(
+            *mut c_void,
+            u32,
+            *mut c_void,
+            *mut *mut c_void,
+        ) -> HRESULT;
+        let f: Fn = unsafe { vtable_fn(gi, 4) };
+        let mut reading = std::ptr::null_mut();
+        let hr = unsafe { f(gi, input_kind, device, &mut reading) };
+        if hr == S_OK && !reading.is_null() {
+            Ok(ComPtr(reading))
+        } else {
+            Err(hr)
+        }
+    }
+
+    unsafe fn gi_register_device_callback(
+        gi: *mut c_void,
+        input_kind: u32,
+        status_filter: u32,
+        enumeration_kind: u32,
+        context: *mut c_void,
+        callback: NativeDeviceCallback,
+    ) -> Result<u64, HRESULT> {
+        type Fn = unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            NativeDeviceCallback,
+            *mut u64,
+        ) -> HRESULT;
+        let f: Fn = unsafe { vtable_fn(gi, 9) };
+        let mut token = 0u64;
+        let hr = unsafe {
+            f(
+                gi,
+                std::ptr::null_mut(),
+                input_kind,
+                status_filter,
+                enumeration_kind,
+                context,
+                callback,
+                &mut token,
+            )
+        };
+        if hr == S_OK { Ok(token) } else { Err(hr) }
+    }
+
+    unsafe fn gi_unregister_callback(gi: *mut c_void, token: u64, timeout_us: u64) -> bool {
+        type Fn = unsafe extern "system" fn(*mut c_void, u64, u64) -> bool;
+        let f: Fn = unsafe { vtable_fn(gi, 13) };
+        unsafe { f(gi, token, timeout_us) }
+    }
+
+    unsafe fn reading_get_key_count(reading: *mut c_void) -> u32 {
+        type Fn = unsafe extern "system" fn(*mut c_void) -> u32;
+        let f: Fn = unsafe { vtable_fn(reading, 14) };
+        unsafe { f(reading) }
+    }
+
+    unsafe fn reading_get_key_state(
+        reading: *mut c_void,
+        count: u32,
+        out: *mut RawKeyState,
+    ) -> u32 {
+        type Fn = unsafe extern "system" fn(*mut c_void, u32, *mut RawKeyState) -> u32;
+        let f: Fn = unsafe { vtable_fn(reading, 15) };
+        unsafe { f(reading, count, out) }
+    }
+
+    unsafe fn reading_get_mouse_state(reading: *mut c_void, out: *mut MouseState) -> bool {
+        type Fn = unsafe extern "system" fn(*mut c_void, *mut MouseState) -> bool;
+        let f: Fn = unsafe { vtable_fn(reading, 16) };
+        unsafe { f(reading, out) }
+    }
+
+    unsafe fn reading_get_gamepad_state(reading: *mut c_void, out: *mut PadState) -> bool {
+        type Fn = unsafe extern "system" fn(*mut c_void, *mut PadState) -> bool;
+        let f: Fn = unsafe { vtable_fn(reading, 22) };
+        unsafe { f(reading, out) }
+    }
+
+    unsafe fn device_get_status(device: *mut c_void) -> u32 {
+        type Fn = unsafe extern "system" fn(*mut c_void) -> u32;
+        let f: Fn = unsafe { vtable_fn(device, 4) };
+        unsafe { f(device) }
+    }
+
+    unsafe fn device_set_rumble(device: *mut c_void, params: *const [f32; 4]) {
+        type Fn = unsafe extern "system" fn(*mut c_void, *const [f32; 4]);
+        let f: Fn = unsafe { vtable_fn(device, 10) };
+        unsafe { f(device, params) };
+    }
+
+    fn load_native_gameinput_create() -> Option<NativeGameInputCreate> {
+        static FN: OnceLock<Option<NativeGameInputCreate>> = OnceLock::new();
+        *FN.get_or_init(|| {
+            // Load strictly from System32 so we never resolve a local shim DLL.
+            let name: Vec<u16> = "GameInput.dll\0".encode_utf16().collect();
+            // SAFETY: null-terminated UTF-16 DLL name; handle stays loaded for process lifetime.
+            let hmod = unsafe {
+                LoadLibraryExW(
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            };
+            if hmod.is_null() {
+                tracing::debug!("System32 GameInput.dll not available; using XInput fallback");
+                return None;
+            }
+            // SAFETY: valid module handle and null-terminated ASCII export name.
+            let proc = unsafe { GetProcAddress(hmod, c"GameInputCreate".as_ptr().cast()) }?;
+            // SAFETY: GameInputCreate export signature matches `NativeGameInputCreate`.
+            Some(unsafe {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, NativeGameInputCreate>(
+                    proc,
+                )
+            })
+        })
+    }
+
+    struct NativePadSlot {
+        device: *mut c_void,
+        last_state: PadState,
+    }
+
+    struct NativePads {
+        slots: Mutex<[Option<NativePadSlot>; PADS]>,
+    }
+
+    unsafe extern "system" fn on_native_pad_device(
+        _token: u64,
+        context: *mut c_void,
+        device: *mut c_void,
+        _timestamp: u64,
+        current_status: u32,
+        _previous_status: u32,
+    ) {
+        if context.is_null() || device.is_null() {
+            return;
+        }
+        // SAFETY: `context` points to `NativePads`, kept alive until after
+        // `UnregisterCallback` returns in `NativeGameInput::drop`.
+        let pads = unsafe { &*(context as *const NativePads) };
+        let mut slots = lock(&pads.slots);
+        let connected = current_status & 0x1 != 0;
+        if connected {
+            if slots
+                .iter()
+                .any(|s| s.as_ref().is_some_and(|p| p.device == device))
+            {
+                return;
+            }
+            if let Some(empty) = slots.iter_mut().find(|s| s.is_none()) {
+                // SAFETY: `device` is a valid `IGameInputDevice` for the duration of this callback.
+                unsafe { com_add_ref(device) };
+                *empty = Some(NativePadSlot {
+                    device,
+                    last_state: PadState::default(),
+                });
+            }
+        } else if let Some(slot) = slots
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|p| p.device == device))
+            && let Some(removed) = slot.take()
+        {
+            // SAFETY: releasing the ref added on connect.
+            unsafe { com_release(removed.device) };
+        }
+    }
+
+    pub(super) struct NativeGameInput {
+        gi: ComPtr,
+        cb_token: u64,
+        /// Heap-allocated context for `on_native_pad_device`; freed in `Drop`
+        /// only after `UnregisterCallback` completes.
+        pads: *mut NativePads,
+        last_mouse: MouseState,
+        vk_buf: Vec<u8>,
+    }
+
+    // SAFETY: `IGameInput` and `IGameInputDevice` are free-threaded COM objects,
+    // and `NativeGameInput` is accessed through `Hub`'s `poller` mutex.
+    unsafe impl Send for NativeGameInput {}
+
+    impl NativeGameInput {
+        pub(super) fn try_new() -> Option<NativeGameInput> {
+            let create = load_native_gameinput_create()?;
+            let mut raw = std::ptr::null_mut();
+            // SAFETY: valid out-pointer to receive `IGameInput*`.
+            let hr = unsafe { create(&mut raw) };
+            if hr != S_OK || raw.is_null() {
+                tracing::warn!(
+                    hr = format_args!("{hr:#010x}"),
+                    "native GameInputCreate failed; falling back to XInput"
+                );
+                return None;
+            }
+            let gi = ComPtr(raw);
+            let pads = Box::into_raw(Box::new(NativePads {
+                slots: Mutex::new(Default::default()),
+            }));
+            // Blocking enumeration (2) populates already-connected pads synchronously.
+            // SAFETY: `gi` is valid and `pads` remains valid until after `UnregisterCallback`.
+            let cb_token = match unsafe {
+                gi_register_device_callback(
+                    gi.as_ptr(),
+                    GAMEPAD_KIND,
+                    0x1, // GameInputDeviceConnected
+                    2,   // GameInputBlockingEnumeration
+                    pads.cast(),
+                    on_native_pad_device,
+                )
+            } {
+                Ok(tok) => tok,
+                Err(hr) => {
+                    tracing::warn!(
+                        hr = format_args!("{hr:#010x}"),
+                        "native GameInput RegisterDeviceCallback failed; falling back to XInput"
+                    );
+                    // SAFETY: registration failed, no callback can run.
+                    drop(unsafe { Box::from_raw(pads) });
+                    return None;
+                }
+            };
+            tracing::info!("native PC GameInput.dll backend active (4-motor impulse triggers)");
+            Some(NativeGameInput {
+                gi,
+                cb_token,
+                pads,
+                last_mouse: MouseState::default(),
+                vk_buf: Vec::new(),
+            })
+        }
+
+        fn pads(&self) -> &NativePads {
+            // SAFETY: allocated in `try_new` and freed only in `Drop`.
+            unsafe { &*self.pads }
+        }
+    }
+
+    impl Drop for NativeGameInput {
+        fn drop(&mut self) {
+            let unregistered = if self.cb_token != 0 {
+                // Wait for any in-flight device callback before releasing devices/context.
+                // SAFETY: `self.gi` and `self.cb_token` are valid.
+                unsafe { gi_unregister_callback(self.gi.as_ptr(), self.cb_token, 5_000_000) }
+            } else {
+                true
+            };
+            if !unregistered {
+                // Keep `self.pads` leaked if the callback did not drain in time so an
+                // in-flight callback can never dereference freed memory.
+                tracing::warn!("GameInput: device callback did not finish unregistering before drop");
+                return;
+            }
+            // SAFETY: callback is unregistered, so no concurrent access to `self.pads`.
+            let pads = unsafe { Box::from_raw(self.pads) };
+            let mut slots = lock(&pads.slots);
+            for slot in slots.iter_mut() {
+                if let Some(removed) = slot.take() {
+                    // SAFETY: releasing the ref added in `on_native_pad_device`.
+                    unsafe { com_release(removed.device) };
+                }
+            }
+        }
+    }
+
+    impl Source for NativeGameInput {
+        fn rumble_motors(&self) -> u32 {
+            RUMBLE_MOTORS_ALL
+        }
+
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let (device, last_state) = {
+                let slots = lock(&self.pads().slots);
+                let entry = slots[slot].as_ref()?;
+                // AddRef under lock, then drop lock before calling into GameInput.dll
+                // to avoid AB-BA deadlock with `on_native_pad_device`.
+                // SAFETY: `entry.device` is live while `slots` is held.
+                unsafe { com_add_ref(entry.device) };
+                (entry.device, entry.last_state)
+            };
+            // SAFETY: we own a COM ref to `device` and `self.gi` is live.
+            let reading_res = unsafe { gi_get_current_reading(self.gi.as_ptr(), GAMEPAD_KIND, device) };
+            let mut updated_state = None;
+            let mut pad = match reading_res {
+                Ok(reading) => {
+                    let mut state = PadState::default();
+                    if unsafe { reading_get_gamepad_state(reading.as_ptr(), &mut state) } {
+                        updated_state = Some(state);
+                        state
+                    } else {
+                        last_state
+                    }
+                }
+                Err(READING_NOT_FOUND) => {
+                    if unsafe { device_get_status(device) } & 0x1 != 0 {
+                        last_state
+                    } else {
+                        // SAFETY: releasing our temporary COM ref.
+                        unsafe { com_release(device) };
+                        return None;
+                    }
+                }
+                Err(_) => {
+                    // SAFETY: releasing our temporary COM ref.
+                    unsafe { com_release(device) };
+                    return None;
+                }
+            };
+            if let Some(state) = updated_state {
+                let mut slots = lock(&self.pads().slots);
+                if let Some(entry) = slots[slot].as_mut()
+                    && entry.device == device
+                {
+                    entry.last_state = state;
+                }
+            }
+            // SAFETY: releasing our temporary COM ref.
+            unsafe { com_release(device) };
+            if slot == 0 {
+                apply_scripted_buttons(&mut pad, &mut self.vk_buf);
+            }
+            Some(pad)
+        }
+
+        fn keys(&mut self, out: &mut Vec<KeyState>) {
+            out.clear();
+            let fg_tid = foreground_thread();
+            if fg_tid.is_some()
+                && let Ok(reading) = unsafe {
+                    gi_get_current_reading(self.gi.as_ptr(), KEYBOARD_KIND, std::ptr::null_mut())
+                }
+            {
+                let count = unsafe { reading_get_key_count(reading.as_ptr()) } as usize;
+                if count > 0 {
+                    let mut raw = [RawKeyState::default(); 64];
+                    let cap = count.min(raw.len());
+                    let n = unsafe {
+                        reading_get_key_state(reading.as_ptr(), cap as u32, raw.as_mut_ptr())
+                    } as usize;
+                    for k in &raw[..n.min(cap)] {
+                        out.push(KeyState {
+                            scan_code: k.scan_code,
+                            code_point: k.code_point,
+                            virtual_key: k.virtual_key,
+                            dead_key: k.dead_key != 0,
+                        });
+                    }
+                }
+            }
+            scripted_into(&mut self.vk_buf);
+            if !self.vk_buf.is_empty() {
+                self.vk_buf
+                    .retain(|vk| !out.iter().any(|k| k.virtual_key == *vk));
+                push_win32_keys(&self.vk_buf, fg_tid, out);
+            }
+        }
+
+        fn mouse(&mut self) -> Option<MouseState> {
+            if foreground_thread().is_some() {
+                if let Ok(reading) = unsafe {
+                    gi_get_current_reading(self.gi.as_ptr(), MOUSE_KIND, std::ptr::null_mut())
+                } {
+                    let mut state = MouseState::default();
+                    if unsafe { reading_get_mouse_state(reading.as_ptr(), &mut state) } {
+                        self.last_mouse = state;
+                    }
+                }
+            } else {
+                self.last_mouse.buttons = 0;
+            }
+            Some(self.last_mouse)
+        }
+
+        fn rumble(&mut self, slot: usize, motors: [f32; 4]) {
+            let device = {
+                let slots = lock(&self.pads().slots);
+                let Some(entry) = slots[slot].as_ref() else {
+                    return;
+                };
+                // SAFETY: `entry.device` is live while `slots` is held.
+                unsafe { com_add_ref(entry.device) };
+                entry.device
+            };
+            let params = if motors == [0.0; 4] {
+                std::ptr::null()
+            } else {
+                &motors as *const [f32; 4]
+            };
+            // SAFETY: we own a COM ref to `device`; `params` is null or valid 4 floats.
+            unsafe {
+                device_set_rumble(device, params);
+                com_release(device);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // XInput + Win32 keyboard/mouse fallback backend
+    // -------------------------------------------------------------------------
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        last_mouse: MouseState,
+        vk_buf: Vec<u8>,
     }
 
     impl Source for Host {
@@ -1191,50 +2145,73 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
-                for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
-                        pad.buttons |= button;
-                    }
-                }
+                apply_scripted_buttons(&mut pad, &mut self.vk_buf);
             }
             Some(pad)
         }
 
-        fn keys(&mut self) -> Vec<KeyState> {
-            let mut down = scripted();
-            if focused() {
+        fn keys(&mut self, out: &mut Vec<KeyState>) {
+            out.clear();
+            scripted_into(&mut self.vk_buf);
+            let fg_tid = foreground_thread();
+            if fg_tid.is_some() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
-                down.extend(held);
-            }
-            down.into_iter()
-                .map(|vk| KeyState {
+                for vk in 0x08..=0xFE_u8 {
+                    if (0x10..=0x12).contains(&vk) || self.vk_buf.contains(&vk) {
+                        continue;
+                    }
                     // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
-                    ..Default::default()
-                })
-                .collect()
+                    if unsafe { GetAsyncKeyState(i32::from(vk)) } < 0 {
+                        self.vk_buf.push(vk);
+                    }
+                }
+            }
+            if !self.vk_buf.is_empty() {
+                push_win32_keys(&self.vk_buf, fg_tid, out);
+            }
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        fn mouse(&mut self) -> Option<MouseState> {
+            if foreground_thread().is_some() {
+                const MOUSE_BUTTONS: [(i32, u32); 5] = [
+                    (VK_LBUTTON as i32, MOUSE_LEFT),
+                    (VK_RBUTTON as i32, MOUSE_RIGHT),
+                    (VK_MBUTTON as i32, MOUSE_MIDDLE),
+                    (VK_XBUTTON1 as i32, MOUSE_BUTTON4),
+                    (VK_XBUTTON2 as i32, MOUSE_BUTTON5),
+                ];
+                let mut buttons = 0;
+                for (vk, bit) in MOUSE_BUTTONS {
+                    // SAFETY: plain query.
+                    if unsafe { GetAsyncKeyState(vk) } < 0 {
+                        buttons |= bit;
+                    }
+                }
+                let mut pt = POINT::default();
+                // SAFETY: valid output pointer.
+                if unsafe { GetCursorPos(&mut pt) } != 0 {
+                    self.last_mouse.position_x = i64::from(pt.x);
+                    self.last_mouse.position_y = i64::from(pt.y);
+                }
+                self.last_mouse.buttons = buttons;
+            } else {
+                self.last_mouse.buttons = 0;
+            }
+            Some(self.last_mouse)
+        }
+
+        fn rumble(&mut self, slot: usize, motors: [f32; 4]) {
+            let speed = |level: f32| (clamp_motor(level) * f32::from(u16::MAX)) as u16;
             let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wLeftMotorSpeed: speed(motors[0]),
+                wRightMotorSpeed: speed(motors[1]),
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
@@ -1246,7 +2223,8 @@ mod host {
     /// time), with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    fn scripted() -> Vec<u8> {
+    fn scripted_into(out: &mut Vec<u8>) {
+        out.clear();
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
@@ -1275,20 +2253,24 @@ mod host {
             (Instant::now(), keys.collect())
         });
         let (start, keys) = &*SCRIPT;
+        if keys.is_empty() {
+            return;
+        }
         let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(from, to, _)| (from..to).contains(&now))
-            .map(|&(_, _, vk)| vk)
-            .collect()
+        for &(from, to, vk) in keys {
+            if (from..to).contains(&now) {
+                out.push(vk);
+            }
+        }
     }
 
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
+    /// Returns the foreground window's thread ID if it belongs to our process.
+    fn foreground_thread() -> Option<u32> {
         let mut process = 0;
         // SAFETY: plain queries; a null window gives process 0.
         unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
+            let tid = GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
+            (process == GetCurrentProcessId()).then_some(tid)
         }
     }
 
@@ -1313,11 +2295,57 @@ mod host {
             (1.0, -1.0, 1.0, 0.0)
         );
     }
+
+    #[test]
+    fn win32_translate_key_maps_unicode_and_modifiers() {
+        // SAFETY: thread 0 returns the current thread's active keyboard layout.
+        let hkl = unsafe { GetKeyboardLayout(0) };
+        let scan_a = unsafe { MapVirtualKeyW(u32::from(b'A'), MAPVK_VK_TO_VSC_EX) };
+        let plain = [0u8; 256];
+        let (cp, dead) = translate_key(b'A', scan_a, &plain, hkl);
+        assert_eq!(cp, u32::from(b'a'));
+        assert!(!dead);
+
+        let mut shifted = [0u8; 256];
+        shifted[usize::from(VK_SHIFT)] = 0x80;
+        let (cp_shift, dead_shift) = translate_key(b'A', scan_a, &shifted, hkl);
+        assert_eq!(cp_shift, u32::from(b'A'));
+        assert!(!dead_shift);
+
+        // Non-character function key produces code point 0.
+        let scan_f1 = unsafe { MapVirtualKeyW(0x70, MAPVK_VK_TO_VSC_EX) };
+        assert_eq!(translate_key(0x70, scan_f1, &plain, hkl), (0, false));
+    }
+
+    #[test]
+    fn native_gameinput_loads_polls_and_fallback_works() {
+        let mut native = NativeGameInput::try_new()
+            .expect("System32 GameInput.dll should initialize on this Windows PC");
+        assert_eq!(native.rumble_motors(), RUMBLE_MOTORS_ALL);
+
+        let mut keys = Vec::new();
+        for slot in 0..PADS {
+            let _ = native.pad(slot);
+        }
+        native.keys(&mut keys);
+        let mouse = native.mouse();
+        assert!(mouse.is_some());
+        native.rumble(0, [0.0; 4]);
+        drop(native);
+
+        // Forced fallback uses XInput + Win32 with 2-motor rumble advertisement.
+        let mut fallback_src = create_source(false);
+        assert_eq!(fallback_src.rumble_motors(), RUMBLE_MOTORS_XINPUT);
+        fallback_src.keys(&mut keys);
+        assert!(fallback_src.mouse().is_some());
+        fallback_src.rumble(0, [0.0; 4]);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use super::*;
     use crate::HleResolver;
@@ -1325,24 +2353,44 @@ mod tests {
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;
 
-    #[derive(Default)]
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        mouse: Option<MouseState>,
+        rumble: Vec<(usize, [f32; 4])>,
+        rumble_motors: u32,
+    }
+
+    impl Default for FakeHost {
+        fn default() -> Self {
+            Self {
+                pads: Default::default(),
+                keys: Vec::new(),
+                mouse: None,
+                rumble: Vec::new(),
+                rumble_motors: RUMBLE_MOTORS_XINPUT,
+            }
+        }
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
+        fn rumble_motors(&self) -> u32 {
+            self.0.lock().unwrap().rumble_motors
+        }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             self.0.lock().unwrap().pads[slot]
         }
-        fn keys(&mut self) -> Vec<KeyState> {
-            self.0.lock().unwrap().keys.clone()
+        fn keys(&mut self, out: &mut Vec<KeyState>) {
+            out.clear();
+            out.extend_from_slice(&self.0.lock().unwrap().keys);
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn mouse(&mut self) -> Option<MouseState> {
+            self.0.lock().unwrap().mouse
+        }
+        fn rumble(&mut self, slot: usize, motors: [f32; 4]) {
+            self.0.lock().unwrap().rumble.push((slot, motors));
         }
     }
 
@@ -1351,7 +2399,14 @@ mod tests {
     }
 
     fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
-        let host = Arc::new(Mutex::new(FakeHost::default()));
+        fake_with_motors(one_pad, RUMBLE_MOTORS_XINPUT)
+    }
+
+    fn fake_with_motors(one_pad: bool, motors: u32) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        let host = Arc::new(Mutex::new(FakeHost {
+            rumble_motors: motors,
+            ..Default::default()
+        }));
         let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
         hub.poll();
         (hub, host)
@@ -1388,7 +2443,7 @@ mod tests {
         log.lock().unwrap().push((index, current, previous));
     }
 
-    fn register(hub: &Hub, kind: u32, enumeration: u32, log: &Log) -> u64 {
+    fn register(hub: &Hub, input_kind: u32, enumeration: u32, log: &Log) -> u64 {
         type Register = extern "system" fn(
             This,
             *const Device,
@@ -1405,7 +2460,7 @@ mod tests {
         let hr = register(
             &hub.object,
             std::ptr::null(),
-            kind,
+            input_kind,
             1,
             enumeration,
             context,
@@ -1426,31 +2481,48 @@ mod tests {
         }
     }
 
-    fn current(hub: &Hub, kind: u32, device: usize) -> Result<*const Reading, HRESULT> {
+    fn current(hub: &Hub, input_kind: u32, device: usize) -> Result<*const Reading, HRESULT> {
         type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
         let mut out = std::ptr::null();
         let hr = slot::<Current, _>(&hub.object, 0x20)(
             &hub.object,
-            kind,
+            input_kind,
             &hub.devices[device],
             &mut out,
         );
         result(hr, out)
     }
 
-    fn walk(hub: &Hub, offset: usize, from: *const Reading) -> Result<*const Reading, HRESULT> {
+    fn walk_kind(
+        hub: &Hub,
+        offset: usize,
+        from: *const Reading,
+        input_kind: u32,
+    ) -> Result<*const Reading, HRESULT> {
         type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
         let mut out = std::ptr::null();
         let device = reading(from).device;
         let hr =
-            slot::<Walk, _>(&hub.object, offset)(&hub.object, from, GAMEPAD_KIND, device, &mut out);
+            slot::<Walk, _>(&hub.object, offset)(&hub.object, from, input_kind, device, &mut out);
         result(hr, out)
+    }
+
+    fn walk(hub: &Hub, offset: usize, from: *const Reading) -> Result<*const Reading, HRESULT> {
+        walk_kind(hub, offset, from, GAMEPAD_KIND)
     }
 
     fn pad(reading: *const Reading) -> PadState {
         let mut state = PadState::default();
         let get =
             slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(reading, 0xb0);
+        assert!(get(reading, &mut state));
+        state
+    }
+
+    fn mouse(reading: *const Reading) -> MouseState {
+        let mut state = MouseState::default();
+        let get =
+            slot::<extern "system" fn(*const Reading, *mut MouseState) -> bool, _>(reading, 0x80);
         assert!(get(reading, &mut state));
         state
     }
@@ -1578,29 +2650,33 @@ mod tests {
         let log = Log::default();
         register(hub, GAMEPAD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
-        let pad = |hub: &Hub| match &hub.state().slots[FALLBACK].history.back().unwrap().value {
+        let pad = |hub: &Hub| match &hub.slots()[FALLBACK].history.back().unwrap().value {
             Value::Pad(p) => *p,
-            Value::Keys(_) => unreachable!(),
+            Value::Keys(_) | Value::Mouse(_) => unreachable!(),
         };
         host.lock().unwrap().keys = vec![key(b'D')];
         hub.poll();
         assert_eq!(pad(hub).left_x, 1.0);
         // A pad is switched on, in any slot: its input arrives, beside the
         // keyboard's, and no device comes or goes.
-        host.lock().unwrap().pads[2] = Some(PadState { buttons: A, left_y: -0.5, ..Default::default() });
+        host.lock().unwrap().pads[2] = Some(PadState {
+            buttons: A,
+            left_y: -0.5,
+            ..Default::default()
+        });
         hub.poll();
         let p = pad(hub);
         assert_eq!((p.buttons, p.left_x, p.left_y), (A, 1.0, -0.5));
         let device: *const Device = &hub.devices[FALLBACK];
-        set_rumble(device, &[1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(host.lock().unwrap().rumble, [(2, u16::MAX, 0)]);
+        set_rumble(device, &[1.0, 0.0, 0.25, 0.75]);
+        assert_eq!(host.lock().unwrap().rumble, [(2, [1.0, 0.0, 0.25, 0.75])]);
         // And off again.
         host.lock().unwrap().pads[2] = None;
         host.lock().unwrap().keys.clear();
         hub.poll();
         assert_eq!(pad(hub), PadState::default());
         assert_eq!(log.lock().unwrap().len(), 1);
-        assert!(!hub.state().slots[2].connected);
+        assert!(!hub.slots()[2].connected);
     }
 
     #[test]
@@ -1621,7 +2697,6 @@ mod tests {
 
     #[test]
     fn unregistering_waits_for_a_running_callback() {
-        use std::sync::atomic::AtomicBool;
         static INSIDE: AtomicBool = AtomicBool::new(false);
         static LEAVE: AtomicBool = AtomicBool::new(false);
         static FROM_INSIDE: AtomicU32 = AtomicU32::new(0);
@@ -1658,7 +2733,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1667,7 +2751,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1701,9 +2788,286 @@ mod tests {
 
         type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
         let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        rumble(device, &[0.5, 1.0, 0.25, 0.75]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, [0.5, 1.0, 0.25, 0.75]), (2, [0.0; 4])]
+        );
+    }
+
+    #[test]
+    fn impulse_trigger_rumble_forwards_four_motors_and_advertises_capabilities() {
+        // Native 4-motor hub in one_pad = false mode.
+        let (hub_multi, host_multi) = fake_with_motors(false, RUMBLE_MOTORS_ALL);
+        assert_eq!(hub_multi.devices[0].info.rumble_motors, RUMBLE_MOTORS_ALL);
+        assert_eq!(hub_multi.devices[KEYBOARD].info.rumble_motors, 0);
+        assert_eq!(hub_multi.devices[MOUSE].info.rumble_motors, 0);
+
+        host_multi.lock().unwrap().pads[1] = Some(PadState::default());
+        hub_multi.poll();
+        set_rumble(&hub_multi.devices[1], &[0.2, 0.4, 0.6, 0.8]);
+        set_rumble(&hub_multi.devices[1], &[1.5, -0.5, f32::NAN, 0.3]);
+        assert_eq!(
+            host_multi.lock().unwrap().rumble,
+            [(1, [0.2, 0.4, 0.6, 0.8]), (1, [1.0, 0.0, 0.0, 0.3])]
+        );
+
+        // Native 4-motor hub in one_pad = true mode forwards to all connected pads.
+        let (hub_one, host_one) = fake_with_motors(true, RUMBLE_MOTORS_ALL);
+        assert_eq!(
+            hub_one.devices[FALLBACK].info.rumble_motors,
+            RUMBLE_MOTORS_ALL
+        );
+        host_one.lock().unwrap().pads[0] = Some(PadState::default());
+        host_one.lock().unwrap().pads[3] = Some(PadState::default());
+        hub_one.poll();
+        set_rumble(&hub_one.devices[FALLBACK], &[0.1, 0.2, 0.9, 1.0]);
+        assert_eq!(
+            host_one.lock().unwrap().rumble,
+            [(0, [0.1, 0.2, 0.9, 1.0]), (3, [0.1, 0.2, 0.9, 1.0])]
+        );
+    }
+
+    #[test]
+    fn mouse_connects_reads_walks_history_and_disconnects() {
+        assert_eq!(size_of::<MouseState>(), 40);
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, MOUSE_KIND, 2, &log);
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
+
+        let m1 = MouseState {
+            buttons: MOUSE_LEFT,
+            position_x: 120,
+            position_y: -45,
+            wheel_x: 0,
+            wheel_y: 120,
+        };
+        host.lock().unwrap().mouse = Some(m1);
+        hub.poll();
+        assert_eq!(*log.lock().unwrap(), [(MOUSE, STATUS_CONNECTED, 0)]);
+
+        let r1 = current(hub, MOUSE_KIND, MOUSE).unwrap();
+        assert_eq!(mouse(r1), m1);
+        // Wildcard device lookup also finds the mouse.
+        type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
+        let mut out = std::ptr::null();
+        assert_eq!(
+            slot::<Current, _>(&hub.object, 0x20)(&hub.object, MOUSE_KIND, std::ptr::null(), &mut out),
+            S_OK
+        );
+        assert_eq!(out.cast::<Reading>(), r1);
+        release(out.cast());
+
+        // Mouse reading is not a gamepad reading.
+        let mut dummy_pad = PadState::default();
+        assert!(!slot::<extern "system" fn(*const Reading, *mut PadState) -> bool, _>(r1, 0xb0)(
+            r1,
+            &mut dummy_pad
+        ));
+
+        let m2 = MouseState {
+            buttons: MOUSE_RIGHT | MOUSE_BUTTON4,
+            position_x: 300,
+            position_y: 500,
+            wheel_x: -1,
+            wheel_y: 240,
+        };
+        host.lock().unwrap().mouse = Some(m2);
+        hub.poll();
+        let r2 = current(hub, MOUSE_KIND, MOUSE).unwrap();
+        assert_eq!(mouse(r2), m2);
+        assert_eq!(walk_kind(hub, 0x30, r2, MOUSE_KIND), Ok(r1));
+        assert_eq!(walk_kind(hub, 0x28, r1, MOUSE_KIND), Ok(r2));
+        for r in [r1, r1, r2, r2] {
+            release(r);
+        }
+
+        host.lock().unwrap().mouse = None;
+        hub.poll();
+        assert_eq!(log.lock().unwrap()[1..], [(MOUSE, 0, STATUS_CONNECTED)]);
+        assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
+    }
+
+    #[test]
+    fn reading_callbacks_deliver_filter_stop_and_synchronize_unregister() {
+        type RegisterReading = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            f32,
+            *mut c_void,
+            Option<ReadingCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        type ReadingLog = Mutex<Vec<(u64, u32, u64)>>;
+
+        extern "system" fn record_reading(
+            token: u64,
+            context: *mut c_void,
+            r: *const Reading,
+            overrun: bool,
+        ) {
+            assert!(!overrun);
+            // SAFETY: test passes `&ReadingLog` and valid `Reading`.
+            let log = unsafe { &*(context as *const ReadingLog) };
+            let r = reading(r);
+            log.lock().unwrap().push((token, r.kind(), r.sequence));
+        }
+
+        let (hub, host) = fake();
+        let reg = slot::<RegisterReading, _>(&hub.object, 0x40);
+        let stop = slot::<extern "system" fn(This, u64), _>(&hub.object, 0x60);
+        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
+
+        // Invalid arguments fail cleanly and zero out token.
+        let mut tok = 99;
+        assert_eq!(
+            reg(&hub.object, std::ptr::null(), GAMEPAD_KIND, 0.0, std::ptr::null_mut(), None, &mut tok),
+            E_INVALIDARG
+        );
+        assert_eq!(tok, 0);
+
+        let pad_log = ReadingLog::default();
+        let mouse_log = ReadingLog::default();
+        let mut pad_tok = 0;
+        let mut mouse_tok = 0;
+        // Pad callback on slot 0 with analog threshold 0.25.
+        assert_eq!(
+            reg(
+                &hub.object,
+                &hub.devices[0],
+                GAMEPAD_KIND,
+                0.25,
+                (&pad_log as *const ReadingLog).cast_mut().cast(),
+                Some(record_reading),
+                &mut pad_tok,
+            ),
+            S_OK
+        );
+        // Mouse callback on any device.
+        assert_eq!(
+            reg(
+                &hub.object,
+                std::ptr::null(),
+                MOUSE_KIND,
+                0.0,
+                (&mouse_log as *const ReadingLog).cast_mut().cast(),
+                Some(record_reading),
+                &mut mouse_tok,
+            ),
+            S_OK
+        );
+
+        // Pad 0 connects: delivered once.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: 0.0,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(pad_log.lock().unwrap().len(), 1);
+        assert!(mouse_log.lock().unwrap().is_empty());
+
+        // Analog change below threshold (0.1 < 0.25): filtered out.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: 0.1,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(pad_log.lock().unwrap().len(), 1);
+
+        // Analog change meeting threshold (0.3 >= 0.25): delivered.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: 0.3,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(pad_log.lock().unwrap().len(), 2);
+
+        // Pad 1 change does not trigger slot 0's callback.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(pad_log.lock().unwrap().len(), 2);
+
+        // Mouse reading triggers mouse callback only.
+        host.lock().unwrap().mouse = Some(MouseState {
+            buttons: MOUSE_LEFT,
+            position_x: 10,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(mouse_log.lock().unwrap().len(), 1);
+        assert_eq!(mouse_log.lock().unwrap()[0].1, MOUSE_KIND);
+
+        // StopCallback halts future delivery.
+        stop(&hub.object, mouse_tok);
+        host.lock().unwrap().mouse = Some(MouseState {
+            buttons: MOUSE_RIGHT,
+            position_x: 20,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(mouse_log.lock().unwrap().len(), 1);
+
+        assert!(unregister(&hub.object, pad_tok, 5000));
+
+        // Verify UnregisterCallback waits for an in-flight reading callback.
+        static R_INSIDE: AtomicBool = AtomicBool::new(false);
+        static R_LEAVE: AtomicBool = AtomicBool::new(false);
+        static R_SELF_FAIL: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn slow_reading(
+            token: u64,
+            context: *mut c_void,
+            _r: *const Reading,
+            _overrun: bool,
+        ) {
+            let unreg = slot::<extern "system" fn(This, u64, u64) -> bool, _>(context, 0x68);
+            if !unreg(context.cast(), token, 0) {
+                R_SELF_FAIL.fetch_add(1, Ordering::SeqCst);
+            }
+            R_INSIDE.store(true, Ordering::SeqCst);
+            while !R_LEAVE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let mut slow_tok = 0;
+        let ctx = (&raw const hub.object).cast_mut().cast();
+        assert_eq!(
+            reg(
+                &hub.object,
+                std::ptr::null(),
+                MOUSE_KIND,
+                0.0,
+                ctx,
+                Some(slow_reading),
+                &mut slow_tok,
+            ),
+            S_OK
+        );
+        host.lock().unwrap().mouse = Some(MouseState {
+            position_x: 99,
+            ..Default::default()
+        });
+        let poller = std::thread::spawn(|| hub.poll());
+        while !R_INSIDE.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!unregister(&hub.object, slow_tok, 5000));
+        let releaser = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(40));
+            R_LEAVE.store(true, Ordering::SeqCst);
+        });
+        let t0 = Instant::now();
+        assert!(unregister(&hub.object, slow_tok, u64::MAX));
+        assert!(t0.elapsed() >= Duration::from_millis(30));
+        assert_eq!(R_SELF_FAIL.load(Ordering::SeqCst), 1);
+        poller.join().unwrap();
+        releaser.join().unwrap();
     }
 }

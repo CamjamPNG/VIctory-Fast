@@ -55,8 +55,12 @@ uint load(uint source, uint at) {
 }
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     uint count = jobs.Load(0);
+    uint first = gid.x * 64u;
+    if (first >= count) {
+        return;
+    }
     bool active = id.x < count;
     uint4 job = uint4(0, 0, 0, 0);
     uint record[5] = {0, 0, 0, 0, 0};
@@ -84,8 +88,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
             cost = record[0] * record[1];
         } else if (kind == 2) {
-            uint3 g = uint3(record[0], record[1], record[2]);
-            g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+            uint3 raw = uint3(record[0], record[1], record[2]);
+            asked = max(raw.x, max(raw.y, raw.z));
+            uint3 g = min(raw, uint3(raw.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
             if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
                 g = uint3(0, 0, 0);
             }
@@ -93,6 +98,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[0] = g.x;
             record[1] = g.y;
             record[2] = g.z;
+        } else if (kind == 11) {
+            // 1D indirect mesh dispatch (`DispatchMeshX`): 1 word in, 3 words (x, 1, 1) out.
+            uint x = record[0];
+            if (x == 0u || x > 65535u) {
+                record[0] = 0;
+                record[1] = 0;
+                record[2] = 0;
+            } else {
+                asked = x;
+                record[0] = x;
+                record[1] = 1;
+                record[2] = 1;
+            }
+            cost = record[0] * 128u;
         } else {
             if (record[0] > 65535u) {
                 record[0] = 0;
@@ -108,57 +127,66 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     costs[gi] = cost;
     GroupMemoryBarrierWithGroupSync();
-    if (active && kind > 2) {
+    if (active && kind >= 2) {
         uint was;
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
-    uint first = id.x - gi;
-    uint n = count > first ? min(64u, count - first) : 0u;
-    if (gi == 0 && n > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = before;
-            for (uint j = 0; j < n; j++) {
-                uint c = costs[j];
-                if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+    uint n = min(64u, count - first);
+    if (gi == 0) {
+        uint group_cost = 0;
+        for (uint ci = 0; ci < n; ci++) {
+            group_cost |= costs[ci];
+        }
+        if (group_cost == 0) {
+            for (uint k = 0; k < n; k++) {
+                fits[k] = 1;
+            }
+        } else {
+            uint before;
+            budget.InterlockedOr(0, 0, before);
+            [allow_uav_condition]
+            while (before < BUDGET) {
+                uint next = before;
+                for (uint j = 0; j < n; j++) {
+                    uint c = costs[j];
+                    if (c > 0 && next < BUDGET) {
+                        next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
+                    }
                 }
+                if (next == before) break;
+                uint prev;
+                budget.InterlockedCompareExchange(0, before, next, prev);
+                if (prev == before) break;
+                before = prev;
             }
-            if (next == before) break;
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        uint at = before;
-        uint refused = 0;
-        uint biggest = 0;
-        for (uint k = 0; k < n; k++) {
-            uint c = costs[k];
-            uint fit = 1;
-            if (c > 0) {
-                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
-                refused += 1 - fit;
-                biggest = max(biggest, c);
+            uint at = before;
+            uint refused = 0;
+            uint biggest = 0;
+            for (uint k = 0; k < n; k++) {
+                uint c = costs[k];
+                uint fit = 1;
+                if (c > 0) {
+                    fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                    at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+                    refused += 1 - fit;
+                    biggest = max(biggest, c);
+                }
+                fits[k] = fit;
             }
-            fits[k] = fit;
-        }
-        // Diagnostics: the records that run empty for want of budget, and
-        // the largest cost there was (small ones are not told).
-        uint told;
-        if (refused > 0) {
-            budget.InterlockedAdd(12, refused, told);
-        }
-        if (biggest >= (1u << 22)) {
-            budget.InterlockedMax(16, biggest, told);
+            // Diagnostics: the records that run empty for want of budget, and
+            // the largest cost there was (small ones are not told).
+            uint told;
+            if (refused > 0) {
+                budget.InterlockedAdd(12, refused, told);
+            }
+            if (biggest >= (1u << 22)) {
+                budget.InterlockedMax(16, biggest, told);
+            }
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && n > 0 && all_asked > 0) {
+    if (gi == 0 && all_asked > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);
@@ -173,7 +201,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[2] = 0;
         }
     }
-    for (uint s = 0; s < words; s++) {
+    uint out_words = (kind == 11) ? 3u : words;
+    for (uint s = 0; s < out_words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
     }
 }
@@ -189,9 +218,15 @@ pub(crate) fn job(source: u32, kind: u32, times: u32) -> u32 {
     source | (kind << 4) | (words(kind).unwrap_or(0) << 8) | (times << 16)
 }
 
+/// Packs `(source, offset, kind)` into a single key for inline dedup scans.
+#[inline]
+fn pack_key(source: u32, offset: u32, kind: u32) -> u64 {
+    (u64::from(source) << 40) | (u64::from(kind) << 32) | u64::from(offset)
+}
+
 /// The jobs of a pass as the CPU fills them ([`SOURCE`]), and where it
-/// keeps which record is where.
-#[derive(Default)]
+/// keeps which record is where. Uses inline fixed-capacity arrays so opening
+/// a batch incurs zero heap allocations.
 pub(crate) struct Table {
     /// The table in upload memory ([`TABLE`] bytes).
     at: usize,
@@ -200,10 +235,25 @@ pub(crate) struct Table {
     /// The host copies it can read, by number ([`crate::shadow::Shadow::id`];
     /// 0: none).
     sources: [u64; SOURCES],
-    /// How many executions each job is charged for so far.
-    times: Vec<u32>,
-    /// The job of a record (source, offset, kind).
-    known: std::collections::HashMap<(u32, u32, u32), u32>,
+    /// Number of active jobs (`0..=JOBS`).
+    len: u32,
+    /// Packed `(source, kind, offset)` key for each active job `0..len`.
+    keys: [u64; JOBS as usize],
+    /// How many executions each job is charged for so far (`1..=TIMES`).
+    times: [u8; JOBS as usize],
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self {
+            at: 0,
+            base: 0,
+            sources: [0; SOURCES],
+            len: 0,
+            keys: [0; JOBS as usize],
+            times: [0; JOBS as usize],
+        }
+    }
 }
 
 impl Table {
@@ -227,23 +277,33 @@ impl Table {
         let source = self.sources.iter().position(|&s| s == id)? as u32;
         let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
         offset.checked_add(words(kind)? * 4)?;
-        let key = (source, offset, kind);
+        let key = pack_key(source, offset, kind);
         let table = self.at as *mut u32;
         let place = |i: u32| u64::from(self.base + i * SLOT);
-        if let Some(&i) = self.known.get(&key)
-            && self.times[i as usize] < TIMES
-        {
-            self.times[i as usize] += 1;
-            // SAFETY: the job's own word of the table ([`Table::new`]).
-            unsafe { table.add(4 + 4 * i as usize).write_volatile(job(source, kind, self.times[i as usize])) };
-            return Some(place(i));
+        // Reverse scan hits the most recently allocated job for `key` first so
+        // once a slot reaches `TIMES`, subsequent calls find the overflow slot.
+        for i in (0..self.len as usize).rev() {
+            if self.keys[i] == key {
+                if u32::from(self.times[i]) < TIMES {
+                    self.times[i] += 1;
+                    // SAFETY: the job's own word of the table ([`Table::new`]).
+                    unsafe {
+                        table
+                            .add(4 + 4 * i)
+                            .write_volatile(job(source, kind, u32::from(self.times[i])));
+                    }
+                    return Some(place(i as u32));
+                }
+                break;
+            }
         }
-        let i = self.times.len() as u32;
+        let i = self.len;
         if i == JOBS {
             return None;
         }
-        self.times.push(1);
-        self.known.insert(key, i);
+        self.keys[i as usize] = key;
+        self.times[i as usize] = 1;
+        self.len = i + 1;
         // SAFETY: inside the table: fewer than [`JOBS`] jobs before it.
         unsafe {
             let to = table.add(4 + 4 * i as usize);

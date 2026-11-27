@@ -10,7 +10,12 @@
 //! which cannot be watched, a content hash of the whole memory at every
 //! submission that samples it.
 //!
-//! shortcut: a change detiles the whole texture, not the pages written.
+//! Dirty-page and per-subresource tracking (`VICTORY_PARTIAL_DETILE`, on by
+//! default; `=0` detiles/uploads the whole texture) restricts detiling and
+//! `CopyTextureRegion` uploads to only the mips and slices whose tiled bytes
+//! changed. When `VICTORY_GPU_DETILE=1` is set, tiled textures skip CPU
+//! detiling and run a D3D12 compute shader on the prelude direct command list
+//! (`crate::gpu_detile`).
 //! Only textures read through descriptor tables are brought up to date
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
@@ -63,7 +68,14 @@ pub(crate) struct Staging {
     /// ([`once`]): read when the list is submitted, and never looked at again.
     once: std::sync::atomic::AtomicBool,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
+    /// With `gpu_detile`, this is the tiled upload buffer size (`read` rounded up
+    /// to 4 bytes); otherwise it equals `linear_bytes`.
     bytes: u64,
+    /// Total bytes of the linear subresource footprints (`GetCopyableFootprints`).
+    linear_bytes: u64,
+    /// Whether this staging buffer holds raw tiled bytes to be detiled on the
+    /// GPU during `PreludeUpload::record` (`VICTORY_GPU_DETILE=1`).
+    gpu_detile: bool,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a list's prelude last
@@ -71,6 +83,9 @@ pub(crate) struct Staging {
     /// records `CopyTextureRegion` at submission time (after `refresh()`)
     /// only when `!uploaded || dirty`.
     dirty: std::sync::atomic::AtomicBool,
+    /// Bitmask of subresources (`0..footprints.len().min(64)`) modified since
+    /// the last prelude upload (`u64::MAX` means every subresource).
+    dirty_subs: std::sync::atomic::AtomicU64,
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
@@ -112,6 +127,12 @@ struct Last {
     /// The frame it was read in ahead of its submission
     /// ([`Staging::refresh_ahead`]).
     ahead: Option<u64>,
+    /// Per-subresource content digests for partial detile/upload on hash-checked
+    /// textures (`VICTORY_PARTIAL_DETILE`).
+    sub_hashes: Vec<Option<Digest>>,
+    /// Whether the full tiled upload buffer has been populated at least once
+    /// (`gpu_detile` mode).
+    gpu_seeded: bool,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -665,6 +686,9 @@ thread_local! {
     /// The thread records the upload of a texture picked by index, of which
     /// that many bytes were found mapped just now (`u64::MAX`: not asked).
     pub(crate) static PICKING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// The thread is staging a texture for a copy-only queue (`texture::ahead`),
+    /// which cannot dispatch GPU compute detile shaders.
+    pub(crate) static COPY_QUEUE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a staging buffer made for one upload of a texture picked by index
@@ -839,6 +863,100 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     });
 }
 
+/// Whether partial dirty-page / per-subresource texture detiling and upload is
+/// enabled (`VICTORY_PARTIAL_DETILE=0` disables it and falls back to full
+/// texture detile/upload). Enabled by default.
+fn partial_detile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PARTIAL_DETILE").is_none_or(|v| v != "0"))
+}
+
+/// Bitmask covering every subresource (`0..count`), or `u64::MAX` when `count >= 64`.
+fn all_subs_mask(count: usize) -> u64 {
+    if count == 0 {
+        0
+    } else if count >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << count) - 1
+    }
+}
+
+/// Returns whether subresource `i` is selected by `sub_mask` (always true when
+/// the texture has more than 64 subresources).
+#[inline]
+fn sub_selected(sub_mask: u64, i: usize, sub_count: usize) -> bool {
+    sub_count > 64 || (i < 64 && (sub_mask & (1u64 << i)) != 0)
+}
+
+/// Maps dirty 64 KiB write-watch/guard pages (`w > since`) inside `[start, start + read)`
+/// to the bitmask of subresources (`0..sub_count`) whose tiled byte spans overlap them.
+#[allow(clippy::too_many_arguments)]
+fn dirty_subs_from_pages(
+    layout: &victory_formats::texture::Layout,
+    first: u32,
+    mips: u32,
+    sub_count: usize,
+    start: usize,
+    read: usize,
+    written: &[(usize, u64)],
+    since: u64,
+) -> u64 {
+    let all = all_subs_mask(sub_count);
+    if !partial_detile() || sub_count <= 1 || sub_count > 64 || read == 0 {
+        return all;
+    }
+    let page_bytes = crate::watch::PAGE;
+    // Merge adjacent dirty 64 KiB pages into minimal relative byte ranges.
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for &(page, epoch) in written {
+        if epoch <= since {
+            continue;
+        }
+        let page_start = page.saturating_mul(page_bytes);
+        let page_end = page_start.saturating_add(page_bytes);
+        if page_end <= start || page_start >= start.saturating_add(read) {
+            continue;
+        }
+        let lo = page_start.saturating_sub(start) as u64;
+        let hi = page_end.saturating_sub(start).min(read) as u64;
+        if lo >= hi {
+            continue;
+        }
+        if let Some(last) = ranges.last_mut()
+            && lo <= last.1
+        {
+            last.1 = last.1.max(hi);
+        } else {
+            ranges.push((lo, hi));
+        }
+    }
+    if ranges.is_empty() {
+        return 0;
+    }
+    let per_slice = mips - first;
+    let mut mask = 0u64;
+    for i in 0..sub_count {
+        let mip = first + (i as u32) % per_slice;
+        let slice = (i as u32) / per_slice;
+        if ranges
+            .iter()
+            .any(|&(lo, hi)| layout.subresource_overlaps(mip, slice, lo, hi))
+        {
+            mask |= 1u64 << i;
+        }
+    }
+    mask
+}
+
+/// Upload instructions produced by [`PreludeUpload::finish_refresh`] for
+/// `HostList::prelude`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UploadPlan {
+    pub(crate) first_upload: bool,
+    pub(crate) sub_mask: u64,
+}
+
 /// Pure claim helper for [`PreludeUpload::finish_refresh`]: returns
 /// `Some(first_upload)` when the host texture has never been uploaded or the
 /// staging buffer was detiled since the last upload, and `None` when the host
@@ -872,23 +990,35 @@ impl PreludeUpload {
     }
 
     /// Called on the submitting thread after `self.staging.refresh()` has
-    /// completed for this submission. Returns `Some(first_upload)` when the
+    /// completed for this submission. Returns `Some(UploadPlan)` when the
     /// list's prelude must record `CopyTextureRegion` into `self.copy.texture`.
-    pub(crate) fn finish_refresh(&self) -> Option<bool> {
-        use std::sync::atomic::Ordering::{Acquire, Relaxed};
-        // Hold `last` while claiming `dirty` and reading `detiled` so a
-        // concurrent `refresh_ahead()` cannot overlap writing `self.data`
+    pub(crate) fn finish_refresh(&self) -> Option<UploadPlan> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        // Hold `last` while claiming `dirty` / `dirty_subs` and reading `detiled`
+        // so a concurrent `refresh_ahead()` cannot overlap writing `self.data`
         // with our prelude `CopyTextureRegion` claim.
-        let (claimed, detiled) = {
+        let (claimed, pending_subs, detiled) = {
             let _last = self.staging.last.lock().unwrap_or_else(|e| e.into_inner());
             let claimed = claim_upload(&self.staging.uploaded, &self.staging.dirty);
+            let pending_subs = self.staging.dirty_subs.swap(0, AcqRel);
             let detiled = self.staging.detiled.load(Acquire);
-            (claimed, detiled)
+            (claimed, pending_subs, detiled)
         };
         let Some(first_upload) = claimed.or(self.force.then_some(false)) else {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexSkipped, 1);
             return None;
+        };
+        let all = all_subs_mask(self.staging.footprints.len());
+        let sub_mask = if first_upload
+            || self.force
+            || self.on_demand.is_some()
+            || !partial_detile()
+            || pending_subs == 0
+        {
+            all
+        } else {
+            pending_subs & all
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
@@ -914,16 +1044,29 @@ impl PreludeUpload {
         } else {
             self.staging.note_held();
         }
-        Some(first_upload)
+        Some(UploadPlan {
+            first_upload,
+            sub_mask,
+        })
     }
 
-    /// Records `CopyTextureRegion` onto `cmd_list` (the prelude command list).
-    /// `self.copy.texture` must already be in `D3D12_RESOURCE_STATE_COPY_DEST`.
-    pub(crate) fn record(&self, cmd_list: &ID3D12GraphicsCommandList) {
+    /// Records `CopyTextureRegion` (and GPU compute detiling when
+    /// `VICTORY_GPU_DETILE=1`) onto `cmd_list` (the prelude command list) for
+    /// the subresources selected in `sub_mask`. `self.copy.texture` must
+    /// already be in `D3D12_RESOURCE_STATE_COPY_DEST`.
+    pub(crate) fn record(&self, cmd_list: &ID3D12GraphicsCommandList, sub_mask: u64) {
         let texture = &self.copy.texture;
+        let sub_count = self.staging.footprints.len();
+        if self.staging.gpu_detile {
+            self.record_gpu_detiled(cmd_list, texture, sub_mask, sub_count);
+            return;
+        }
         // The staging buffer lives as long as `self.staging`, which the list's
         // deferred steps hold until the list is reset after GPU completion.
         for (i, footprint) in self.staging.footprints.iter().enumerate() {
+            if !sub_selected(sub_mask, i, sub_count) {
+                continue;
+            }
             let to = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: a borrowed pointer the location never releases.
                 pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -945,6 +1088,111 @@ impl PreludeUpload {
             };
             // SAFETY: an open prelude list; both locations name live resources.
             unsafe { cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        }
+    }
+
+    /// Dispatches the native compute detiler from `self.staging.buffer` (raw
+    /// tiled bytes) into a shared device-local UAV scratch buffer, then copies
+    /// the selected subresources VRAM-to-VRAM into `texture`.
+    fn record_gpu_detiled(
+        &self,
+        cmd_list: &ID3D12GraphicsCommandList,
+        texture: &ID3D12Resource,
+        sub_mask: u64,
+        sub_count: usize,
+    ) {
+        let Some(host) = host() else {
+            return;
+        };
+        let scratch_len = self.staging.linear_bytes.next_multiple_of(4).max(4);
+        let Some(scratch) = crate::gpu_detile::shared_scratch(host, scratch_len) else {
+            once!("gpu detile: no device-local scratch buffer");
+            return;
+        };
+        let held = if self.staging.on_demand {
+            self.staging
+                .detiled
+                .load(std::sync::atomic::Ordering::Acquire)
+        } else {
+            u32::MAX
+        };
+        let mut jobs = Vec::with_capacity(sub_count);
+        let mut indices = Vec::with_capacity(sub_count);
+        for (i, (footprint, &rows)) in self
+            .staging
+            .footprints
+            .iter()
+            .zip(&self.staging.rows)
+            .enumerate()
+        {
+            if !sub_selected(sub_mask, i, sub_count) {
+                continue;
+            }
+            let (mip, slice) = self.staging.part(i);
+            let row_pitch = footprint.Footprint.RowPitch;
+            let depth_pitch = row_pitch.saturating_mul(rows);
+            jobs.push(crate::gpu_detile::SubresourceJob {
+                mip,
+                slice,
+                dst_offset: footprint.Offset,
+                row_pitch,
+                depth_pitch,
+                zero: mip < 32 && held & (1 << mip) == 0,
+            });
+            indices.push(i);
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        // SAFETY: live staging upload buffer.
+        let src_va = unsafe { self.staging.buffer.GetGPUVirtualAddress() } + self.staging.base;
+        let common = D3D12_RESOURCE_STATE_COMMON;
+        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // SAFETY: open prelude direct list; `scratch` rests in COMMON between uses.
+        unsafe {
+            cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, common, uav)]);
+        }
+        let ok = crate::gpu_detile::record_detile_subresources(
+            cmd_list,
+            &self.staging.layout,
+            src_va,
+            self.staging.read as u64,
+            &scratch,
+            self.staging.linear_bytes,
+            &jobs,
+        );
+        if !ok {
+            // SAFETY: restore COMMON state before returning.
+            unsafe {
+                cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, uav, common)]);
+            }
+            once!("gpu detile dispatch validation failed; skipping texture upload");
+            return;
+        }
+        // SAFETY: open prelude direct list; transition UAV output to COPY_SOURCE,
+        // copy selected subresources into `texture`, then restore COMMON.
+        unsafe {
+            cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, uav, copy_src)]);
+            for i in indices {
+                let footprint = &self.staging.footprints[i];
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: self.staging.first - self.staging.level0 + i as u32,
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&scratch),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: *footprint,
+                    },
+                };
+                cmd_list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            cmd_list.ResourceBarrier(&[crate::host::transition(&scratch, copy_src, common)]);
         }
     }
 }
@@ -1273,6 +1521,10 @@ impl Staging {
     /// refresh detiles anew, whether the memory changed or not.
     fn forget(&self) {
         *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
+        self.dirty_subs.store(
+            all_subs_mask(self.footprints.len()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// The title memory the texture is read from: address and bytes.
@@ -1339,15 +1591,33 @@ impl Staging {
             return 0;
         }
         if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if !exact && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+            let prev_asked = last.asked;
+            if !exact && prev_asked != 0 && written.iter().all(|&(_, w)| w <= prev_asked) {
                 return 0;
             }
+            let sub_mask = if !exact && prev_asked != 0 {
+                dirty_subs_from_pages(
+                    &self.layout,
+                    self.first,
+                    self.mips,
+                    self.footprints.len(),
+                    start,
+                    size,
+                    &written,
+                    prev_asked,
+                )
+            } else {
+                all_subs_mask(self.footprints.len())
+            };
             last.asked = now;
+            if sub_mask == 0 {
+                return 0;
+            }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile_masked(read, last, sub_mask);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -1371,7 +1641,22 @@ impl Staging {
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let prev_asked = last.asked;
+            let unwritten = prev_asked != 0 && written.iter().all(|&(_, w)| w <= prev_asked);
+            let guarded_dirty_mask = if !unwritten && prev_asked != 0 && last.hash.is_some() {
+                Some(dirty_subs_from_pages(
+                    &self.layout,
+                    self.first,
+                    self.mips,
+                    self.footprints.len(),
+                    start,
+                    size,
+                    &written,
+                    prev_asked,
+                ))
+            } else {
+                None
+            };
             last.asked = now;
             let frame = crate::frame::current();
             let recent_ahead = last.ahead.is_some_and(|at| frame <= at + 1);
@@ -1385,10 +1670,10 @@ impl Staging {
                 last.hot_until = frame + HOT_FRAMES;
             }
             let hot = hot_textures() && frame < last.hot_until && !recent_ahead;
-            if !exact && unwritten && !turn && !hot {
+            if !exact && (unwritten || guarded_dirty_mask == Some(0)) && !turn && !hot {
                 return 0;
             }
-            blind = unwritten;
+            blind = unwritten || guarded_dirty_mask == Some(0);
         }
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
@@ -1436,11 +1721,13 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
+                let had_prev = last.hash.is_some();
                 last.hash = Some(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                let sub_mask = self.changed_subs_by_hash(read, last, had_prev);
+                self.detile_masked(read, last, sub_mask);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -1460,9 +1747,11 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
+                let had_prev = last.hash.is_some();
                 last.hash = Some(hash);
                 found_blind(last);
-                self.detile(tiled);
+                let sub_mask = self.changed_subs_by_hash(tiled, last, had_prev);
+                self.detile_masked(tiled, last, sub_mask);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -1477,9 +1766,11 @@ impl Staging {
         if last.hash == Some(hash) {
             return size;
         }
+        let had_prev = last.hash.is_some();
         last.hash = Some(hash);
         found_blind(last);
-        self.detile(tiled);
+        let sub_mask = self.changed_subs_by_hash(tiled, last, had_prev);
+        self.detile_masked(tiled, last, sub_mask);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1491,7 +1782,7 @@ impl Staging {
     /// not at all (the submission then does it, as ever). False if it was
     /// not read. What the title writes after this is found at submission.
     pub(crate) fn refresh_ahead(&self) -> bool {
-        let size = self.layout.size as usize;
+        let size = self.read;
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
@@ -1509,7 +1800,8 @@ impl Staging {
                 return false;
             }
             last.hash = Some(digest(read));
-            self.detile(read);
+            let sub_mask = self.changed_subs_by_hash(read, last, false);
+            self.detile_masked(read, last, sub_mask);
             last.asked = now;
             last.ahead = Some(crate::frame::current());
             true
@@ -1531,8 +1823,10 @@ impl Staging {
             }
             let hash = digest(read);
             if last.hash != Some(hash) {
+                let had_prev = last.hash.is_some();
                 last.hash = Some(hash);
-                self.detile(read);
+                let sub_mask = self.changed_subs_by_hash(read, last, had_prev);
+                self.detile_masked(read, last, sub_mask);
             }
             true
         });
@@ -1571,8 +1865,10 @@ impl Staging {
                 crate::watch::change_over();
             }
             if got != 0 {
+                let had_prev = last.hash.is_some();
                 last.hash = Some(digest(read));
-                self.detile(read);
+                let sub_mask = self.changed_subs_by_hash(read, last, had_prev);
+                self.detile_masked(read, last, sub_mask);
             }
             got
         });
@@ -1588,22 +1884,74 @@ impl Staging {
         size
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Computes per-subresource digests against `last.sub_hashes` and returns
+    /// the bitmask of subresources whose tiled bytes changed (always all
+    /// subresources on first fill or when `partial_detile()` is off).
+    fn changed_subs_by_hash(&self, tiled: &[u8], last: &mut Last, had_prev: bool) -> u64 {
+        let sub_count = self.footprints.len();
+        let all = all_subs_mask(sub_count);
+        if !partial_detile() || sub_count <= 1 || sub_count > 64 {
+            return all;
+        }
+        if last.sub_hashes.len() != sub_count {
+            last.sub_hashes.resize(sub_count, None);
+        }
+        let mut mask = if had_prev { 0u64 } else { all };
+        for i in 0..sub_count {
+            let (mip, slice) = self.part(i);
+            let Some((s, e)) = self.layout.subresource_byte_span(mip, slice) else {
+                last.sub_hashes[i] = None;
+                mask |= 1u64 << i;
+                continue;
+            };
+            let (s, e) = (s as usize, e as usize);
+            if e > tiled.len() {
+                last.sub_hashes[i] = None;
+                mask |= 1u64 << i;
+                continue;
+            }
+            let h = digest(&tiled[s..e]);
+            if !had_prev || last.sub_hashes[i] != Some(h) {
+                last.sub_hashes[i] = Some(h);
+                mask |= 1u64 << i;
+            }
+        }
+        mask
+    }
+
+    /// Detiles (or stages raw tiled bytes for GPU compute detiling) the
+    /// subresources selected by `sub_mask` from `tiled` into the staging buffer.
+    fn detile_masked(&self, tiled: &[u8], last: &mut Last, mut sub_mask: u64) {
+        let sub_count = self.footprints.len();
+        let all = all_subs_mask(sub_count);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.
         let held = if self.on_demand {
-            use std::sync::atomic::Ordering::{Relaxed, Release};
+            use std::sync::atomic::Ordering::{AcqRel, Relaxed};
             let judged = self.judgement();
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
             let held = self.held_levels(judged);
-            self.detiled.store(held, Release);
+            let prev_held = self.detiled.swap(held, AcqRel);
+            let flipped = held ^ prev_held;
+            if flipped != 0 && sub_count <= 64 {
+                for i in 0..sub_count {
+                    let (mip, _) = self.part(i);
+                    if mip < 32 && (flipped & (1 << mip)) != 0 {
+                        sub_mask |= 1u64 << i;
+                    }
+                }
+            } else if flipped != 0 {
+                sub_mask = all;
+            }
             held
         } else {
             u32::MAX
         };
+        if sub_mask == 0 {
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1612,7 +1960,48 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        if self.gpu_detile {
+            let copy_len = self.read.min(tiled.len()).min(self.bytes as usize);
+            let full_copy = !last.gpu_seeded || sub_count > 64 || (sub_mask & all) == all;
+            let mut copied_partial = false;
+            if !full_copy {
+                copied_partial = true;
+                for i in 0..sub_count {
+                    if !sub_selected(sub_mask, i, sub_count) {
+                        continue;
+                    }
+                    let (mip, slice) = self.part(i);
+                    let Some((s, e)) = self.layout.subresource_byte_span(mip, slice) else {
+                        copied_partial = false;
+                        break;
+                    };
+                    let (s, e) = (s as usize, e as usize);
+                    if e > copy_len {
+                        copied_partial = false;
+                        break;
+                    }
+                    // SAFETY: `self.data` is mapped for `self.bytes >= copy_len >= e` bytes.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(tiled.as_ptr().add(s), self.data.add(s), e - s);
+                    }
+                }
+            }
+            if !copied_partial {
+                // SAFETY: `self.data` is mapped for `self.bytes >= copy_len` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(tiled.as_ptr(), self.data, copy_len);
+                }
+                last.gpu_seeded = true;
+            }
+            self.dirty_subs
+                .fetch_or(sub_mask & all, std::sync::atomic::Ordering::Release);
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            if !sub_selected(sub_mask, i, sub_count) {
+                continue;
+            }
             let (mip, slice) = self.part(i);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
@@ -1620,7 +2009,7 @@ impl Staging {
             // (VIctory 4fc9d70): to the end of the buffer at most, where a
             // block of the pool goes on with another texture's.
             let len = (pitch * rows as usize * f.Depth as usize)
-                .min(self.bytes.saturating_sub(footprint.Offset) as usize);
+                .min(self.linear_bytes.saturating_sub(footprint.Offset) as usize);
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
@@ -1640,6 +2029,8 @@ impl Staging {
         }
         // Publish dirty only after `detiled` and every texel in `self.data`
         // have been written so a prelude upload never reads half-detiled bytes.
+        self.dirty_subs
+            .fetch_or(sub_mask & all, std::sync::atomic::Ordering::Release);
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
     }
 }
@@ -1782,6 +2173,10 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     if len == 0 {
         return true;
     }
+    if crate::safecopy::on() {
+        // SAFETY: `safecopy::on()` installed the fault handler; non-mutating probe.
+        return unsafe { crate::safecopy::probe_readable(at, len, 4096) };
+    }
     let (there, of) = readable(at as usize, len, true);
     there == of
 }
@@ -1897,6 +2292,10 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     if !query && !ends_missing {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+            if crate::safecopy::on() {
+                // SAFETY: `safecopy::on()` installed the fault handler; non-mutating probe.
+                return unsafe { crate::safecopy::readable_bytes(at, len, 4096) } as u64;
+            }
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);
@@ -1910,11 +2309,23 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
+        let fast = crate::safecopy::on();
+        // Fast path: all 64 KiB blocks present in one zero-syscall probe.
+        // SAFETY: `safecopy::on()` installed the fault handler; non-mutating probe.
+        if fast && unsafe { crate::safecopy::probe_readable(at, len, BLOCK) } {
+            return len as u64;
+        }
         let mut there = 0u64;
         let mut block = start & !(BLOCK - 1);
         while block < end {
             let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
+            // SAFETY: `safecopy::on()` installed the fault handler; non-mutating probe.
+            let present = if fast {
+                unsafe { crate::safecopy::probe_readable(lo as *const u8, 1, 1) }
+            } else {
+                readable(lo, 1, true).0 == 1
+            };
+            if present {
                 there += (hi - lo) as u64;
             }
             block = block.saturating_add(BLOCK);
@@ -2021,7 +2432,14 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             Some(&mut total),
         );
     }
-    let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
+    let use_gpu_detile =
+        !COPY_QUEUE_ONLY.get() && crate::gpu_detile::can_use(&layout, read, total);
+    let alloc_bytes = if use_gpu_detile {
+        (read as u64).next_multiple_of(4).max(4)
+    } else {
+        total
+    };
+    let (piece, buffer, base, data) = match crate::pool::staging(host, alloc_bytes) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
         None => {
             let speculative = PICKING.get().is_some() && !BAKING.get();
@@ -2031,7 +2449,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
                 crate::residency::note_staging_deferred();
                 return None;
             }
-            let (buffer, data) = host.upload_buffer(total)?;
+            let (buffer, data) = host.upload_buffer(alloc_bytes)?;
             crate::host::name(&buffer, || {
                 format!(
                     "staging of {resource:?} {}x{}x{} f{}",
@@ -2041,15 +2459,16 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             (None, buffer, 0, data)
         }
     };
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(?desc, total, alloc_bytes, use_gpu_detile, "texture contents uploaded from title memory");
     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+    STAGED[1].fetch_add(alloc_bytes, std::sync::atomic::Ordering::Relaxed);
+    let init_dirty_subs = all_subs_mask(footprints.len());
     let s = Arc::new(Staging {
         buffer,
         base,
         _piece: piece,
         #[cfg(feature = "diagnostics")]
-        size: total,
+        size: alloc_bytes,
         data,
         footprints,
         rows,
@@ -2061,10 +2480,13 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         serial: copy.serial,
         holds: copy.holds.clone(),
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
-        bytes: total,
+        bytes: alloc_bytes,
+        linear_bytes: total,
+        gpu_detile: use_gpu_detile,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
+        dirty_subs: std::sync::atomic::AtomicU64::new(init_dirty_subs),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
         expected: std::sync::atomic::AtomicU64::new(0),
@@ -2275,6 +2697,298 @@ mod prelude_upload_tests {
                 "slot {slot} displayed stale frame {} instead of {video_frame}",
                 gpu_frame[slot]
             );
+        }
+    }
+
+    #[test]
+    fn dirty_pages_map_to_only_affected_subresources() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        // 1024x1024 BC7, 11 mips, 64 KiB display swizzle:
+        // tail = mips 3..11 in [0, 64 KiB), mip 2 in [64 KiB, 128 KiB),
+        // mip 1 in [128 KiB, 384 KiB), mip 0 in [384 KiB, 1408 KiB).
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 1024,
+            height: 1024,
+            depth: 1,
+            mips: 11,
+            element_bytes: 16,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        })
+        .unwrap();
+        let page_bytes = crate::watch::PAGE;
+        let base_page = 0x1000usize;
+        let start = base_page * page_bytes;
+        let read = layout.size as usize;
+
+        // Dirty page inside mip 0 only -> ONLY bit 0 set.
+        let (mip0_lo, _) = layout.subresource_byte_span(0, 0).unwrap();
+        let mip0_page = base_page + (mip0_lo as usize / page_bytes) + 1;
+        let mask0 = super::dirty_subs_from_pages(&layout, 0, 11, 11, start, read, &[(mip0_page, 5)], 4);
+        assert_eq!(mask0, 1u64 << 0, "mip 0 page should only dirty mip 0");
+
+        // Dirty page inside mip 1 only -> ONLY bit 1 set.
+        let (mip1_lo, _) = layout.subresource_byte_span(1, 0).unwrap();
+        let mip1_page = base_page + (mip1_lo as usize / page_bytes);
+        let mask1 = super::dirty_subs_from_pages(&layout, 0, 11, 11, start, read, &[(mip1_page, 5)], 4);
+        assert_eq!(mask1, 1u64 << 1, "mip 1 page should only dirty mip 1");
+
+        // Dirty page in the mip tail -> only tail mips (first_tail_mip..11) set.
+        let tail_mask = super::dirty_subs_from_pages(&layout, 0, 11, 11, start, read, &[(base_page, 5)], 4);
+        let expected_tail: u64 = (layout.first_tail_mip..11).fold(0, |m, mip| m | (1u64 << mip));
+        assert_eq!(tail_mask, expected_tail, "tail page should only dirty tail mips");
+
+        // Stale epoch (<= since) produces 0 dirty subresources.
+        let clean = super::dirty_subs_from_pages(&layout, 0, 11, 11, start, read, &[(mip0_page, 4)], 4);
+        assert_eq!(clean, 0);
+
+        // 2D array (4 slices, 4 mips): dirty page in slice 2 mip 0 -> ONLY subresource 2*4 + 0.
+        let array = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 512,
+            height: 512,
+            depth: 4,
+            mips: 4,
+            element_bytes: 16,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_S,
+        })
+        .unwrap();
+        let (s2m0_lo, _) = array.subresource_byte_span(0, 2).unwrap();
+        let s2m0_page = base_page + (s2m0_lo as usize / page_bytes);
+        let mask_arr = super::dirty_subs_from_pages(
+            &array,
+            0,
+            4,
+            16,
+            start,
+            array.size as usize,
+            &[(s2m0_page, 9)],
+            8,
+        );
+        assert_eq!(mask_arr, 1u64 << (2 * 4));
+    }
+
+    #[test]
+    fn gpu_detile_end_to_end_and_partial_mip_upload_match_cpu() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC7_UNORM, DXGI_SAMPLE_DESC};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 512,
+            height: 512,
+            depth: 1,
+            mips: 10,
+            element_bytes: 16,
+            block: 4,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_D,
+        })
+        .unwrap();
+        let mut tiled: Vec<u8> = (0..layout.size as usize)
+            .map(|i| ((i.wrapping_mul(2654435761)) >> 19) as u8)
+            .collect();
+
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 512,
+            Height: 512,
+            DepthOrArraySize: 1,
+            MipLevels: 10,
+            Format: DXGI_FORMAT_BC7_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 10];
+        let mut rows = vec![0u32; 10];
+        let mut total = 0u64;
+        // SAFETY: valid queries on live device.
+        unsafe {
+            host.device.GetCopyableFootprints(
+                &tex_desc,
+                0,
+                10,
+                0,
+                Some(footprints.as_mut_ptr()),
+                Some(rows.as_mut_ptr()),
+                None,
+                Some(&mut total),
+            );
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut tex_opt: Option<ID3D12Resource> = None;
+        // SAFETY: plain texture creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &tex_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut tex_opt,
+                )
+                .unwrap();
+        }
+        let texture = tex_opt.unwrap();
+
+        let upload_bytes = layout.size.next_multiple_of(4);
+        let (tiled_buf, tiled_ptr) = host.upload_buffer(upload_bytes).unwrap();
+        let scratch = crate::gpu_detile::shared_scratch(host, total.next_multiple_of(4)).unwrap();
+
+        let run_upload = |tiled_src: &[u8], sub_mask: u64| {
+            // SAFETY: `tiled_ptr` is mapped for `upload_bytes >= tiled_src.len()`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(tiled_src.as_ptr(), tiled_ptr, tiled_src.len());
+            }
+            let jobs: Vec<_> = (0..10usize)
+                .filter(|&i| super::sub_selected(sub_mask, i, 10))
+                .map(|i| crate::gpu_detile::SubresourceJob {
+                    mip: i as u32,
+                    slice: 0,
+                    dst_offset: footprints[i].Offset,
+                    row_pitch: footprints[i].Footprint.RowPitch,
+                    depth_pitch: footprints[i].Footprint.RowPitch * rows[i],
+                    zero: false,
+                })
+                .collect();
+            let list = host.new_list().unwrap();
+            let common = D3D12_RESOURCE_STATE_COMMON;
+            let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let copy_src = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            // SAFETY: open direct list, live resources.
+            unsafe {
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(&scratch, common, uav)]);
+                assert!(crate::gpu_detile::record_detile_subresources(
+                    &list.list,
+                    &layout,
+                    tiled_buf.GetGPUVirtualAddress(),
+                    tiled_src.len() as u64,
+                    &scratch,
+                    total,
+                    &jobs,
+                ));
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(&scratch, uav, copy_src)]);
+                for i in (0..10usize).filter(|&i| super::sub_selected(sub_mask, i, 10)) {
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+                    };
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&scratch),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprints[i] },
+                    };
+                    list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                }
+                list.list
+                    .ResourceBarrier(&[crate::host::transition(&scratch, copy_src, common)]);
+            }
+            list.close();
+            host.execute(&[&list]);
+        };
+
+        let readback_mip = |mip: usize| -> Vec<u8> {
+            let fp = footprints[mip];
+            let pitch = fp.Footprint.RowPitch as usize;
+            let len = pitch * rows[mip] as usize;
+            let rb = host.read_back_buffer(len as u64).unwrap();
+            let list = host.new_list().unwrap();
+            // SAFETY: open direct list, transition texture COPY_DEST -> COPY_SOURCE -> COPY_DEST.
+            unsafe {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &texture,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&rb),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, ..fp },
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: mip as u32 },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &texture,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: readback buffer mapped for `len` bytes.
+            unsafe {
+                rb.Map(0, None, Some(&mut ptr)).unwrap();
+                let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec();
+                rb.Unmap(0, None);
+                bytes
+            }
+        };
+
+        // Pass 1: full GPU-detiled upload of all 10 mips.
+        run_upload(&tiled, super::all_subs_mask(10));
+        for mip in [0usize, 1, 2, 5, 9] {
+            let pitch = footprints[mip].Footprint.RowPitch as usize;
+            let h = rows[mip] as usize;
+            let mut expected = vec![0u8; pitch * h];
+            layout
+                .detile(&tiled, mip as u32, 0, &mut expected, pitch, pitch * h)
+                .unwrap();
+            let got = readback_mip(mip);
+            let active = layout.mips[mip].width as usize * 16;
+            for y in 0..h {
+                assert_eq!(
+                    &got[y * pitch..y * pitch + active],
+                    &expected[y * pitch..y * pitch + active],
+                    "full upload mip {mip} row {y}"
+                );
+            }
+        }
+
+        // Pass 2: mutate ONLY mip 0 in tiled memory and upload ONLY subresource 0.
+        let (mip0_s, mip0_e) = layout.subresource_byte_span(0, 0).unwrap();
+        for b in &mut tiled[mip0_s as usize..mip0_e as usize] {
+            *b ^= 0x5a;
+        }
+        run_upload(&tiled, 1u64 << 0);
+
+        // Verify mip 0 updated bit-for-bit AND mip 1 stayed intact.
+        for mip in [0usize, 1] {
+            let pitch = footprints[mip].Footprint.RowPitch as usize;
+            let h = rows[mip] as usize;
+            let mut expected = vec![0u8; pitch * h];
+            layout
+                .detile(&tiled, mip as u32, 0, &mut expected, pitch, pitch * h)
+                .unwrap();
+            let got = readback_mip(mip);
+            let active = layout.mips[mip].width as usize * 16;
+            for y in 0..h {
+                assert_eq!(
+                    &got[y * pitch..y * pitch + active],
+                    &expected[y * pitch..y * pitch + active],
+                    "partial upload mip {mip} row {y}"
+                );
+            }
         }
     }
 }

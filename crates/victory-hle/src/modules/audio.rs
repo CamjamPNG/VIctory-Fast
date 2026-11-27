@@ -281,6 +281,7 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
     match lock(&CONTEXTS).take() {
         Some(arrays) => {
             *XMA.write().unwrap_or_else(|e| e.into_inner()) = Xma::EMPTY;
+            lock(&OVERLAP_STORE).clear();
             arrays.iter().for_each(|&p| heap_free(p as *mut u8));
             S_OK
         }
@@ -302,13 +303,13 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
 //    (27-28: 24, 32, 44.1, 48 kHz), stereo (29), output writable (31);
 // 2: read position in bits (0-25), error status (26-30), error (31);
 // 3: loop start in bits (0-25); 4: loop end in bits (0-25), current input
-//    (31); 5, 6: input addresses; 7: output address; 8: overlap buffer;
-//    9: read block (0-4).
+//    (31); 5, 6: input addresses; 7: output address; 8: overlap buffer
+//    (128-byte aligned; 256 bytes mono / 512 bytes stereo); 9: read block (0-4).
 // Titles read back only the write block, "writable" and the read block,
-// and take whatever lies between read and write.
-// shortcut: each enabled context decodes from a cold state and the overlap
-// buffer is ignored (titles copy it between consecutive contexts of one
-// voice); keep decoder state there if a title's seams turn out audible.
+// and take whatever lies between read and write. When a title supplies a
+// non-zero overlap buffer (word 8), we tag its first 16 bytes with a token
+// referencing the exact `xma::OverlapState` so copying that buffer between
+// consecutive contexts of one voice preserves overlap seamlessly.
 
 use victory_formats::xma;
 
@@ -323,9 +324,119 @@ const SAMPLES_PER_BLOCK: usize = BLOCK_BYTES / 2;
 /// Error status: the input ran out.
 const INPUT_INVALID: u32 = 4;
 
+const XMA_RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
+
+const OVERLAP_MAGIC: [u8; 4] = *b"XMAO";
+const OVERLAP_TAG_BYTES: usize = 16;
+const OVERLAP_MAX_ENTRIES: usize = 512;
+
+struct OverlapStore {
+    next_token: u64,
+    order: VecDeque<u64>,
+    entries: BTreeMap<u64, xma::OverlapState>,
+}
+
+impl OverlapStore {
+    const fn new() -> Self {
+        OverlapStore {
+            next_token: 1,
+            order: VecDeque::new(),
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.order.clear();
+        self.entries.clear();
+    }
+
+    fn save(&mut self, token: Option<u64>, state: xma::OverlapState) -> u64 {
+        if let Some(id) = token
+            && let Some(slot) = self.entries.get_mut(&id)
+        {
+            *slot = state;
+            return id;
+        }
+        let id = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1).max(1);
+        if self.entries.len() >= OVERLAP_MAX_ENTRIES
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.entries.remove(&oldest);
+        }
+        self.order.push_back(id);
+        self.entries.insert(id, state);
+        id
+    }
+
+    fn get(&self, token: u64) -> Option<xma::OverlapState> {
+        self.entries.get(&token).cloned()
+    }
+}
+
+static OVERLAP_STORE: Mutex<OverlapStore> = Mutex::new(OverlapStore::new());
+
+fn overlap_checksum(token: u64) -> u32 {
+    (token as u32) ^ ((token >> 32) as u32).rotate_left(13) ^ 0xA55A_5AA5
+}
+
+fn load_overlap(context: Context) -> Option<xma::OverlapState> {
+    let addr = context.get(8) & !0x7f;
+    if addr == 0 {
+        return None;
+    }
+    let tag = heap_bytes(addr, OVERLAP_TAG_BYTES)?;
+    if tag[0..4] != OVERLAP_MAGIC {
+        return None;
+    }
+    let token = u64::from_le_bytes(tag[4..12].try_into().ok()?);
+    let check = u32::from_le_bytes(tag[12..16].try_into().ok()?);
+    if token == 0 || check != overlap_checksum(token) {
+        return None;
+    }
+    let state = lock(&OVERLAP_STORE).get(token)?;
+    (state.channels == context.channels()).then_some(state)
+}
+
+fn save_overlap(context: Context, voice: &mut Voice, state: xma::OverlapState) {
+    let addr = context.get(8) & !0x7f;
+    if addr == 0 {
+        return;
+    }
+    let Some(tag) = heap_bytes(addr, OVERLAP_TAG_BYTES) else {
+        return;
+    };
+    let prev_token = voice.overlap_token;
+    let token = lock(&OVERLAP_STORE).save(prev_token, state);
+    if prev_token != Some(token) || voice.overlap_addr != addr {
+        tag[0..4].copy_from_slice(&OVERLAP_MAGIC);
+        tag[4..12].copy_from_slice(&token.to_le_bytes());
+        tag[12..16].copy_from_slice(&overlap_checksum(token).to_le_bytes());
+        voice.overlap_token = Some(token);
+        voice.overlap_addr = addr;
+    }
+}
+
+fn clear_overlap(context: Context, voice: &mut Voice) {
+    let addr = context.get(8) & !0x7f;
+    if addr != 0
+        && let Some(tag) = heap_bytes(addr, OVERLAP_TAG_BYTES)
+    {
+        tag.fill(0);
+    }
+    voice.overlap_token = None;
+    voice.overlap_addr = 0;
+}
+
 struct Voice {
     decoder: Option<xma::Decoder>,
     pcm: VecDeque<i16>,
+    /// Reusable per-frame scratch buffers to avoid heap allocation per frame.
+    frame_buf: Vec<u8>,
+    pcm_buf: Vec<i16>,
+    /// Active overlap store token and APU address written to word 8.
+    overlap_token: Option<u64>,
+    overlap_addr: u32,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
@@ -422,9 +533,19 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
+        let decoder = load_overlap(context).map(|saved| {
+            let rate = XMA_RATES[context.field(1, 27, 2) as usize];
+            let mut dec = xma::Decoder::new(context.channels(), rate);
+            dec.import_overlap(&saved);
+            dec
+        });
         *slot = Some(Voice {
-            decoder: None,
+            decoder,
             pcm: VecDeque::new(),
+            frame_buf: Vec::new(),
+            pcm_buf: Vec::new(),
+            overlap_token: None,
+            overlap_addr: 0,
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
             trace: Trace {
@@ -447,9 +568,15 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let Some(mut voice) = lock(&self.voices[index as usize]).take() else {
             return;
         };
+        if !voice.ended
+            && let Some(decoder) = &voice.decoder
+        {
+            let overlap = decoder.export_overlap();
+            save_overlap(context, &mut voice, overlap);
+        }
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -577,10 +704,11 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.pcm_buf.clear();
+                decoder.flush(&mut voice.pcm_buf);
+                voice.pcm.extend(voice.pcm_buf.iter().copied());
             }
+            clear_overlap(context, voice);
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
             context.set_field(2, 26, 5, INPUT_INVALID);
@@ -603,29 +731,35 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     if at < 32 {
         at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    let Some(frame) = xma::read_frame_into(data, at, &mut voice.frame_buf) else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let decoder = voice.decoder.get_or_insert_with(|| {
-        const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
-        xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
-    });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    let rate = XMA_RATES[context.field(1, 27, 2) as usize];
+    let decoder = match &mut voice.decoder {
+        Some(d) => {
+            d.reconfigure(channels, rate);
+            d
+        }
+        slot @ None => slot.insert(xma::Decoder::new(channels, rate)),
+    };
+    voice.pcm_buf.clear();
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(&voice.frame_buf, frame.bits, &mut voice.pcm_buf) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
                 at,
                 bits = frame.bits,
-                head = ?&frame.data[..frame.data.len().min(8)],
+                head = ?&voice.frame_buf[..voice.frame_buf.len().min(8)],
                 %e,
                 "XMA frame did not decode"
             );
         }
     }
+    let overlap = decoder.export_overlap();
+    save_overlap(context, voice, overlap);
     let mut next = frame.next.unwrap_or(0);
     let loops = context.field(0, 12, 8);
     let loop_end = context.field(4, 0, 26) as usize;
@@ -635,7 +769,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let looping = loops > 0 && ends_loop;
     if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
-        pcm.truncate(keep);
+        voice.pcm_buf.truncate(keep);
         next = context.field(3, 0, 26) as usize;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
@@ -643,9 +777,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     }
     // What is still to skip is this frame's (the stream's first, or a
     // loop's first when it is its last too).
-    let skip = (voice.skip * channels).min(pcm.len());
+    let skip = (voice.skip * channels).min(voice.pcm_buf.len());
     voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.pcm.extend(&voice.pcm_buf[skip..]);
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -1308,6 +1442,10 @@ mod tests {
         let mut voice = Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            frame_buf: Vec::new(),
+            pcm_buf: Vec::new(),
+            overlap_token: None,
+            overlap_addr: 0,
             skip: 0,
             ended: false,
             trace: Trace {
@@ -1425,6 +1563,139 @@ mod tests {
         assert_eq!((m.disconnect)(acp), S_OK);
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn xma_overlap_buffer_persists_state_across_contexts_and_resets_when_zeroed() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+
+        let (mut ov_a, mut ov_a_apu) = (std::ptr::null_mut(), 0);
+        let (mut ov_b, mut ov_b_apu) = (std::ptr::null_mut(), 0);
+        // Hardware-sized mono overlap buffers: 256 bytes, 128-byte aligned.
+        assert_eq!(ApuAlloc(&mut ov_a, &mut ov_a_apu, 256, 128, 1), S_OK);
+        assert_eq!(ApuAlloc(&mut ov_b, &mut ov_b_apu, 256, 128, 1), S_OK);
+
+        // Set up context 0 with a seeded overlap state, save it through disable,
+        // copy the 256-byte overlap buffer to ov_b, and enable context 1.
+        let ctx_a = Context(request.arrays[4].cast::<u32>());
+        ctx_a.set(0, 2 | 1 << 20 | 4 << 22);
+        ctx_a.set(1, 1 << 31 | 3 << 27);
+        ctx_a.set(2, 32);
+        ctx_a.set(5, input_apu);
+        ctx_a.set(8, ov_a_apu);
+
+        let mut seeded = xma::OverlapState {
+            channels: 1,
+            prev_block_len: [256, 512],
+            samples: [[0.0; xma::OVERLAP_SAMPLES]; 2],
+        };
+        for i in 0..xma::OVERLAP_SAMPLES {
+            seeded.samples[0][i] = (i as f32 * 0.04).sin() * 0.5;
+        }
+        {
+            let xma_ref = xma();
+            let mut dec = xma::Decoder::new(1, 48_000);
+            dec.import_overlap(&seeded);
+            *lock(&xma_ref.voices[0]) = Some(Voice {
+                decoder: Some(dec),
+                pcm: VecDeque::new(),
+                frame_buf: Vec::new(),
+                pcm_buf: Vec::new(),
+                overlap_token: None,
+                overlap_addr: 0,
+                skip: 0,
+                ended: false,
+                trace: Trace {
+                    since: Instant::now(),
+                    produced: 0,
+                    taken: 0,
+                    takes: 0,
+                    partial_takes: 0,
+                    frames: 0,
+                    bad_frames: 0,
+                    peak: 0,
+                    ended_ms: None,
+                },
+            });
+            xma_ref.disable(0);
+        }
+
+        // Title copies context A's 256-byte overlap buffer into context B's overlap buffer.
+        // SAFETY: both buffers are 256 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(ov_a.cast::<u8>(), ov_b.cast::<u8>(), 256) };
+
+        let ctx_b = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+        ctx_b.set(0, 2 | 1 << 20 | 4 << 22);
+        ctx_b.set(1, 1 << 31 | 3 << 27);
+        ctx_b.set(2, 32);
+        ctx_b.set(5, input_apu);
+        ctx_b.set(8, ov_b_apu);
+
+        // Verify context B restores the exact overlap state.
+        let restored = load_overlap(ctx_b).expect("copied overlap buffer must restore state");
+        assert_eq!(restored, seeded);
+
+        // Decoding one silent frame with context B must emit the restored overlap tail
+        // identically to a continuous decoder.
+        let mut expected_dec = xma::Decoder::new(1, 48_000);
+        expected_dec.import_overlap(&seeded);
+        let first_frame = xma::read_frame(&stream, 32).unwrap();
+        let mut expected_pcm = Vec::new();
+        expected_dec
+            .decode(&first_frame.data, first_frame.bits, &mut expected_pcm)
+            .unwrap();
+
+        let mut voice_b = Voice {
+            decoder: Some({
+                let mut d = xma::Decoder::new(1, 48_000);
+                d.import_overlap(&restored);
+                d
+            }),
+            pcm: VecDeque::new(),
+            frame_buf: Vec::new(),
+            pcm_buf: Vec::new(),
+            overlap_token: None,
+            overlap_addr: 0,
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+        assert!(decode(ctx_b, &mut voice_b));
+        let got_pcm: Vec<i16> = voice_b.pcm.iter().copied().collect();
+        assert_eq!(got_pcm, expected_pcm);
+        assert!(got_pcm.iter().any(|&s| s != 0));
+
+        // Zeroing the overlap buffer signals a fresh voice (no stale overlap).
+        // SAFETY: 256 bytes allocated.
+        unsafe { ov_b.cast::<u8>().write_bytes(0, 256) };
+        assert!(load_overlap(ctx_b).is_none());
+
+        ApuFree(ov_a);
+        ApuFree(ov_b);
+        ApuFree(input);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 }

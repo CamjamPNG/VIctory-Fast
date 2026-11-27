@@ -1587,26 +1587,60 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     let _ = (this, x, y, z, flags);
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: records a native GPU query when host
+/// queries are enabled (`crate::query::enabled()`).
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::begin_query(list, heap, kind, index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// `EndQuery(heap, type, index)`: records a native GPU query end (or
+/// timestamp sample) when host queries are enabled.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::end_query(list, heap, kind, index);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `SetPredication(buffer, aligned_offset, operation)`: binds or clears GPU
+/// draw/dispatch predication on the host list when native queries are enabled.
+extern "system" fn set_predication(this: This, buffer: This, offset: u64, operation: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        crate::query::set_predication(list, buffer, offset, operation);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer, offset, operation);
+}
+
+/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: resolves real
+/// host GPU query results into the destination shadow buffer when native
+/// queries are enabled (`crate::query::enabled()`), falling back to plausible
+/// synthetic deferred writes when disabled (`VICTORY_QUERIES=0`) or headless.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && crate::query::resolve_query_data(list, heap, kind, first, count, buffer, offset)
+    {
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = (heap, first);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
@@ -1966,8 +2000,8 @@ mod state {
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// When `indirect != 0`, routes through native `ExecuteIndirect` with a
+    /// 1D clamped mesh-dispatch record (`indirect::KIND_DISPATCH_MESH_1D`).
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1977,8 +2011,7 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            with_state(this, |list, s| s.dispatch_mesh_indirect(list, indirect));
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -2039,14 +2072,10 @@ extern "system" fn draw(_: This) {
 }
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
-/// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
-/// hold one argument each: draw (stride 16), indexed draw (20), dispatch
-/// (12), mesh dispatch (12), and the console's single-pass dispatch, type
-/// 105 (stride 12: the three group counts; its flags live in the
-/// signature, the title passes none), run as a plain dispatch. They run
-/// through the host's indirect execution (`State::execute_indirect`).
-/// shortcut: signatures that change root arguments are dropped (logged
-/// once per signature).
+/// offset)`. Supports both single-argument signatures (draw, indexed draw,
+/// dispatch, single-pass dispatch type 105, mesh dispatch) and multi-argument
+/// signatures with root constants / root CBV/SRV/UAV views preceding the draw
+/// or dispatch (`State::execute_indirect_signature`).
 extern "system" fn execute_indirect(
     this: This,
     signature: This,
@@ -2064,14 +2093,12 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let Some(address) = address
+        && !args.is_empty()
         && (count.is_null() || counter.is_some())
     {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect_signature(list, stride, args, max, address, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -2477,10 +2504,11 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
-    (30, resolve_queries as *const ()),        // 0xf0
+const MORE_METHODS: [(usize, *const ()); 10] = [
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
+    (30, resolve_queries as *const ()),        // 0xf0 ResolveQueryData
+    (31, set_predication as *const ()),        // 0xf8 SetPredication
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
@@ -2612,5 +2640,53 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_rewritten_back_texture_after_reuse_is_read_back() {
+        use crate::object::guid;
+        use crate::resource::{create_committed, readback_test_descriptions};
+        let Some(_) = crate::host::host() else {
+            return;
+        };
+        let _test_kinds = ResetTestKinds(crate::texback::TEST_KINDS.replace(Some(&[(256, 256, 41)])));
+        struct ResetTestKinds(Option<&'static [(u64, u32, u32)]>);
+        impl Drop for ResetTestKinds {
+            fn drop(&mut self) {
+                crate::texback::TEST_KINDS.set(self.0);
+            }
+        }
+        let null = std::ptr::null();
+        let (heap, desc) = readback_test_descriptions();
+        let resource = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut tex = null;
+        assert_eq!(
+            create_committed(null, &heap, 0, &desc, 0, null.cast(), &resource, &mut tex),
+            S_OK
+        );
+        let (_, at, _) = crate::resource::title_texture(tex).expect("synthetic title texture");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let host = host_list(list).expect("a host list");
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the write registered a read-back");
+        crate::texback::replaced(at);
+        assert!(!host.back_wanted_fresh(tex), "the reuse invalidated the read-back");
+        host.texture_written(tex);
+        assert!(host.back_wanted_fresh(tex), "the second write re-registered the read-back");
+        host.close();
+        assert_eq!(host.texture_back_count(), 1, "the rewritten texture was read back");
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(tex), 0);
     }
 }

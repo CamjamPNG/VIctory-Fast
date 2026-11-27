@@ -1457,6 +1457,12 @@ impl Host {
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
     }
+
+    /// Host direct queue GPU timestamp frequency in ticks per second, if non-zero.
+    pub(crate) fn timestamp_frequency(&self) -> Option<u64> {
+        // SAFETY: plain D3D12 command queue query.
+        unsafe { self.queue.GetTimestampFrequency() }.ok().filter(|&f| f > 0)
+    }
 }
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
@@ -1724,7 +1730,7 @@ struct PreludePlan {
     aliasing: Vec<D3D12_RESOURCE_BARRIER>,
     to_copy: Vec<D3D12_RESOURCE_BARRIER>,
     barriers: Vec<D3D12_RESOURCE_BARRIER>,
-    uploads: Vec<(crate::texture::PreludeUpload, bool)>,
+    uploads: Vec<(crate::texture::PreludeUpload, crate::texture::UploadPlan)>,
 }
 
 // SAFETY: resources referenced by `D3D12_RESOURCE_BARRIER` stay alive in
@@ -4219,6 +4225,36 @@ fn land() {
     }
 }
 
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Waits for `fence` to reach `target` and rejects device-removed (`u64::MAX`).
+/// The event is private to the waiting thread and the fence remains alive.
+unsafe fn wait_host_fence(fence: &ID3D12Fence, target: u64, event: HANDLE, context: &str) {
+    // SAFETY: caller owns the event and fence for the entire wait.
+    if let Err(e) = unsafe { fence.SetEventOnCompletion(target, event) } {
+        fail(format_args!("{context}: SetEventOnCompletion({target}) failed: {e}"));
+    }
+    let status = unsafe { WaitForSingleObject(event, INFINITE) };
+    if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        fail(format_args!("{context}: fence wait failed: {status:?}"));
+    }
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!("{context}: fence {completed} did not reach {target}"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn host_fence_completion_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -4260,11 +4296,9 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
-                #[cfg(feature = "diagnostics")]
-                let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
-            }
+            #[cfg(feature = "diagnostics")]
+            let _card = crate::timeline::card_wait(Some(target));
+            wait_host_fence(&host.fence, target, event, "late helper");
         }
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -4396,6 +4430,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if completed == u64::MAX {
+                    drop(line);
+                    fail(format_args!("relay fence reported device removal"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -4430,14 +4468,7 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
+                unsafe { wait_host_fence(&host.fence, target, event, "relay") };
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         }
@@ -7978,11 +8009,33 @@ impl HostList {
             return;
         }
         let mut deferred = self.deferred();
-        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
-            && let Some(target) = crate::texback::Target::new(resource)
-        {
-            deferred.back_wanted.push(target);
+        // Re-register if the title reused or remapped the texture's memory.
+        let existing = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|target| target.owner() == resource as usize);
+        match existing {
+            Some(entry) if !entry.fresh() => {
+                if let Some(target) = crate::texback::Target::new(resource) {
+                    *entry = target;
+                }
+            }
+            None => deferred.back_wanted.extend(crate::texback::Target::new(resource)),
+            Some(_) => {}
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn back_wanted_fresh(&self, resource: crate::object::This) -> bool {
+        self.deferred()
+            .back_wanted
+            .iter()
+            .any(|t| t.owner() == resource as usize && t.fresh())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn texture_back_count(&self) -> usize {
+        self.deferred().texture_backs.len()
     }
 
     /// Before the list closes: the textures its shaders wrote that are copied
@@ -8015,7 +8068,7 @@ impl HostList {
     /// Plans a list's state prelude sequentially (updating shared texture state
     /// trackers in submission order); the actual D3D12 command recording happens
     /// in [`HostList::record_prelude`], which can run in parallel across lists.
-    fn plan_prelude(&self, uploads: Vec<(crate::texture::PreludeUpload, bool)>) -> Option<PreludePlan> {
+    fn plan_prelude(&self, uploads: Vec<(crate::texture::PreludeUpload, crate::texture::UploadPlan)>) -> Option<PreludePlan> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -8071,12 +8124,12 @@ impl HostList {
                 }
             }
         }
-        for (upload, first_upload) in &uploads {
+        for (upload, plan) in &uploads {
             let copy = &upload.copy;
             let key = std::sync::Arc::as_ptr(copy) as usize;
             // A texture cut from a block may lie where another did: what the card
             // holds of that one is done with before the first upload into this one.
-            if crate::pool::on() && *first_upload {
+            if crate::pool::on() && plan.first_upload {
                 aliasing.push(D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -8155,8 +8208,8 @@ impl HostList {
                 for (depth, twin, colour) in &plan.syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
-                for (upload, _) in &plan.uploads {
-                    upload.record(list);
+                for (upload, uplan) in &plan.uploads {
+                    upload.record(list, uplan.sub_mask);
                 }
                 if !plan.barriers.is_empty() {
                     list.ResourceBarrier(&plan.barriers);
@@ -8782,7 +8835,7 @@ impl HostList {
         air: &[(usize, usize)],
         taken: impl Fn(usize) -> bool,
         skip_front_refreshes: bool,
-    ) -> Vec<(crate::texture::PreludeUpload, bool)> {
+    ) -> Vec<(crate::texture::PreludeUpload, crate::texture::UploadPlan)> {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -8948,8 +9001,8 @@ impl HostList {
         batch.refresh_textures();
         let mut uploads = Vec::new();
         for upload in textures {
-            if let Some(first_upload) = upload.finish_refresh() {
-                uploads.push((upload, first_upload));
+            if let Some(plan) = upload.finish_refresh() {
+                uploads.push((upload, plan));
             }
         }
         uploads
@@ -10669,23 +10722,9 @@ impl Host {
     }
 }
 
-/// The swap chain formats a presented texture can be copied into: its own
-/// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
-    Some(match format.0 {
-        27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
-        87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
-        23..=25 => DXGI_FORMAT_R10G10B10A2_UNORM,
-        9..=14 => DXGI_FORMAT_R16G16B16A16_FLOAT,
-        _ => return None,
-    })
-}
-
-const BUFFERS: u32 = 3;
-
 struct Presenter {
     swap_chain: IDXGISwapChain3,
-    allow_tearing: bool,
+    present_state: crate::present::PresentState,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -11074,14 +11113,9 @@ impl Host {
                 crate::compose::view(&over_desc)?,
             ))
         });
-        let format = if planes.is_some() {
-            DXGI_FORMAT_R8G8B8A8_UNORM
-        } else {
-            let Some(format) = swap_format(desc.Format) else {
-                tracing::warn!(format = desc.Format.0, "cannot present this format");
-                return None;
-            };
-            format
+        let Some(format) = crate::present::select_swap_format(desc.Format, planes.is_some()) else {
+            tracing::warn!(format = desc.Format.0, "cannot present this format");
+            return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
@@ -11110,14 +11144,14 @@ impl Host {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
-            let resize_flags = if p.allow_tearing {
-                DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
-            } else {
-                DXGI_SWAP_CHAIN_FLAG(0)
-            };
             let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, resize_flags)
+                p.swap_chain.ResizeBuffers(
+                    p.present_state.buffer_count(),
+                    width,
+                    height,
+                    format,
+                    p.present_state.swap_chain_flags(),
+                )
             };
             match resized {
                 Ok(()) => {
@@ -11125,6 +11159,7 @@ impl Host {
                         p.composer = None;
                     }
                     (p.width, p.height, p.format) = (width, height, format);
+                    p.present_state.on_resized(&p.swap_chain, format);
                     tracing::info!(
                         width,
                         height,
@@ -11153,6 +11188,7 @@ impl Host {
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
+            p.present_state.wait_for_latency();
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
@@ -11160,10 +11196,11 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
+            let take_shot = crate::present::screenshot_pending();
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = take_shot || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = take_shot;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -11253,6 +11290,9 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
+            let screenshot = take_shot
+                .then(|| crate::present::record_screenshot_readback(&self.device, list, &back))
+                .flatten();
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
@@ -11320,6 +11360,9 @@ impl Host {
                     0
                 }
             };
+            if let Some((buffer, footprint)) = screenshot {
+                crate::present::deliver_screenshot(&buffer, &footprint, p.present_state.hdr_active());
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);
@@ -11335,12 +11378,7 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             #[cfg(feature = "diagnostics")]
             let present_t = std::time::Instant::now();
-            let present_flags = if p.allow_tearing {
-                DXGI_PRESENT_ALLOW_TEARING
-            } else {
-                DXGI_PRESENT(0)
-            };
-            let _ = p.swap_chain.Present(0, present_flags);
+            p.present_state.present(&p.swap_chain);
             #[cfg(feature = "diagnostics")]
             PRESENT_NS.fetch_add(present_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             showing.next("the frame meter");
@@ -11366,62 +11404,25 @@ impl Host {
             None => window(width, height)?,
         };
         self.log_video_memory("right before the swap chain is made");
-        // SAFETY: plain object creation for our window.
-        unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let mut allow_tearing_u32 = 0u32;
-            let allow_tearing = factory
-                .cast::<IDXGIFactory5>()
-                .ok()
-                .is_some_and(|f5| {
-                    f5.CheckFeatureSupport(
-                        DXGI_FEATURE_PRESENT_ALLOW_TEARING,
-                        (&raw mut allow_tearing_u32).cast(),
-                        size_of::<u32>() as u32,
-                    )
-                    .is_ok()
-                        && allow_tearing_u32 != 0
-                });
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: width,
-                Height: height,
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                Flags: if allow_tearing {
-                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
-                } else {
-                    0
-                },
-                ..Default::default()
-            };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
-            let copy = self.new_list()?;
-            copy.close();
-            tracing::info!(width, height, format = format.0, buffers = BUFFERS, allow_tearing, "presenting to a window");
-            self.log_video_memory("right after the swap chain is made");
-            Ok(Presenter {
-                swap_chain,
-                allow_tearing,
-                width,
-                height,
-                format,
-                copy,
-                ahead: Vec::new(),
-                hwnd,
-                meter: Meter::new(),
-                composer: None,
-                #[cfg(feature = "diagnostics")]
-                panel: panel::Panel::new(),
-            })
-        }
+        let (swap_chain, format, present_state) =
+            crate::present::create_swap_chain(&self.queue, hwnd, width, height, format)?;
+        let copy = self.new_list()?;
+        copy.close();
+        self.log_video_memory("right after the swap chain is made");
+        Ok(Presenter {
+            swap_chain,
+            present_state,
+            width,
+            height,
+            format,
+            copy,
+            ahead: Vec::new(),
+            hwnd,
+            meter: Meter::new(),
+            composer: None,
+            #[cfg(feature = "diagnostics")]
+            panel: panel::Panel::new(),
+        })
     }
 }
 

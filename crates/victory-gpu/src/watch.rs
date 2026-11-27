@@ -3795,10 +3795,18 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    let freed_len = if len != 0 {
+        len
+    } else {
+        allocation_end(at, at).saturating_sub(at)
+    };
+    if freed_len != 0 {
+        crate::inplace::title_memory_freeing(at, freed_len);
+    }
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     } else if VIEWS.any(at / BLOCK, at / BLOCK + 1) {
-        forget_views(at / BLOCK, allocation_end(at, at).div_ceil(BLOCK).max(at / BLOCK + 1));
+        forget_views(at / BLOCK, at.saturating_add(freed_len).div_ceil(BLOCK).max(at / BLOCK + 1));
     }
     let mut g = guards();
     let first = at / BLOCK;

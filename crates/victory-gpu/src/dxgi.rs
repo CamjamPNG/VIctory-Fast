@@ -215,6 +215,7 @@ static FACTORY_FUNCTIONS: Table<32> = {
 
 /// A display mode as the console lists it: size, refresh rate (numerator,
 /// denominator), format, scanline order, scaling, flags.
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct Mode {
     width: u32,
@@ -227,6 +228,18 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
+/// Explicitly requested `VICTORY_DISPLAY_MODE=WxH`, if set and valid.
+fn requested_display_size() -> Option<(u32, u32)> {
+    static ASKED: std::sync::OnceLock<Option<(u32, u32)>> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let (w, h) = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
+            let (w, h) = v.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        })?;
+        ((640..=7680).contains(&w) && (360..=4320).contains(&h)).then_some((w, h))
+    })
+}
+
 /// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
 /// if set (as a console reports the television it is plugged into: a
 /// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
@@ -235,23 +248,55 @@ const _: () = assert!(size_of::<Mode>() == 32);
 fn display_size() -> (u32, u32) {
     static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
-            let (w, h) = v.trim().split_once(['x', 'X'])?;
-            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
-        });
-        let size = match asked {
-            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
-            _ => (3840, 2160),
-        };
+        let size = requested_display_size().unwrap_or((3840, 2160));
         tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
         size
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+#[cfg(windows)]
+fn use_host_display_modes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HOST_DISPLAY_MODES"))
+}
+
+fn select_host_modes(mut host_modes: Vec<Mode>, requested: Option<(u32, u32)>) -> Vec<Mode> {
+    if let Some((w, h)) = requested {
+        let filtered: Vec<Mode> = host_modes
+            .iter()
+            .copied()
+            .filter(|m| m.width == w && m.height == h)
+            .collect();
+        if !filtered.is_empty() {
+            host_modes = filtered;
+        }
+    }
+    host_modes
+}
+
+fn write_mode_list(list: &[Mode], count: *mut u32, out: *mut Mode) -> HRESULT {
+    // SAFETY: the title passes its count (null is tolerated).
+    let Some(count) = (unsafe { count.as_mut() }) else {
+        return E_INVALIDARG;
+    };
+    let n = list.len() as u32;
+    if out.is_null() {
+        *count = n;
+        return S_OK;
+    }
+    if *count < n {
+        return MORE_DATA;
+    }
+    *count = n;
+    for (i, &mode) in list.iter().enumerate() {
+        // SAFETY: checked non-null; room for at least `n` modes.
+        unsafe { out.add(i).write(mode) };
+    }
+    S_OK
+}
+
+/// The console's mode list: one 4K mode at 60 Hz by default, or the host
+/// monitor's progressive modes when `VICTORY_HOST_DISPLAY_MODES=1`.
 extern "system" fn modes(
     _: This,
     _format: u32,
@@ -259,20 +304,27 @@ extern "system" fn modes(
     count: *mut u32,
     out: *mut Mode,
 ) -> HRESULT {
-    // SAFETY: the title passes its count (null is tolerated).
-    let Some(count) = (unsafe { count.as_mut() }) else {
-        return E_INVALIDARG;
-    };
-    if out.is_null() {
-        *count = 1;
-        return S_OK;
+    #[cfg(windows)]
+    if use_host_display_modes() {
+        let raw: Vec<Mode> = crate::present::host_display_modes()
+            .into_iter()
+            .map(|m| Mode {
+                width: m.width,
+                height: m.height,
+                refresh: [m.refresh_num, m.refresh_den],
+                format: m.format,
+                scanlines: 1, // progressive
+                scaling: 0,
+                flags: 0,
+            })
+            .collect();
+        let list = select_host_modes(raw, requested_display_size());
+        if !list.is_empty() {
+            return write_mode_list(&list, count, out);
+        }
     }
-    if *count < 1 {
-        return MORE_DATA;
-    }
-    *count = 1;
     let (width, height) = display_size();
-    let mode = Mode {
+    let fallback = [Mode {
         width,
         height,
         refresh: [60, 1],
@@ -280,10 +332,8 @@ extern "system" fn modes(
         scanlines: 1, // progressive
         scaling: 0,
         flags: 0,
-    };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
-    S_OK
+    }];
+    write_mode_list(&fallback, count, out)
 }
 
 /// IUnknown 3, object 4, output 15 (12 as on PC, then 3 console ones).
@@ -359,5 +409,53 @@ mod tests {
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
         }
+    }
+
+    #[test]
+    fn mode_list_contract_and_filtering() {
+        let list = vec![
+            Mode {
+                width: 2560,
+                height: 1440,
+                refresh: [144, 1],
+                format: 28,
+                scanlines: 1,
+                scaling: 0,
+                flags: 0,
+            },
+            Mode {
+                width: 1920,
+                height: 1080,
+                refresh: [120, 1],
+                format: 28,
+                scanlines: 1,
+                scaling: 0,
+                flags: 0,
+            },
+        ];
+        // Null output queries count.
+        let mut count = 0u32;
+        assert_eq!(write_mode_list(&list, &mut count, std::ptr::null_mut()), S_OK);
+        assert_eq!(count, 2);
+
+        // Smaller buffer returns MORE_DATA.
+        let mut small = [list[0]; 1];
+        count = 1;
+        assert_eq!(write_mode_list(&list, &mut count, small.as_mut_ptr()), MORE_DATA);
+
+        // Enough room writes all modes.
+        let mut buf = [list[1]; 3];
+        count = 3;
+        assert_eq!(write_mode_list(&list, &mut count, buf.as_mut_ptr()), S_OK);
+        assert_eq!(count, 2);
+        assert_eq!((buf[0].width, buf[0].height, buf[0].refresh), (2560, 1440, [144, 1]));
+        assert_eq!((buf[1].width, buf[1].height, buf[1].refresh), (1920, 1080, [120, 1]));
+
+        // Explicit WxH filters when present, keeps full list when absent.
+        let filtered = select_host_modes(list.clone(), Some((1920, 1080)));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!((filtered[0].width, filtered[0].height), (1920, 1080));
+        let fallback = select_host_modes(list, Some((3840, 2160)));
+        assert_eq!(fallback.len(), 2);
     }
 }

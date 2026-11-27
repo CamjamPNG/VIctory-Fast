@@ -16,8 +16,10 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, GetLastError};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
@@ -37,29 +39,43 @@ macro_rules! host {
 }
 pub(crate) use host;
 
-/// Mounted drives: upper-case letter and host root (UTF-16, no trailing
-/// separator, no NUL).
-static DRIVES: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
+/// Bitmask of mounted drive letters (`bit (letter - b'A')` set iff mounted).
+static MOUNTED_MASK: AtomicU32 = AtomicU32::new(0);
 
-fn drives() -> MutexGuard<'static, Vec<(u16, Vec<u16>)>> {
-    DRIVES.lock().unwrap_or_else(|e| e.into_inner())
+/// Mounted drives indexed by `(letter - b'A')`: host root (UTF-16, no trailing
+/// separator, no NUL).
+static DRIVES: RwLock<[Option<Arc<[u16]>>; 26]> = RwLock::new([const { None }; 26]);
+
+fn drives_read() -> RwLockReadGuard<'static, [Option<Arc<[u16]>>; 26]> {
+    DRIVES.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn drives_write() -> RwLockWriteGuard<'static, [Option<Arc<[u16]>>; 26]> {
+    DRIVES.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Gives the host folder `root` a drive letter (the same one if it already
 /// has one): the highest letter neither the host nor another mount uses.
 pub fn mount(root: &Path) -> Option<char> {
-    let wide = root_wide(root);
-    let mut drives = drives();
-    if let Some(&(letter, _)) = drives.iter().find(|(_, r)| *r == wide) {
-        return char::from_u32(letter.into());
+    let wide: Arc<[u16]> = root_wide(root).into();
+    let mut drives = drives_write();
+    if let Some((idx, _)) = drives
+        .iter()
+        .enumerate()
+        .find(|(_, r)| r.as_deref() == Some(&*wide))
+    {
+        return Some(char::from(b'A' + idx as u8));
     }
     // SAFETY: no arguments.
     let host = unsafe { GetLogicalDrives() };
     let letter = (b'D'..=b'Z').rev().find(|&l| {
-        host >> (l - b'A') & 1 == 0 && !drives.iter().any(|(m, _)| *m == u16::from(l))
+        let idx = usize::from(l - b'A');
+        (host >> idx) & 1 == 0 && drives[idx].is_none()
     })?;
+    let idx = usize::from(letter - b'A');
     tracing::info!(drive = %char::from(letter), root = %root.display(), "virtual drive");
-    drives.push((letter.into(), wide));
+    drives[idx] = Some(wide);
+    MOUNTED_MASK.fetch_or(1u32 << idx, Ordering::Release);
     Some(letter.into())
 }
 
@@ -77,9 +93,10 @@ pub fn mount_at(letter: char, root: &Path) {
     // SAFETY: no arguments.
     let hides_host_drive = unsafe { GetLogicalDrives() } >> index & 1 != 0;
     tracing::info!(drive = %letter, root = %root.display(), hides_host_drive, "virtual drive");
-    let mut drives = drives();
-    drives.retain(|(l, _)| u32::from(*l) != u32::from(letter));
-    drives.push((letter as u16, root_wide(root)));
+    let wide: Arc<[u16]> = root_wide(root).into();
+    let mut drives = drives_write();
+    drives[index as usize] = Some(wide);
+    MOUNTED_MASK.fetch_or(1u32 << index, Ordering::Release);
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
@@ -142,9 +159,53 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     out
 }
 
-/// The host path, NUL-terminated, for `path` (without its NUL) if it is on
-/// a virtual drive.
-pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
+const STACK_WIDE: usize = 320;
+const STACK_MODE: usize = 32;
+
+/// NUL-terminated UTF-16 path buffer: stack-backed for common lengths, heap
+/// fallback for long paths.
+enum WideBuf {
+    Stack { buf: [u16; STACK_WIDE], len: usize },
+    Heap(Vec<u16>),
+}
+
+impl WideBuf {
+    fn as_ptr(&self) -> *const u16 {
+        self.as_slice().as_ptr()
+    }
+
+    fn as_slice(&self) -> &[u16] {
+        match self {
+            WideBuf::Stack { buf, len } => &buf[..*len],
+            WideBuf::Heap(v) => v.as_slice(),
+        }
+    }
+
+    fn into_vec(self) -> Vec<u16> {
+        match self {
+            WideBuf::Stack { buf, len } => buf[..len].to_vec(),
+            WideBuf::Heap(v) => v,
+        }
+    }
+}
+
+/// NUL-terminated UTF-16 mode string buffer (`"rb"`, `"w, ccs=UTF-8"`, etc.).
+enum ModeBuf {
+    Stack([u16; STACK_MODE]),
+    Heap(Vec<u16>),
+}
+
+impl ModeBuf {
+    fn as_ptr(&self) -> *const u16 {
+        match self {
+            ModeBuf::Stack(buf) => buf.as_ptr(),
+            ModeBuf::Heap(v) => v.as_ptr(),
+        }
+    }
+}
+
+#[inline]
+fn drive_index_wide(path: &[u16]) -> Option<(&'static [u16], usize, &[u16])> {
     let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
         Some(rest) => (&VERBATIM[..], rest),
         None => (&[][..], path),
@@ -156,40 +217,120 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         return None;
     }
     let letter = u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic)?;
-    let letter = u16::from(letter.to_ascii_uppercase());
-    let drives = drives();
-    let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
-    let tail = &rest[2..];
+    let idx = usize::from(letter.to_ascii_uppercase() - b'A');
+    Some((prefix, idx, &rest[2..]))
+}
+
+/// Peeks the drive letter index of a NUL-terminated UTF-16 path without
+/// scanning the full string length.
+#[inline]
+unsafe fn peek_drive_index_wide(path: *const u16) -> Option<usize> {
+    unsafe {
+        let c0 = *path;
+        if c0 == 0 {
+            return None;
+        }
+        let c1 = *path.add(1);
+        let (letter, colon) = if c0 == u16::from(b'\\')
+            && c1 == u16::from(b'\\')
+            && *path.add(2) == u16::from(b'?')
+            && *path.add(3) == u16::from(b'\\')
+        {
+            let l = *path.add(4);
+            if l == 0 {
+                return None;
+            }
+            (l, *path.add(5))
+        } else {
+            (c0, c1)
+        };
+        if colon != u16::from(b':') {
+            return None;
+        }
+        let letter = u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic)?;
+        Some(usize::from(letter.to_ascii_uppercase() - b'A'))
+    }
+}
+
+fn translate_buf(path: &[u16]) -> Option<WideBuf> {
+    let (prefix, idx, tail) = drive_index_wide(path)?;
+    if (MOUNTED_MASK.load(Ordering::Acquire) & (1u32 << idx)) == 0 {
+        return None;
+    }
+    let drives = drives_read();
+    let root = drives[idx].as_deref()?;
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
         out.push(0);
-        return Some(out);
+        return Some(WideBuf::Heap(out));
     }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
     // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-        out.push(b'\\'.into());
-    }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
+    let needs_sep = !tail.first().is_some_and(|c| SEPARATORS.contains(c));
+    let total_len = prefix.len() + root.len() + usize::from(needs_sep) + tail.len() + 1;
+    let is_verbatim = !prefix.is_empty();
+    if total_len <= STACK_WIDE {
+        let mut buf = [0u16; STACK_WIDE];
+        let mut pos = 0;
+        buf[pos..pos + prefix.len()].copy_from_slice(prefix);
+        pos += prefix.len();
+        buf[pos..pos + root.len()].copy_from_slice(root);
+        pos += root.len();
+        if needs_sep {
+            buf[pos] = u16::from(b'\\');
+            pos += 1;
         }
-    }));
-    out.push(0);
-    Some(out)
+        if is_verbatim {
+            for &c in tail {
+                buf[pos] = if c == u16::from(b'/') {
+                    u16::from(b'\\')
+                } else {
+                    c
+                };
+                pos += 1;
+            }
+        } else {
+            buf[pos..pos + tail.len()].copy_from_slice(tail);
+            pos += tail.len();
+        }
+        buf[pos] = 0;
+        pos += 1;
+        Some(WideBuf::Stack { buf, len: pos })
+    } else {
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(root);
+        if needs_sep {
+            out.push(b'\\'.into());
+        }
+        if is_verbatim {
+            out.extend(tail.iter().map(|&c| {
+                if c == u16::from(b'/') {
+                    b'\\'.into()
+                } else {
+                    c
+                }
+            }));
+        } else {
+            out.extend_from_slice(tail);
+        }
+        out.push(0);
+        Some(WideBuf::Heap(out))
+    }
+}
+
+/// The host path, NUL-terminated, for `path` (without its NUL) if it is on
+/// a virtual drive.
+pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
+    translate_buf(path).map(WideBuf::into_vec)
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
 /// the title's own pointer.
-struct Wide(*const u16, Option<Vec<u16>>);
+struct Wide(*const u16, Option<WideBuf>);
 
 impl Wide {
     fn ptr(&self) -> *const u16 {
-        self.1.as_ref().map_or(self.0, |p| p.as_ptr())
+        self.1.as_ref().map_or(self.0, WideBuf::as_ptr)
     }
 }
 
@@ -198,17 +339,34 @@ fn wide(path: *const u16) -> Wide {
         return Wide(path, None);
     }
     // SAFETY: the title passes a NUL-terminated path.
+    let mounted = unsafe { peek_drive_index_wide(path) }
+        .is_some_and(|idx| (MOUNTED_MASK.load(Ordering::Acquire) & (1u32 << idx)) != 0);
+    if !mounted {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            // SAFETY: the title passes a NUL-terminated path.
+            let path_slice = unsafe {
+                let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+                std::slice::from_raw_parts(path, len)
+            };
+            trace(path_slice, None);
+        }
+        return Wide(path, None);
+    }
+    // SAFETY: the title passes a NUL-terminated path.
     let path_slice = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         std::slice::from_raw_parts(path, len)
     };
-    let host = translate(path_slice);
-    trace(path_slice, host.as_deref());
+    let host = translate_buf(path_slice);
+    trace(path_slice, host.as_ref().map(WideBuf::as_slice));
     Wide(path, host)
 }
 
 /// Every title path at debug level, with the host path if rewritten.
 fn trace(path: &[u16], host: Option<&[u16]>) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     tracing::debug!(
         path = %String::from_utf16_lossy(path),
         host = host.map(|h| String::from_utf16_lossy(&h[..h.len() - 1])),
@@ -218,41 +376,90 @@ fn trace(path: &[u16], host: Option<&[u16]>) {
 
 /// A narrow path (ANSI code page, as the host decodes it) on a virtual
 /// drive, as a wide host path.
-fn narrow(path: *const c_char) -> Option<Vec<u16>> {
+fn narrow(path: *const c_char) -> Option<WideBuf> {
     if path.is_null() {
         return None;
     }
     // SAFETY: the title passes a NUL-terminated path.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
-    // The drive part is ASCII in every code page; decode only candidates.
-    match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
-        [letter, b':', ..] if letter.is_ascii_alphabetic() => {}
+    // The drive part is ASCII in every code page; decode only mounted candidates.
+    let idx = match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => {
+            usize::from(letter.to_ascii_uppercase() - b'A')
+        }
         _ => {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
+            }
+            return None;
+        }
+    };
+    if (MOUNTED_MASK.load(Ordering::Acquire) & (1u32 << idx)) == 0 {
+        if tracing::enabled!(tracing::Level::DEBUG) {
             tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
+        }
+        return None;
+    }
+    let len = i32::try_from(bytes.len()).ok()?;
+    if bytes.len() <= STACK_WIDE {
+        let mut stack = [0u16; STACK_WIDE];
+        // SAFETY: `stack` has room for `STACK_WIDE` UTF-16 units.
+        let n = unsafe {
+            MultiByteToWideChar(
+                CP_ACP,
+                0,
+                bytes.as_ptr(),
+                len,
+                stack.as_mut_ptr(),
+                STACK_WIDE as i32,
+            )
+        };
+        if n > 0 {
+            let wide = &stack[..n as usize];
+            let host = translate_buf(wide);
+            trace(wide, host.as_ref().map(WideBuf::as_slice));
+            return host;
+        }
+        // SAFETY: plain call.
+        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
             return None;
         }
     }
-    let len = i32::try_from(bytes.len()).ok()?;
     // SAFETY: sizing call, then a call with room for `n` units.
     let wide = unsafe {
         let n = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
-        let mut wide = vec![0u16; usize::try_from(n).ok()?];
-        MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+        if n <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; n as usize];
+        let written = MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n);
+        if written <= 0 {
+            return None;
+        }
+        wide.truncate(written as usize);
         wide
     };
-    let host = translate(&wide);
-    trace(&wide, host.as_deref());
+    let host = translate_buf(&wide);
+    trace(&wide, host.as_ref().map(WideBuf::as_slice));
     host
 }
 
 /// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
-fn widen(mode: *const c_char) -> Vec<u16> {
+fn widen(mode: *const c_char) -> ModeBuf {
     if mode.is_null() {
-        return vec![0];
+        return ModeBuf::Stack([0; STACK_MODE]);
     }
     // SAFETY: a NUL-terminated mode string.
     let bytes = unsafe { CStr::from_ptr(mode) }.to_bytes();
-    bytes.iter().map(|&b| u16::from(b)).chain([0]).collect()
+    if bytes.len() < STACK_MODE {
+        let mut buf = [0u16; STACK_MODE];
+        for (dst, &b) in buf.iter_mut().zip(bytes) {
+            *dst = u16::from(b);
+        }
+        ModeBuf::Stack(buf)
+    } else {
+        ModeBuf::Heap(bytes.iter().map(|&b| u16::from(b)).chain([0]).collect())
+    }
 }
 
 type Handle = *mut c_void;
@@ -430,11 +637,16 @@ pub extern "system" fn GetDiskFreeSpaceW(
 ) -> i32 {
     let mut p = wide(root);
     if let Some(host) = &mut p.1
-        && let [letter, colon, sep, ..] = host[..]
+        && let &[letter, colon, sep, ..] = host.as_slice()
         && colon == u16::from(b':')
         && SEPARATORS.contains(&sep)
     {
-        *host = vec![letter, colon, sep, 0];
+        let mut buf = [0u16; STACK_WIDE];
+        buf[0] = letter;
+        buf[1] = colon;
+        buf[2] = sep;
+        buf[3] = 0;
+        *host = WideBuf::Stack { buf, len: 4 };
     }
     host!("kernel32.dll", "GetDiskFreeSpaceW": extern "system" fn(*const u16, *mut u32, *mut u32, *mut u32, *mut u32) -> i32)(
         p.ptr(),
@@ -1016,5 +1228,112 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn stack_and_heap_wide_narrow_and_mode_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let letter = mount(dir.path()).unwrap();
+
+        // Short virtual path uses stack buffer with zero heap allocation.
+        let short_w = w(&format!(r"{letter}:\short\file.bin"));
+        let res = wide(short_w.as_ptr());
+        assert!(matches!(res.1, Some(WideBuf::Stack { .. })));
+        assert_eq!(
+            text(res.1.as_ref().unwrap().as_slice()),
+            format!(r"{root}\short\file.bin")
+        );
+
+        // Long (> 320 UTF-16 units) verbatim path falls back to heap buffer.
+        let long_tail = "x".repeat(330);
+        let long_w = w(&format!(r"\\?\{letter}:\{long_tail}"));
+        let res = wide(long_w.as_ptr());
+        assert!(matches!(res.1, Some(WideBuf::Heap(_))));
+        assert_eq!(
+            text(res.1.as_ref().unwrap().as_slice()),
+            format!(r"\\?\{root}\{long_tail}")
+        );
+
+        // Unmounted drive fast-path returns None without rewriting (`A:` is never auto-mounted).
+        let unmounted_w = w(r"A:\should\not\rewrite.txt");
+        let res = wide(unmounted_w.as_ptr());
+        assert!(res.1.is_none());
+        assert_eq!(res.ptr(), unmounted_w.as_ptr());
+        assert!(narrow(c"A:\\should\\not\\rewrite.txt".as_ptr()).is_none());
+
+        // Narrow ANSI short path uses stack buffer.
+        let short_a = format!("{letter}:/narrow.dat\0");
+        let nb = narrow(short_a.as_ptr().cast()).unwrap();
+        assert!(matches!(nb, WideBuf::Stack { .. }));
+        assert_eq!(text(nb.as_slice()), format!("{root}/narrow.dat"));
+
+        // Narrow ANSI long (> 320 bytes) path falls back to heap decode + verbatim.
+        let long_a = format!("{letter}:/{}\0", "y".repeat(340));
+        let nb = narrow(long_a.as_ptr().cast()).unwrap();
+        assert!(matches!(nb, WideBuf::Heap(_)));
+        assert_eq!(
+            text(nb.as_slice()),
+            format!(r"\\?\{root}\{}", "y".repeat(340))
+        );
+
+        // `widen` uses stack for short modes and heap for long modes (>= 32 bytes).
+        let short_mode = widen(c"rb".as_ptr());
+        assert!(matches!(short_mode, ModeBuf::Stack(_)));
+        // SAFETY: NUL-terminated UTF-16 string.
+        let short_mode_str = unsafe {
+            let p = short_mode.as_ptr();
+            let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+        };
+        assert_eq!(short_mode_str, "rb");
+
+        let long_mode_src = format!("{}\0", "w, ccs=UTF-8,".repeat(4));
+        let long_mode = widen(long_mode_src.as_ptr().cast());
+        assert!(matches!(long_mode, ModeBuf::Heap(_)));
+        // SAFETY: NUL-terminated UTF-16 string.
+        let long_mode_str = unsafe {
+            let p = long_mode.as_ptr();
+            let len = (0..).take_while(|&i| *p.add(i) != 0).count();
+            String::from_utf16_lossy(std::slice::from_raw_parts(p, len))
+        };
+        assert_eq!(long_mode_str, &long_mode_src[..long_mode_src.len() - 1]);
+    }
+
+    #[test]
+    fn concurrent_translate_and_mount_at() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_a = dir_a.path().to_string_lossy().into_owned();
+        let root_b = dir_b.path().to_string_lossy().into_owned();
+        // Use `B:` which is never chosen by `mount()` (`D..=Z`).
+        mount_at('B', dir_a.path());
+
+        let path_w = w(r"B:\asset.pak");
+        let path_slice = &path_w[..path_w.len() - 1];
+        let expected_a = format!(r"{root_a}\asset.pak");
+        let expected_b = format!(r"{root_b}\asset.pak");
+
+        std::thread::scope(|s| {
+            let path_a = dir_a.path();
+            let path_b = dir_b.path();
+            s.spawn(move || {
+                for i in 0..200 {
+                    mount_at('B', if i % 2 == 0 { path_a } else { path_b });
+                }
+            });
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..500 {
+                        let out = translate(path_slice).expect("B: stays mounted");
+                        let s = text(&out);
+                        assert!(
+                            s == expected_a || s == expected_b,
+                            "unexpected translation: {s}"
+                        );
+                    }
+                });
+            }
+        });
     }
 }

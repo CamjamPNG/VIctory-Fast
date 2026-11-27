@@ -1,8 +1,7 @@
 //! Renderer port #1: the title's 32-bit graphics heap as the card's own
 //! memory (`VICTORY_PORT_CONSTANTS`, off by default).
 //!
-//! What the title does (the target executable, the routine at image
-//! +0x1e86440, reached at its start): one `XMemVirtualAlloc` of the five
+//! What the title does at startup: one `XMemVirtualAlloc` of the five
 //! sizes it is given together (kind 0x42000: a reservation of 64 KiB
 //! pages, flags 7: graphics memory below 4 GiB, 185 MB at 0x34310000 in
 //! every run so far), split into five placeholders (`VirtualFree` with
@@ -72,13 +71,16 @@ const MOST: u64 = 512 << 20;
 
 /// `VICTORY_PORT_CONSTANTS`: `1` turns renderer port #1 on (title buffers
 /// and windows of title memory in the title's 32-bit graphics memory, view
-/// memory that is one stretch of a section, used in place); unset or
-/// anything else: off, everything as before.
+/// memory that is one stretch of a section, used in place); `VICTORY_INPLACE_ALL=1`
+/// extends this to section stretches across all addresses within `VICTORY_INPLACE_MB`.
 #[allow(dead_code)]
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Read once, here: the switch of renderer port #1.
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"))
+    // Read once, here: the switch of renderer port #1 (or full in-place mode).
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1")
+            || crate::inplace::all_on()
+    })
 }
 
 /// A stretch of title memory opened as a heap through a view of ours.
@@ -94,6 +96,15 @@ unsafe impl Send for Region {}
 
 static REGIONS: Mutex<Vec<Region>> = Mutex::new(Vec::new());
 
+/// Bytes pinned in working set by reserved-section `OpenExistingHeapFromAddress1`
+/// regions currently cached in `REGIONS`.
+static PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Current pinned bytes held by `port::REGIONS`.
+pub(crate) fn pinned_bytes() -> u64 {
+    PINNED_BYTES.load(Ordering::Relaxed)
+}
+
 /// The lowest start and highest end of every region (both 0: none), for a
 /// quick look on the paths that run thousands of times a frame.
 static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -106,11 +117,17 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// touch it, their bytes.
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
-/// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
-/// memory.
+/// Whether `[at, at + len)` may be ported: the title's 32-bit graphics memory
+/// under `VICTORY_PORT_CONSTANTS=1`, or any valid range under `VICTORY_INPLACE_ALL=1`.
 #[allow(dead_code)]
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    if !on() || len == 0 {
+        return false;
+    }
+    match at.checked_add(len) {
+        Some(end) => crate::inplace::all_on() || end <= LOW,
+        None => false,
+    }
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
@@ -164,6 +181,18 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 /// statistic to count and why.
 #[allow(dead_code)]
 pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, (usize, String)> {
+    // Prefer zero-pinned `OpenExistingHeapFromFileMapping` when the stretch
+    // belongs to a `SEC_COMMIT` section: 0 MB locked working set, no extra view.
+    match crate::inplace_sections::place_section(device, start, len) {
+        Ok(placed) => return Ok(placed),
+        Err(crate::inplace_sections::SectionPlaceError::NotCommittedRun) => {}
+        Err(crate::inplace_sections::SectionPlaceError::Remapped) => {
+            return Err((3, "remapped concurrently during committed-section placement".to_owned()));
+        }
+        Err(crate::inplace_sections::SectionPlaceError::Host(e)) => {
+            return Err((5, format!("committed section refused by host: {e}")));
+        }
+    }
     let at = start & !(K64 - 1);
     let end = (start + len.max(1)).next_multiple_of(K64);
     let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -191,13 +220,14 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
 /// a view of ours of the same pages.
 #[allow(dead_code)]
 fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usize, String)> {
+    let generation = crate::inplace_sections::mapping_generation();
     let Some((first, bytes, section, offset)) = stretch(at as usize, (end - at) as usize) else {
         return Err((3, format!("not one stretch of a section: {:?}", cover(at as usize, (end - at) as usize))));
     };
     // The whole stretch, kept to what may be ported: the next buffer in it
     // finds the region made.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
-    if first < LOW && first + bytes > LOW {
+    if !crate::inplace::all_on() && first < LOW && first + bytes > LOW {
         bytes = LOW.saturating_sub(first);
     }
     if bytes > MOST {
@@ -211,22 +241,36 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     if first > at || first + bytes < end || offset % K64 != 0 {
         return Err((3, format!("the stretch {first:#x}+{bytes:#x} does not hold it")));
     }
+    if !crate::inplace_sections::try_reserve_budget(&PINNED_BYTES, bytes, crate::inplace::most()) {
+        return Err((5, format!("{bytes:#x} bytes would exceed VICTORY_INPLACE_MB budget")));
+    }
     // SAFETY: the section of a view the title has; the runtime keeps its
     // handle open while a view of it is there, and the range is inside it.
     let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (offset >> 32) as u32, offset as u32, bytes as usize) }.Value as usize;
     if view == 0 {
+        crate::inplace_sections::release_budget(&PINNED_BYTES, bytes);
         return Err((5, format!("no view of the stretch: {}", std::io::Error::last_os_error())));
     }
     let unmap = || {
         // SAFETY: our own view, nothing opened on it.
         unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+        crate::inplace_sections::release_budget(&PINNED_BYTES, bytes);
     };
-    if !committed(view, bytes as usize) {
+    if !crate::inplace::is_committed_section(section) && !committed(view, bytes as usize) {
         unmap();
         return Err((4, "pages of the stretch are not committed".to_owned()));
     }
+    if crate::inplace_sections::mapping_generation() != generation {
+        unmap();
+        return Err((3, "remapped concurrently before opening view heap".to_owned()));
+    }
     match crate::inplace::open(device, crate::inplace::From::Part(view, bytes as usize)) {
         Ok(heap) => {
+            if crate::inplace_sections::mapping_generation() != generation {
+                drop(heap);
+                unmap();
+                return Err((3, "remapped concurrently while opening view heap".to_owned()));
+            }
             tracing::info!(
                 start = format_args!("{first:#x}"),
                 bytes,
@@ -249,6 +293,15 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
 /// Whether every page of `[at, at + len)` is committed.
 #[allow(dead_code)]
 fn committed(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if crate::safecopy::on() {
+        // Zero-syscall in-process read probe across every 4 KiB page of our
+        // freshly mapped section view; avoids VirtualQuery's page-table walk.
+        // SAFETY: `safecopy::on()` installed the fault handler; non-mutating probe.
+        return unsafe { crate::safecopy::probe_readable(at as *const u8, len, 4096) };
+    }
     let mut here = at;
     while here < at + len {
         // SAFETY: plain data filled in by the query.
@@ -276,11 +329,29 @@ pub(crate) fn forget(at: usize, len: usize) {
     if BOUNDS[1].load(Ordering::Relaxed) <= at || BOUNDS[0].load(Ordering::Relaxed) >= end {
         return;
     }
-    let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    let before = regions.len();
-    regions.retain(|r| r.end <= at || r.start >= end);
-    STATS[7].fetch_add((before - regions.len()) as u64, Ordering::Relaxed);
-    bounds(&regions);
+    let mut dropped = Vec::new();
+    let mut released_bytes = 0u64;
+    {
+        let mut regions = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < regions.len() {
+            if regions[i].end > at && regions[i].start < end {
+                let r = regions.swap_remove(i);
+                released_bytes += r.end - r.start;
+                dropped.push(r.heap);
+            } else {
+                i += 1;
+            }
+        }
+        STATS[7].fetch_add(dropped.len() as u64, Ordering::Relaxed);
+        bounds(&regions);
+    }
+    if released_bytes > 0 {
+        crate::inplace_sections::release_budget(&PINNED_BYTES, released_bytes);
+    }
+    for heap in dropped {
+        crate::host::retire(heap);
+    }
 }
 
 /// Whether `[at, at + len)` touches ported memory (a quick look).

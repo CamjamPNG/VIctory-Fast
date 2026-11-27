@@ -950,6 +950,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
+        if srv && shadow.in_place() && crate::port_cbv::on() && crate::port_cbv::root_cbv_ok(gpu) {
+            crate::port_cbv::root_in_place();
+        }
         shadow.refresh(list, address, len);
         #[cfg(feature = "diagnostics")]
         crate::book::root(gpu, len);
@@ -2153,7 +2156,10 @@ impl State {
                             // rest (`victory_shader::emit::USER_VIEW_BIAS`).
                             let bias = offset & 15;
                             host.raw_at(index, &s.buffer, offset - bias, s.left(*a) + bias);
-                        } else if offset.is_multiple_of(16) {
+                        } else if crate::port_cbv::root_table_cbv_ok(offset) {
+                            if s.in_place() && crate::port_cbv::on() {
+                                crate::port_cbv::root_in_place();
+                            }
                             host.raw_at(index, &s.buffer, offset, s.left(*a));
                         } else {
                             // Raw views start on 16 bytes; one from the
@@ -3766,6 +3772,23 @@ impl State {
         }
     }
 
+    /// Runs an indirect mesh dispatch whose 1D group count lies in GPU memory at
+    /// `indirect_va` (`DispatchMeshX` with a non-zero indirect argument address).
+    pub(crate) fn dispatch_mesh_indirect(&mut self, list: &HostList, indirect_va: u64) {
+        #[cfg(feature = "diagnostics")]
+        self.trace("mesh_indirect", 1, 0);
+        if !self.execute_indirect(
+            list,
+            (crate::indirect::KIND_DISPATCH_MESH_1D, 4, 1),
+            indirect_va,
+            None,
+        ) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(self.pipeline);
+        }
+    }
+
     /// The walls trace (`crate::host::walls_trace`): one log line per
     /// frame with the draws of its main pass (four or more colour targets)
     /// by scissor rectangle, and how often each of the title's culling
@@ -4197,11 +4220,17 @@ impl State {
                         if crate::port_cbv::in_place_on() {
                             match crate::shadow::find(address, u64::from(size)).filter(|s| s.in_place()) {
                                 Some(shadow) => {
-                                    if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                    let gpu = shadow.gpu(address);
+                                    if host.constant_raw_at(index, &shadow.buffer, gpu, size) {
+                                        list.keep_shadow(shadow);
                                         crate::port_cbv::in_place(size);
                                         continue;
                                     }
-                                    crate::port_cbv::copied(false);
+                                    if size == 0 || crate::port_cbv::raw_ok(gpu) {
+                                        crate::port_cbv::copied_oob_or_empty();
+                                    } else {
+                                        crate::port_cbv::copied(false);
+                                    }
                                 }
                                 None => crate::port_cbv::copied(true),
                             }
@@ -4552,10 +4581,12 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
         }
-        const DRAW: u32 = 0;
-        const INDEXED: u32 = 1;
-        const DISPATCH: u32 = 2;
-        const MESH: u32 = 10;
+        const DRAW: u32 = crate::indirect::KIND_DRAW;
+        const INDEXED: u32 = crate::indirect::KIND_DRAW_INDEXED;
+        const DISPATCH: u32 = crate::indirect::KIND_DISPATCH;
+        const MESH: u32 = crate::indirect::KIND_DISPATCH_MESH;
+        const MESH_1D: u32 = crate::indirect::KIND_DISPATCH_MESH_1D;
+        let is_mesh = matches!(kind, MESH | MESH_1D);
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -4584,7 +4615,7 @@ impl State {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || made_rects || p.rects) && !p.compute && !p.mesh
             }
-            MESH => !p.compute && p.mesh,
+            MESH | MESH_1D => !p.compute && p.mesh,
             DISPATCH => p.compute,
             _ => false,
         };
@@ -4619,14 +4650,18 @@ impl State {
             .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
         let is_spread = spread.is_some();
         let Some(signature) = spread.or_else(|| {
-            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-                .then(|| host_signature(kind, stride))
-                .flatten()
+            if kind == MESH_1D {
+                host_signature(MESH, 12)
+            } else {
+                matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                    .then(|| host_signature(kind, stride))
+                    .flatten()
+            }
         }) else {
             why("no host signature");
             return false;
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+        if is_mesh && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
@@ -4645,105 +4680,128 @@ impl State {
             }
             self.window = None;
         }
-        // One record without a count: clamped in a batch (`batches`).
-        // Spread dispatches use 20-byte [row, asked x, x, y, z] records and
-        // bypass the unspread 12-byte batch path.
-        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() && !is_spread {
-            args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
-        } else {
-            None
-        };
-        if batch.is_some() {
-            self.window = None;
-        }
-        // A window of records clamped in one pass (`windows`): for single
-        // records without a count buffer, drawn by shaders that store to no
-        // buffer. Anything else ends the window: it uses the scratch buffer
-        // or may write the arguments.
-        const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
-            && !ordered
-            && kind != DISPATCH
-            && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
-        // Another host list (a new one after a cut, or this one after its
-        // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
+        let count_off = counter.as_ref().map(|(s, at)| s.offset(*at));
+        let (bounded, at) = if !crate::indirect::clamp_enabled()
+            && !is_spread
+            && crate::indirect::can_bypass_clamp(kind, stride, offset, count_off)
+        {
+            // shortcut: VICTORY_INDIRECT_CLAMP=0 executes directly from the
+            // title buffer's host copy without clamping; unfilled garbage slots
+            // can TDR the GPU.
+            args.refresh(list, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(list, *at, 4);
+            }
             self.window = None;
-        }
-        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match batch.or(hit) {
-            Some(hit) => hit,
-            None => {
-                // A record a short step after the last window's last one
-                // (the same step as that window's, if it had one): the
-                // title walks the buffer, so the ones that step apart
-                // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
-                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                        } else {
-                            (stride, max)
+            // Ensure earlier compute UAV writes to the argument/count buffer are visible.
+            // SAFETY: an open list; a null-resource UAV barrier is always valid.
+            unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
+            (args.buffer.clone(), offset)
+        } else {
+            // One record without a count: clamped in a batch (`batches`).
+            // Spread dispatches use 20-byte [row, asked x, x, y, z] records and
+            // bypass the unspread 12-byte batch path.
+            let batch = if !alone && batches() > 0 && max == 1 && count.is_none() && !is_spread {
+                args.refresh(list, arguments, len);
+                self.batched(list, &args, arguments, kind)
+            } else {
+                None
+            };
+            if batch.is_some() {
+                self.window = None;
+            }
+            // A window of records clamped in one pass (`windows`): for single
+            // records without a count buffer, drawn by shaders that store to no
+            // buffer. Anything else ends the window: it uses the scratch buffer
+            // or may write the arguments.
+            const WINDOW_USE: usize = usize::MAX - 0x77;
+            let windowed = windows()
+                && !ordered
+                && kind != DISPATCH
+                && kind != MESH_1D
+                && max == 1
+                && count.is_none()
+                && !p.stages.iter().any(|stage| stage.translated().stores);
+            // Another host list (a new one after a cut, or this one after its
+            // reset) has another scratch buffer, or this one's with old bytes.
+            if !windowed || list.first_use(WINDOW_USE) {
+                self.window = None;
+            }
+            let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
+            let hit = self
+                .window
+                .as_ref()
+                .filter(|w| same(w) && offset >= w.base)
+                .filter(|w| {
+                    (offset - w.base) % u64::from(w.step) == 0
+                        && (offset - w.base) / u64::from(w.step) < u64::from(w.records)
+                })
+                .map(|w| (w.scratch.clone(), offset - w.base));
+            match batch.or(hit) {
+                Some(hit) => hit,
+                None => {
+                    // A record a short step after the last window's last one
+                    // (the same step as that window's, if it had one): the
+                    // title walks the buffer, so the ones that step apart
+                    // after it are clamped with it.
+                    let (step, records) = match &self.window {
+                        Some(w) if windowed && same(w) => {
+                            let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
+                            let step = offset.saturating_sub(last);
+                            let walks = step >= u64::from(stride)
+                                && step <= 256
+                                && step % 4 == 0
+                                && (w.records == 1 || step == u64::from(w.step));
+                            if walks {
+                                let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                                (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                            } else {
+                                (stride, max)
+                            }
                         }
+                        _ => (stride, max),
+                    };
+                    args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                    if let Some((s, at)) = &counter {
+                        s.refresh(list, *at, 4);
                     }
-                    _ => (stride, max),
-                };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
-                if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
+                    // Bounded first: the clamp binds a compute pipeline of its
+                    // own and copies clamped active records into a scratch
+                    // buffer at offset 0.
+                    let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                    // More than the record asked for: a window clamped ahead,
+                    // whose unfilled slots must not spend the list's budget.
+                    let bounded = if windowed && records > 1 {
+                        crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                    } else {
+                        // (A spread dispatch is never windowed: `windowed` is
+                        // false for dispatches.)
+                        crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
+                    };
+                    let Some(bounded) = bounded else {
+                        self.window = None;
+                        why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                        return false;
+                    };
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                    self.window = windowed.then(|| Window {
+                        copy: args.id(),
+                        kind,
+                        stride,
+                        step,
+                        base: offset,
+                        records,
+                        scratch: bounded.clone(),
+                    });
+                    (bounded, 0)
                 }
-                // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a scratch
-                // buffer at offset 0.
-                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-                // More than the record asked for: a window clamped ahead,
-                // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
-                } else {
-                    // (A spread dispatch is never windowed: `windowed` is
-                    // false for dispatches.)
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
-                };
-                let Some(bounded) = bounded else {
-                    self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
-                };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
-                (bounded, 0)
             }
         };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            MESH | MESH_1D => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
@@ -4757,7 +4815,7 @@ impl State {
         });
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
-        if kind == MESH {
+        if is_mesh {
             self.mesh_scissor(list, true);
         }
         // SAFETY: an open list with everything set; the scratch buffer and
@@ -4772,7 +4830,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        if kind == MESH {
+        if is_mesh {
             self.mesh_scissor(list, false);
         }
         if kind == DISPATCH {
@@ -4789,6 +4847,206 @@ impl State {
                 SPREAD[1].fetch_add(1, Ordering::Relaxed);
             }
         } else {
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Indirect execution of a general console command signature (`stride`,
+    /// `args`): single-argument signatures delegate straight to
+    /// [`State::execute_indirect`]; multi-argument signatures with any prefix
+    /// of root constants (`CONSTANT = 5`) and root descriptors (`CBV = 6`,
+    /// `SRV = 7`, `UAV = 8`) followed by `DRAW` / `DRAW_INDEXED` / `DISPATCH` /
+    /// `DISPATCH_SINGLE` / `DISPATCH_MESH` are repacked, VA-rebased, and
+    /// clamped on the GPU before executing through a cached host command
+    /// signature.
+    pub(crate) fn execute_indirect_signature(
+        &mut self,
+        list: &HostList,
+        stride: u32,
+        args: &[[u32; 4]],
+        max: u32,
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        use crate::indirect::{
+            KIND_DISPATCH, KIND_DISPATCH_MESH, KIND_DISPATCH_SINGLE, KIND_DRAW, KIND_DRAW_INDEXED,
+            StageBinding,
+        };
+        match args {
+            [] => return false,
+            [[kind, ..]] => {
+                let kind = if *kind == KIND_DISPATCH_SINGLE {
+                    KIND_DISPATCH
+                } else {
+                    *kind
+                };
+                return self.execute_indirect(list, (kind, stride, max), arguments, count);
+            }
+            _ => {}
+        }
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
+        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| crate::pipeline::note_why(format!("multi-arg indirect {args:?}: {what}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let why = |_: &str| {};
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        };
+        let bindings: Vec<StageBinding<'_>> = p
+            .stages
+            .iter()
+            .map(|stage| StageBinding {
+                user_data_param: stage.user_data.map(|(param, _)| param),
+                user_data: &stage.translated().host.user_data,
+                root_cbvs: &stage.root_cbvs,
+                root_srvs: &stage.root_srvs,
+                root_uavs: &stage.root_uavs,
+            })
+            .collect();
+        let Some(plan) = crate::indirect::translate_signature(
+            stride,
+            args,
+            &bindings,
+            crate::pipeline::host::bounded_root_srvs(),
+        ) else {
+            why("unsupported multi-argument signature layout");
+            return false;
+        };
+        if plan.skipped_tabled_views {
+            once!(
+                "indirect root SRV/UAV targets a bounded descriptor-table parameter; set VICTORY_ROOT_SRV_DIRECT=1 to enable indirect root SRV/UAV updates"
+            );
+        }
+        let kind = plan.exec_kind;
+        let made_rects = !p.rects
+            && kind == KIND_DRAW
+            && self.topology == RECTANGLES
+            && !p.inputs.iter().any(|e| !e.per_instance);
+        if made_rects {
+            once!("indirect rectangles without vertex inputs drawn as their first triangle");
+        }
+        let matches_kind = match kind {
+            KIND_DRAW | KIND_DRAW_INDEXED => {
+                (self.topology != RECTANGLES || made_rects || p.rects) && !p.compute && !p.mesh
+            }
+            KIND_DISPATCH_MESH => !p.compute && p.mesh,
+            KIND_DISPATCH => p.compute,
+            _ => false,
+        };
+        if !matches_kind {
+            why(&format!(
+                "pipeline mismatch (compute {}, mesh {}, topology {})",
+                p.compute, p.mesh, self.topology
+            ));
+            return false;
+        }
+        if kind == KIND_DISPATCH_MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            return false;
+        }
+        let Some(len) = u64::from(stride).checked_mul(u64::from(max.max(1))) else {
+            why("argument byte length overflow");
+            return false;
+        };
+        let Some(arg_shadow) = crate::shadow::find_any(arguments, len) else {
+            why("arguments outside title buffers");
+            return false;
+        };
+        let counter = match count {
+            Some(at) => match crate::shadow::find_any(at, 4) {
+                Some(s) => Some((s, at)),
+                None => {
+                    why("count outside title buffers");
+                    return false;
+                }
+            },
+            None => None,
+        };
+        let Some(signature) = host_multi_signature(
+            plan.has_root_args.then_some(&p.root),
+            plan.dst_stride,
+            &plan.host_args,
+        ) else {
+            why("no host multi-argument signature");
+            return false;
+        };
+        arg_shadow.refresh(list, arguments, len);
+        if let Some((s, at)) = &counter {
+            s.refresh(list, *at, 4);
+        }
+        let rebase = if plan.needs_rebase {
+            collect_rebase_entries(list, self.roots_ref(p.compute))
+        } else {
+            Vec::new()
+        };
+        let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        let Some(bounded) = crate::indirect::repack(
+            list,
+            (&arg_shadow.buffer, arg_shadow.offset(arguments)),
+            count_arg,
+            &plan,
+            &rebase,
+            max,
+        ) else {
+            self.window = None;
+            why("multi-arg repack failed");
+            return false;
+        };
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        self.window = None;
+        let ran = match kind {
+            KIND_DRAW | KIND_DRAW_INDEXED => self.prepare(list, kind == KIND_DRAW_INDEXED),
+            KIND_DISPATCH_MESH => self.prepare_for(list, false, true),
+            KIND_DISPATCH => self.bind(list, p, true),
+            _ => false,
+        };
+        if !ran {
+            why("prepare failed");
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            self.op_text(
+                format!("indirect multi kind {kind} max {max} at {arguments:#x}"),
+                kind == KIND_DISPATCH,
+            )
+        });
+        #[cfg(feature = "diagnostics")]
+        list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+        if kind == KIND_DISPATCH_MESH {
+            self.mesh_scissor(list, true);
+        }
+        // SAFETY: an open list with everything set; `bounded`, `signature`, and
+        // any rebased shadow buffers are kept alive for the list.
+        unsafe {
+            list.list.ExecuteIndirect(
+                &signature,
+                max,
+                &bounded,
+                0,
+                counter.as_ref().map(|(s, _)| &s.buffer),
+                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+            )
+        };
+        if kind == KIND_DISPATCH_MESH {
+            self.mesh_scissor(list, false);
+        }
+        if kind == KIND_DISPATCH {
+            self.buffers_written();
+            DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.drew(Some(p));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
@@ -5016,6 +5274,135 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     }
     let signature = signature?;
     made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+/// Collects active live shadow ranges into a sorted, non-overlapping GPU
+/// VA-rebase table for indirect root CBV/SRV/UAV translation, keeping every
+/// referenced shadow buffer alive on `list`.
+fn collect_rebase_entries(list: &HostList, roots: &[Root]) -> Vec<[u32; 8]> {
+    const UNORDERED: i32 = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0;
+    let mut ranges: Vec<(u64, u64, u64, bool)> = Vec::new();
+    let mut seen_ids: Vec<u64> = Vec::new();
+    let mut push_shadow = |s: std::sync::Arc<crate::shadow::Shadow>| {
+        let id = s.id();
+        if seen_ids.contains(&id) {
+            return;
+        }
+        seen_ids.push(id);
+        let (start, len) = s.span();
+        if len == 0 {
+            return;
+        }
+        let host_gpu = s.gpu(start);
+        // SAFETY: live D3D12 buffer resource.
+        let writable = unsafe { s.buffer.GetDesc() }.Flags.0 & UNORDERED != 0;
+        list.keep_shadow(s);
+        ranges.push((start, len, host_gpu, writable));
+    };
+    for (start, len, _) in crate::shadow::spans() {
+        if len > 0
+            && let Some(s) = crate::shadow::peek(start, 1)
+        {
+            push_shadow(s);
+        }
+    }
+    for root in roots {
+        if let &Root::View(va) = root
+            && va != 0
+            && let Some(s) = crate::shadow::find(va, 1)
+        {
+            push_shadow(s);
+        }
+    }
+    crate::indirect::build_rebase_table(&ranges)
+}
+
+/// Cached host multi-argument command signature keyed by
+/// `(root_sig_ptr, host_stride, host_args_layout)`.
+fn host_multi_signature(
+    root: Option<&ID3D12RootSignature>,
+    stride: u32,
+    args: &[crate::indirect::HostIndirectArg],
+) -> Option<ID3D12CommandSignature> {
+    use crate::indirect::HostIndirectArg;
+    type Key = (usize, u32, Vec<HostIndirectArg>);
+    type Entry = (Option<ID3D12RootSignature>, ID3D12CommandSignature);
+    static MADE: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<Key, Entry>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let root_ptr = root.map_or(0, |r| r.as_raw() as usize);
+    let key = (root_ptr, stride, args.to_vec());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.get(&key) {
+        return Some(s.clone());
+    }
+    let descs: Vec<D3D12_INDIRECT_ARGUMENT_DESC> = args
+        .iter()
+        .map(|&arg| match arg {
+            HostIndirectArg::Constant {
+                param,
+                dest_offset,
+                count,
+            } => D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: param,
+                        DestOffsetIn32BitValues: dest_offset,
+                        Num32BitValuesToSet: count,
+                    },
+                },
+            },
+            HostIndirectArg::Cbv { param } => D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    ConstantBufferView: D3D12_INDIRECT_ARGUMENT_DESC_0_2 {
+                        RootParameterIndex: param,
+                    },
+                },
+            },
+            HostIndirectArg::Srv { param } => D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    ShaderResourceView: D3D12_INDIRECT_ARGUMENT_DESC_0_3 {
+                        RootParameterIndex: param,
+                    },
+                },
+            },
+            HostIndirectArg::Uav { param } => D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    UnorderedAccessView: D3D12_INDIRECT_ARGUMENT_DESC_0_4 {
+                        RootParameterIndex: param,
+                    },
+                },
+            },
+            HostIndirectArg::Exec { kind } => D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+                ..Default::default()
+            },
+        })
+        .collect();
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: stride,
+        NumArgumentDescs: descs.len() as u32,
+        pArgumentDescs: descs.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: valid argument descriptions and matching optional root signature.
+    let result = unsafe {
+        crate::host::host()?
+            .device
+            .CreateCommandSignature(&desc, root, &mut signature)
+    };
+    if let Err(e) = result {
+        once!(error = %e, stride, ?args, "multi-argument command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.insert(key, (root.cloned(), signature.clone()));
     Some(signature)
 }
 

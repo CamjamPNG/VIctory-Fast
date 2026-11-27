@@ -4377,17 +4377,6 @@ impl<'a> Lower<'a> {
         )
     }
 
-    fn ibinary(&mut self, op: u32, a: V, b: V) -> V {
-        self.s.op(
-            self.cur,
-            "binary.i32",
-            Attr::ReadNone,
-            self.s.t.i32,
-            op,
-            &[a, b],
-        )
-    }
-
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
     /// the compare and select DXIL specifies gives either zero.
@@ -6691,19 +6680,21 @@ impl<'a> Lower<'a> {
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let op = match name {
-                    "s_min_u32" => 40,
-                    "s_max_u32" => 39,
-                    "s_min_i32" => 38,
-                    _ => 37,
+                let p = match name {
+                    "s_min_u32" => pred::IULT,
+                    "s_max_u32" => pred::IUGT,
+                    "s_min_i32" => pred::SLT,
+                    _ => pred::SGT,
                 };
-                (self.ibinary(op, a, b), None)
+                let t = self.s.m.cmp(c, p, a, b);
+                (self.s.m.select(c, t, a, b), None)
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
                 let z = self.s.m.i32(0);
+                let neg = self.s.m.cmp(c, pred::SLT, a, z);
                 let n = self.s.m.bin(c, Bin::Sub, z, a);
-                (self.ibinary(37, a, n), None)
+                (self.s.m.select(c, neg, n, a), None)
             }
             "s_bitset0_b32" | "s_bitset1_b32" => {
                 // Sets (clears) bit src[4:0] of the destination it reads.
@@ -10710,13 +10701,14 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, op, x, sh)
                 }
                 _ => {
-                    let op = match name {
-                        "v_max_u16" => 39,
-                        "v_min_u16" => 40,
-                        "v_max_i16" => 37,
-                        _ => 38,
+                    let p = match name {
+                        "v_max_u16" => pred::IUGT,
+                        "v_min_u16" => pred::IULT,
+                        "v_max_i16" => pred::SGT,
+                        _ => pred::SLT,
                     };
-                    self.ibinary(op, a, b)
+                    let t = self.s.m.cmp(c, p, a, b);
+                    self.s.m.select(c, t, a, b)
                 }
             }
         };
@@ -10936,13 +10928,14 @@ impl<'a> Lower<'a> {
                         self.s.m.bin(c, o, x, sh)
                     }
                     _ => {
-                        let code = match op {
-                            "max_u16" => 39,
-                            "min_u16" => 40,
-                            "max_i16" => 37,
-                            _ => 38,
+                        let p = match op {
+                            "max_u16" => pred::IUGT,
+                            "min_u16" => pred::IULT,
+                            "max_i16" => pred::SGT,
+                            _ => pred::SLT,
                         };
-                        self.ibinary(code, xs[0], xs[1])
+                        let t = self.s.m.cmp(c, p, xs[0], xs[1]);
+                        self.s.m.select(c, t, xs[0], xs[1])
                     }
                 }
             };
@@ -11078,13 +11071,14 @@ impl<'a> Lower<'a> {
             }
             "v_max_i32" | "v_min_i32" | "v_max_u32" | "v_min_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let op = match name {
-                    "v_max_i32" => 37,
-                    "v_min_i32" => 38,
-                    "v_max_u32" => 39,
-                    _ => 40,
+                let p = match name {
+                    "v_max_i32" => pred::SGT,
+                    "v_min_i32" => pred::SLT,
+                    "v_max_u32" => pred::IUGT,
+                    _ => pred::IULT,
                 };
-                self.ibinary(op, a, b)
+                let t = self.s.m.cmp(c, p, a, b);
+                self.s.m.select(c, t, a, b)
             }
             "v_mul_hi_u32" | "v_mul_hi_i32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
@@ -11181,25 +11175,30 @@ impl<'a> Lower<'a> {
             "v_min3_i32" | "v_max3_i32" | "v_min3_u32" | "v_max3_u32" | "v_med3_i32"
             | "v_med3_u32" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let (min_op, max_op) = if name.ends_with("i32") {
-                    (38, 37)
+                let signed = name.ends_with("i32");
+                let (lt, gt) = if signed {
+                    (pred::SLT, pred::SGT)
                 } else {
-                    (40, 39)
+                    (pred::IULT, pred::IUGT)
+                };
+                let pick = |l: &mut Self, p, x, y| {
+                    let t = l.s.m.cmp(c, p, x, y);
+                    l.s.m.select(c, t, x, y)
                 };
                 match &name[2..6] {
                     "min3" => {
-                        let t = self.ibinary(min_op, a, b);
-                        self.ibinary(min_op, t, d)
+                        let t = pick(self, lt, a, b);
+                        pick(self, lt, t, d)
                     }
                     "max3" => {
-                        let t = self.ibinary(max_op, a, b);
-                        self.ibinary(max_op, t, d)
+                        let t = pick(self, gt, a, b);
+                        pick(self, gt, t, d)
                     }
                     _ => {
-                        let lo = self.ibinary(min_op, a, b);
-                        let hi = self.ibinary(max_op, a, b);
-                        let t = self.ibinary(min_op, hi, d);
-                        self.ibinary(max_op, lo, t)
+                        let lo = pick(self, lt, a, b);
+                        let hi = pick(self, gt, a, b);
+                        let t = pick(self, lt, hi, d);
+                        pick(self, gt, lo, t)
                     }
                 }
             }

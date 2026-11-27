@@ -1000,7 +1000,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let BufferSweep { passes, ranges, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
-    let slots = if all {
+    let mut slots = if all {
         ranges.0.clear();
         host.buffer_slots()
     } else if heap_spread() {
@@ -1013,6 +1013,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     } else {
         changed
     };
+    slots.sort_unstable();
+    slots.dedup();
     *passes += 1;
     // Whether the device was there before the pass: a view that removes
     // it is named below.

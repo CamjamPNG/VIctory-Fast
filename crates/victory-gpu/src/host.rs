@@ -1021,7 +1021,7 @@ pub(crate) fn allocator_pool_caps(
     critical: bool,
 ) -> (usize, usize) {
     const WATCH_PRIVATE: u64 = 16 << 30;
-    const HIGH_PRIVATE: u64 = 22 << 30;
+    const HIGH_PRIVATE: u64 = 26 << 30;
     // Keep enough idle HostLists (~256-320) and tiny barrier preludes (~32-64,
     // ~4 MB total) so 2 frames of async-submit + thin list workers never drop
     // and recreate command allocators, budget shared_buffers, and indirect UAVs
@@ -9954,7 +9954,7 @@ impl Batch {
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
         const FEW: usize = 256;
-        const CHUNK: usize = 16;
+        const CHUNK: usize = 64;
         let mut spans = spans;
         // (Renderer port #6: on the threads beside, whatever their number.)
         let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
@@ -12886,11 +12886,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Watch / >=16 GiB private keeps 2-frame list reuse (<=320) and tiny barrier preludes (<=64).
         assert_eq!(super::allocator_pool_caps(256, 64, 16 * GIB, false, false), (256, 64));
         assert_eq!(super::allocator_pool_caps(384, 128, 8 * GIB, true, false), (320, 64));
-        // Critical / >=22 GiB private trims lists to <=128 and preludes to <=32.
-        assert_eq!(super::allocator_pool_caps(256, 64, 22 * GIB, false, false), (128, 32));
+        // Critical / >=26 GiB private trims lists to <=128 and preludes to <=32.
+        assert_eq!(super::allocator_pool_caps(256, 64, 22 * GIB, false, false), (256, 64));
+        assert_eq!(super::allocator_pool_caps(256, 64, 26 * GIB, false, false), (128, 32));
         assert_eq!(super::allocator_pool_caps(384, 128, 8 * GIB, true, true), (128, 32));
         // Respects smaller explicit caps.
-        assert_eq!(super::allocator_pool_caps(40, 20, 22 * GIB, false, false), (40, 10));
+        assert_eq!(super::allocator_pool_caps(40, 20, 26 * GIB, false, false), (40, 10));
 
         // Landed-flight lag shrinks to 0 under high commit so finished allocators recycle immediately.
         assert_eq!(super::land_lag(16, 10 * GIB, false, false), 16);

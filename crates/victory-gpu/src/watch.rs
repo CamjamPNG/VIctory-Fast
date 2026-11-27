@@ -135,7 +135,11 @@ pub(crate) fn dirty4k_count(found: Option<u16>, narrowed: bool) {
 
 impl Shard {
     const fn new() -> Shard {
-        Shard { written: BTreeMap::new(), parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()) }
+        Shard {
+            written: BTreeMap::new(),
+            max_written: 0,
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -147,7 +151,11 @@ impl Shard {
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
-        self.written.insert(page, before.max(now));
+        let latest = before.max(now);
+        self.written.insert(page, latest);
+        if latest > self.max_written {
+            self.max_written = latest;
+        }
         if parts == WHOLE || !parts_on() {
             if now >= before {
                 self.parts.remove(&page);
@@ -212,6 +220,8 @@ struct Notes([RwLock<Shard>; SHARDS]);
 struct Shard {
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
+    /// Largest asking recorded in `written`, for O(1) clean-shard skipping.
+    max_written: u64,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -265,6 +275,24 @@ impl Notes {
                 all.sort_unstable();
                 all.into_iter().all(|(p, w)| each(p, w))
             }
+        }
+    }
+
+    /// Order-independent predicate over notes in `[first, last)`, skipping any
+    /// shard whose `max_written <= floor` in O(1) without allocating or sorting.
+    fn all_below(&self, first: usize, last: usize, floor: u64, mut pred: impl FnMut(usize, u64) -> bool) -> bool {
+        if first >= last {
+            return true;
+        }
+        match pieces(first, last) {
+            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+                let s = self.read(shard_of(from));
+                s.max_written <= floor || s.written.range(from..to).all(|(&p, &w)| w <= floor || pred(p, w))
+            }),
+            None => (0..SHARDS).all(|shard| {
+                let s = self.read(shard);
+                s.max_written <= floor || s.written.range(first..last).all(|(&p, &w)| w <= floor || pred(p, w))
+            }),
         }
     }
 
@@ -1358,8 +1386,21 @@ pub(crate) fn nothing_new_in(
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.0.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+    let floor = if ranged != 0 {
+        ranged
+    } else {
+        let mut min_taken = u64::MAX;
+        for &at in taken {
+            if at == 0 {
+                return false;
+            }
+            if at < min_taken {
+                min_taken = at;
+            }
+        }
+        min_taken
+    };
+    j.0.notes.all_below(first, last, floor, |page, write| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {

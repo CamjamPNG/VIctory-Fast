@@ -34,7 +34,7 @@
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
@@ -51,6 +51,8 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Ends the title's reflections (`CS_UpdateHistory`).
+    Reflect,
 }
 
 /// The program's part in this, by its name in the container.
@@ -62,6 +64,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_UpdateHistory") {
+        Some(Role::Reflect)
     } else {
         None
     }
@@ -75,6 +79,8 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the last reflection pass writes reflections (R9G9B9E5 as 32-bit integers).
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -94,12 +100,58 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| match parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()) {
+        Set::Off => rt_band().map_or(Set::Off, |b| Set::Estimate(b.level)),
+        set => set,
+    })
 }
 
-/// Whether the stand-in is on: set, and the title's rays find nothing.
+/// With ray tracing (`VICTORY_AMBIENT_RT=<least>,<most>[,<level>]`; unset:
+/// off, the title's own light whenever rays run): keeps traced diffuse light
+/// between `least` and `most` times the estimate.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Band {
+    least: f32,
+    most: f32,
+    level: f32,
+}
+
+pub(crate) fn rt_band() -> Option<Band> {
+    static SET: OnceLock<Option<Band>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let band = parse_band(&std::env::var("VICTORY_AMBIENT_RT").ok()?)?;
+        tracing::info!(
+            least = band.least,
+            most = band.most,
+            level = band.level,
+            "the stand-in keeps the traced indirect light in a band (VICTORY_AMBIENT_RT)"
+        );
+        Some(band)
+    })
+}
+
+fn parse_band(set: &str) -> Option<Band> {
+    let mut parts = set.split(',').map(|p| p.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0));
+    let least = parts.next().flatten()?;
+    let most = parts.next().flatten().unwrap_or(4.0).max(least).max(1e-3);
+    let level = parts.next().flatten().filter(|v| *v > 0.0).unwrap_or(0.8);
+    Some(Band { least, most, level })
+}
+
+fn rays_run() -> bool {
+    crate::pipeline::builder_runs() || crate::dxr::enabled()
+}
+
+/// Whether the stand-in is on: set, and rays are off (or `VICTORY_AMBIENT_RT` is set).
 pub(crate) fn on() -> bool {
-    set() != Set::Off && !crate::pipeline::builder_runs()
+    set() != Set::Off && (rt_band().is_some() || !rays_run())
+}
+
+fn bounds() -> (f32, f32) {
+    match rt_band() {
+        Some(b) if rays_run() => (b.least, b.most),
+        _ => (1.0, 4.0),
+    }
 }
 
 /// The most the air scatters, as a multiple of the light around
@@ -110,6 +162,23 @@ fn air() -> f32 {
         let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
         set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
     })
+}
+
+/// The most RT-off reflections may hold, as a multiple of the ambient light
+/// around (`VICTORY_AMBIENT_REFLECT=<multiple>`; default `0.5`, `0` leaves them).
+/// Without rays, glossy indoor surfaces (eyes, picture glass, tabletops) miss
+/// interior geometry and reflect the bright unoccluded outdoor sky.
+fn parse_reflect(set: &str) -> f32 {
+    let set = set.trim();
+    if set.is_empty() {
+        return 0.5;
+    }
+    set.parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(0.5)
+}
+
+fn reflect_cap() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_reflect(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default()))
 }
 
 /// How the slow mean of the light around follows the frames
@@ -203,7 +272,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=16, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -212,8 +281,8 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
-    float jump; float fresh; float dt;
+    float follow; float most; float air; float reflect_cap;
+    float jump; float fresh; float dt; float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -331,7 +400,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
-#ifdef RAISE
+#if defined(RAISE) || defined(REFLECT)
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
     return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
@@ -345,6 +414,42 @@ uint pack(float3 c) {
     uint3 m = min(uint3(c * scale + 0.5), 511u);
     return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
 }
+#endif
+
+#ifdef REFLECT
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold_reflect(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    int2 p = int2(at.xy);
+    float3 c = unpack(light[p]);
+    if (any(isnan(c)) || any(isinf(c))) { light[p] = 0; return; }
+    if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) { light[p] = 0; return; }
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 local = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float3 room = cells[CELLS].rgb;
+    float3 around;
+    if (constant > 0.0) {
+        around = float3(1.0, 0.98, 0.94) * constant;
+    } else {
+        float3 base = dot(local, LUMA) > 1e-5 ? lerp(room, local, 0.35) : room;
+        around = base * level;
+    }
+    float around_luma = max(dot(around, LUMA), 1e-4);
+    float cap = around_luma * reflect_cap;
+    float has = dot(c, LUMA);
+    if (has > cap) {
+        float3 clamped = c * (cap / has);
+        // Strong spikes indoors are unoccluded outdoor sky-miss rays: shift toward the room's tint.
+        float excess = saturate((has / cap - 1.0) / 3.0);
+        float3 room_tint = around * (cap / around_luma);
+        light[p] = pack(lerp(clamped, room_tint, 0.65 * excess));
+    }
+}
+#endif
+
+#ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
@@ -415,7 +520,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    light[p] = pack(max(was, found * least));
 }
 #endif
 "#;
@@ -433,6 +538,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    reflect: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -464,6 +570,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let reflect = pipeline("REFLECT", s!("hold_reflect"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -473,6 +580,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        reflect,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -529,30 +637,38 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    static SAID: Mutex<u32> = Mutex::new(0);
-    {
-        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
-            *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
-        }
+    if role == Role::Reflect && (reflect_cap() <= 0.0 || rays_run()) {
+        return false;
+    }
+    static SAID: [std::sync::atomic::AtomicBool; 4] = [const { std::sync::atomic::AtomicBool::new(false) }; 4];
+    let slot = match role {
+        Role::Resolve => 0,
+        Role::Radiance => 1,
+        Role::Air => 2,
+        Role::Reflect => 3,
+    };
+    if !SAID[slot].swap(true, Ordering::Relaxed) {
+        tracing::info!(?role, size = ?views.size, level, constant, reflect = reflect_cap(), "a stand-in for the indirect light");
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 16];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
+    let (least, most) = bounds();
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = follow(role).to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = most.to_bits();
     words[10] = air().to_bits();
+    words[11] = reflect_cap().to_bits();
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();
+    words[15] = least.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -560,7 +676,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 16, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -577,6 +693,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);
@@ -614,11 +731,26 @@ mod tests {
     }
 
     #[test]
+    fn the_band_with_rays() {
+        assert_eq!(parse_band("0.5,1.5"), Some(Band { least: 0.5, most: 1.5, level: 0.8 }));
+        assert_eq!(parse_band("1,1,0.6"), Some(Band { least: 1.0, most: 1.0, level: 0.6 }));
+        assert_eq!(parse_band("2,1"), Some(Band { least: 2.0, most: 2.0, level: 0.8 }));
+        assert_eq!(parse_band("0.7"), Some(Band { least: 0.7, most: 4.0, level: 0.8 }));
+        assert_eq!(parse_band(""), None);
+        assert_eq!(parse_band("x,1"), None);
+    }
+
+    #[test]
     fn roles_by_name() {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"CS_UpdateHistory_12345678"), Some(Role::Reflect));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+        assert_eq!(parse_reflect(""), 0.5);
+        assert_eq!(parse_reflect("0"), 0.0);
+        assert_eq!(parse_reflect("0.75"), 0.75);
+        assert_eq!(parse_reflect("-1"), 0.5);
     }
 
     /// The passes compile with the system's compiler and the host takes them.

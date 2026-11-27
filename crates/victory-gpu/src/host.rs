@@ -4672,6 +4672,7 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
+    crate::port_rt::line(frames);
     crate::port_cbv::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -6836,27 +6837,39 @@ impl Host {
         if crate::watch::once() {
             let (ranges, stale_spans) = if refresh_front() {
                 let fronts = plan_lists_parallel(runs, wide_textures(), true, behind);
-                let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-                let mut stale_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-                let mut stale_places: ByCopy<usize> = ByCopy::default();
-                for front in &fronts {
-                    for &(key, lo, hi) in &front.ask_spans {
-                        let span = spans.entry(key).or_insert((lo, hi));
-                        *span = (span.0.min(lo), span.1.max(hi));
-                    }
-                    if behind {
-                        for (key, shadow, lo, hi) in &front.stale_spans {
-                            let i = *stale_places.entry(*key).or_insert_with(|| {
-                                stale_spans.push((shadow.clone(), *lo, *hi));
-                                stale_spans.len() - 1
-                            });
-                            let s = &mut stale_spans[i];
-                            (s.1, s.2) = (s.1.min(*lo), s.2.max(*hi));
+                if fronts.len() == 1 {
+                    let front = &fronts[0];
+                    let ranges: Vec<(usize, usize)> = front.ask_spans.iter().map(|&(_, lo, hi)| (lo, hi)).collect();
+                    let stale_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = if behind {
+                        front.stale_spans.iter().map(|(_, s, lo, hi)| (s.clone(), *lo, *hi)).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    prepared_fronts = Some(fronts);
+                    (ranges, stale_spans)
+                } else {
+                    let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+                    let mut stale_spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+                    let mut stale_places: ByCopy<usize> = ByCopy::default();
+                    for front in &fronts {
+                        for &(key, lo, hi) in &front.ask_spans {
+                            let span = spans.entry(key).or_insert((lo, hi));
+                            *span = (span.0.min(lo), span.1.max(hi));
+                        }
+                        if behind {
+                            for (key, shadow, lo, hi) in &front.stale_spans {
+                                let i = *stale_places.entry(*key).or_insert_with(|| {
+                                    stale_spans.push((shadow.clone(), *lo, *hi));
+                                    stale_spans.len() - 1
+                                });
+                                let s = &mut stale_spans[i];
+                                (s.1, s.2) = (s.1.min(*lo), s.2.max(*hi));
+                            }
                         }
                     }
+                    prepared_fronts = Some(fronts);
+                    (spans.into_values().collect::<Vec<(usize, usize)>>(), stale_spans)
                 }
-                prepared_fronts = Some(fronts);
-                (spans.into_values().collect::<Vec<(usize, usize)>>(), stale_spans)
             } else {
                 let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
                 let mut last: Option<(usize, usize, usize)> = None;
@@ -8393,9 +8406,33 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+            .push(Step::Fill(dst as usize, src, len, None));
+    }
+
+    /// Renderer port RT: forwards a fill behind a same-list placed copy out of
+    /// that copy's upload source when safe (`crate::port_rt::forwarded`).
+    fn forward_fill(&self, src: usize, len: usize) -> usize {
+        if !crate::port_rt::on() || len == 0 {
+            return src;
+        }
+        let deferred = self.deferred();
+        let seen = deferred.copies.iter().rev().map(|step| match step {
+            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
+            &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
+            &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
+            Step::Run(_) => crate::port_rt::Seen::Anything,
+            _ => crate::port_rt::Seen::Nothing,
+        });
+        match crate::port_rt::forwarded(seen, src, len) {
+            Some(from) => {
+                crate::port_rt::count(crate::port_rt::FORWARDED);
+                from
+            }
+            None => src,
+        }
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -8416,16 +8453,18 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        let src = self.forward_fill(src as usize, len);
+        self.deferred().copies.push(Step::Fill(dst as usize, src, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -9652,19 +9691,34 @@ fn join_keys_covered<'a>(
 
 /// [`join_keys`] of the lists' parts, with their copies and per-list coverage flags.
 fn join_fronts(
-    fronts: &[ListFront],
+    mut fronts: Vec<ListFront>,
     parts: &[usize],
 ) -> (Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, Vec<bool>) {
-    let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
-    for front in fronts {
-        for (key, shadow) in &front.shadows {
-            shadows.entry(*key).or_insert_with(|| shadow.clone());
+    if fronts.len() == 1 {
+        let front = fronts.pop().unwrap();
+        let covered = vec![!front.has_post_write_refresh];
+        // `list_front` pushes each `shadow` the first time a copy has a pre-write refresh,
+        // matching `copies.iter().filter(|c| c.1 < c.2)` in exact 1-to-1 order.
+        let mut shadows = front.shadows.into_iter();
+        let mut spans = Vec::with_capacity(shadows.len());
+        for (key, from, to, _) in front.copies {
+            if from < to {
+                if let Some((s_key, shadow)) = shadows.next() {
+                    debug_assert_eq!(s_key, key);
+                    spans.push((shadow, from, to));
+                }
+            }
         }
+        return (spans, covered);
     }
     let (spans, mut covered) = join_keys_covered(fronts.iter().map(|f| f.copies.as_slice()), parts);
+    let mut shadows: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
     for (ok, front) in covered.iter_mut().zip(fronts) {
         if front.has_post_write_refresh {
             *ok = false;
+        }
+        for (key, shadow) in front.shadows {
+            shadows.entry(key).or_insert(shadow);
         }
     }
     let spans = spans
@@ -9993,7 +10047,7 @@ impl Batch {
                 }
             }
         }
-        let (spans, covered) = join_fronts(&fronts, parts);
+        let (spans, covered) = join_fronts(fronts, parts);
         self.refresh_spans(spans, due, planning);
         covered
     }
@@ -10019,7 +10073,7 @@ impl Batch {
                     }
                 }
             }
-            let (spans, covered) = join_fronts(&fronts, parts);
+            let (spans, covered) = join_fronts(fronts, parts);
             self.refresh_spans(spans, due, planning);
             return covered;
         }

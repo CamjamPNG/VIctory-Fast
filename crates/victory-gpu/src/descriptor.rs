@@ -1569,18 +1569,25 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// Fast liveness check for a previously resolved view record `(i, generation)`
-/// without cloning the [`View`]. `CONSTANT` and `PLACED` records stay valid
-/// once emitted (`shapes` is append-only).
-pub(crate) fn view_alive(i: u32, generation: u32) -> bool {
-    match generation >> KIND_SHIFT {
-        0 | OBJECT_BUFFER => {
-            let views = views_read();
-            views.list.get(i as usize).is_some_and(|(_, current)| *current == (generation & GENERATIONS))
+/// Read guard over the global view table so callers validating a batch of
+/// slots (e.g. `heap_buffer_pass`) acquire `VIEWS.read()` once per chunk.
+pub(crate) struct ViewsGuard(std::sync::RwLockReadGuard<'static, Views>);
+
+impl ViewsGuard {
+    #[inline]
+    pub(crate) fn view_alive(&self, i: u32, generation: u32) -> bool {
+        match generation >> KIND_SHIFT {
+            0 | OBJECT_BUFFER => {
+                self.0.list.get(i as usize).is_some_and(|(_, current)| *current == (generation & GENERATIONS))
+            }
+            CONSTANT | PLACED => true,
+            _ => false,
         }
-        CONSTANT | PLACED => true,
-        _ => false,
     }
+}
+
+pub(crate) fn lock_views_read() -> ViewsGuard {
+    ViewsGuard(views_read())
 }
 
 /// The view the record words `i` and `generation` name: the one they hold

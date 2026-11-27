@@ -1100,29 +1100,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     // Immutable snapshot of cached entries for lock-free validation across worker threads.
     let cached = &*ranges;
-    // What a slot of the title's shows: its copy and range, and whether it is
-    // an unordered view. Returns `None` when the cached entry stays unchanged
-    // and needs no main-thread update.
-    let look = |index: u32| -> Option<SlotUpdate> {
-        // A draw's table's: the draw brings what it reads up to date.
-        if host.copied_tabled(index, frame) {
-            return cached.get(index).is_some().then_some(SlotUpdate::Set(None));
-        }
-        let Some(handle) = heap.handle(index) else {
-            return cached.get(index).is_some().then_some(SlotUpdate::Set(None));
-        };
-        let record = crate::descriptor::record_at(handle);
-        if let Some([_, i, generation]) = record {
-            let key = u64::from(generation) << 32 | u64::from(i);
-            if let Some((_, (shadow, prev_key, prev_uav), _, _)) = cached.get(index)
-                && *prev_key == key
-                && !shadow.is_dead()
-                && host.quick_matches(index, key)
-                && crate::descriptor::view_alive(i, generation)
-            {
-                return (picked_on && *prev_uav).then_some(SlotUpdate::KeepUav);
-            }
-        }
+    // Slow path for a slot that missed the lock-free cache check (no VIEWS lock held).
+    let mirror_slot = |index: u32, handle: u64, record: Option<[u32; 3]>| -> Option<SlotUpdate> {
         let Some(view) = host.mirror_heap_pass(index, handle) else {
             return cached.get(index).is_some().then_some(SlotUpdate::Set(None));
         };
@@ -1139,12 +1118,75 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         let written = picked_on && view_kind(&view) == Some(ResourceType::Uav);
         Some(SlotUpdate::Set(Some(((shadow, key, written), address, address + len))))
     };
+    #[cfg(feature = "diagnostics")]
+    let (diag_tabled, diag_hits, diag_mirrors) = (
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    );
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 256;
     let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
     let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().filter_map(|&index| Some((index, look(index)?))).collect();
+        let mut looked: Vec<(u32, SlotUpdate)> = Vec::new();
+        let mut misses: Vec<(u32, u64, Option<[u32; 3]>)> = Vec::new();
+        #[cfg(feature = "diagnostics")]
+        let (mut loc_tabled, mut loc_hits) = (0u64, 0u64);
+        {
+            // Acquire `VIEWS.read()` once per 256-slot chunk for cached liveness checks.
+            let views = crate::descriptor::lock_views_read();
+            for &index in parts[n] {
+                // A draw's table's: the draw brings what it reads up to date.
+                if host.copied_tabled(index, frame) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        loc_tabled += 1;
+                    }
+                    if cached.get(index).is_some() {
+                        looked.push((index, SlotUpdate::Set(None)));
+                    }
+                    continue;
+                }
+                let Some(handle) = heap.handle(index) else {
+                    if cached.get(index).is_some() {
+                        looked.push((index, SlotUpdate::Set(None)));
+                    }
+                    continue;
+                };
+                let record = crate::descriptor::record_at(handle);
+                if let Some([_, i, generation]) = record {
+                    let key = u64::from(generation) << 32 | u64::from(i);
+                    if let Some((_, (shadow, prev_key, prev_uav), _, _)) = cached.get(index)
+                        && *prev_key == key
+                        && !shadow.is_dead()
+                        && host.quick_matches(index, key)
+                        && views.view_alive(i, generation)
+                    {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            loc_hits += 1;
+                        }
+                        if picked_on && *prev_uav {
+                            looked.push((index, SlotUpdate::KeepUav));
+                        }
+                        continue;
+                    }
+                }
+                misses.push((index, handle, record));
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            diag_tabled.fetch_add(loc_tabled, Ordering::Relaxed);
+            diag_hits.fetch_add(loc_hits, Ordering::Relaxed);
+            diag_mirrors.fetch_add(misses.len() as u64, Ordering::Relaxed);
+        }
+        for (index, handle, record) in misses {
+            if let Some(update) = mirror_slot(index, handle, record) {
+                looked.push((index, update));
+            }
+        }
         // (After each piece while the device lives: a cheap query.)
         if alive
             && let Some(why) = crate::descriptor::host::device_removed()
@@ -1160,6 +1202,22 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         let _ = found[n].set(looked);
     });
+    #[cfg(feature = "diagnostics")]
+    {
+        static DIAG_PASS: AtomicU64 = AtomicU64::new(0);
+        let p = DIAG_PASS.fetch_add(1, Ordering::Relaxed);
+        if p % 120 == 119 {
+            tracing::info!(
+                slots = slots.len(),
+                tabled = diag_tabled.load(Ordering::Relaxed),
+                hits = diag_hits.load(Ordering::Relaxed),
+                mirrors = diag_mirrors.load(Ordering::Relaxed),
+                dense = ranges.dense.len(),
+                look_ms = format_args!("{:.2}", started.elapsed().as_secs_f64() * 1000.0),
+                "heap_buffer_pass breakdown"
+            );
+        }
+    }
     for (index, update) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
         match update {
             SlotUpdate::KeepUav => {
@@ -3537,7 +3595,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3569,18 +3627,19 @@ impl State {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
+            Role::Reflect => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
@@ -4965,6 +5024,13 @@ impl State {
             if is_spread {
                 SPREAD[1].fetch_add(1, Ordering::Relaxed);
             }
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -5164,6 +5230,13 @@ impl State {
         if kind == KIND_DISPATCH {
             self.buffers_written();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             self.drew(Some(p));
             DRAWN.fetch_add(1, Ordering::Relaxed);

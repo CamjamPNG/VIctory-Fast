@@ -103,6 +103,9 @@ fn build() -> [u8; 32] {
         if !victory_shader::emit::loop_limit_enabled() {
             bytes.extend_from_slice(b"VICTORY_LOOP_LIMIT=0");
         }
+        if !victory_shader::emit::lds_init_hoist_on() {
+            bytes.extend_from_slice(b"VICTORY_LDS_INIT_HOIST=0");
+        }
         bytes
     });
     let mut hash = blake3::Hasher::new();

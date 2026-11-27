@@ -1133,6 +1133,118 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
+/// Whether constant identity LDS accumulator inits are hoisted to entry
+/// (`VICTORY_LDS_INIT_HOIST=0` turns it off).
+pub fn lds_init_hoist_on() -> bool {
+    std::env::var_os("VICTORY_LDS_INIT_HOIST").is_none_or(|v| v != "0")
+}
+
+fn accumulator_identity(name: &str) -> Option<u32> {
+    Some(match name.replace("_rtn", "").as_str() {
+        "ds_min_u32" | "ds_and_b32" => u32::MAX,
+        "ds_max_u32" | "ds_add_u32" | "ds_or_b32" | "ds_xor_b32" => 0,
+        "ds_min_i32" => 0x7FFF_FFFF,
+        "ds_max_i32" => 0x8000_0000,
+        _ => return None,
+    })
+}
+
+/// LDS dwords every write to which stores one constant at a constant address
+/// and every atomic on which accumulates with that constant as identity.
+pub(super) fn lds_init_hoists(p: &Program, dwords: u32) -> Vec<(u32, u32)> {
+    let constant = |insts: &[Inst], i: usize, x: Value| -> Option<u32> {
+        let d = insts[..i]
+            .iter()
+            .rposition(|j| j.writes.iter().any(|w| w.1 == x))?;
+        let Fields::Valu(f) = &insts[d].fields else {
+            return None;
+        };
+        let plain = insts[d].name() == "v_mov_b32"
+            && f.abs == 0
+            && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
+            && f.opsel == 0
+            && f.sdwa.is_none()
+            && f.dpp.is_none()
+            && insts[d + 1..i]
+                .iter()
+                .all(|j| j.write(Reg::S(EXEC)).is_none() && j.write(Reg::S(EXEC + 1)).is_none());
+        if !plain {
+            return None;
+        }
+        match f.src.first()? {
+            Operand::Const(c) => crate::resource::inline(*c),
+            Operand::Literal(k) => Some(*k),
+            _ => None,
+        }
+    };
+    let operand = |insts: &[Inst], i: usize, o: Option<&Operand>| -> Option<u32> {
+        let &Operand::Vector { reg, .. } = o? else {
+            return None;
+        };
+        constant(insts, i, insts[i].read(Reg::V(reg))?)
+    };
+    let mut stores: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    let mut atomics: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    for block in &p.blocks {
+        let insts = &block.insts;
+        for (i, inst) in insts.iter().enumerate() {
+            let Fields::Ds {
+                addr,
+                data,
+                offset0,
+                offset1,
+                gds,
+                ..
+            } = &inst.fields
+            else {
+                continue;
+            };
+            let name = inst.name();
+            let is_lds = !(name.starts_with("ds_swizzle") || name.contains("permute"));
+            if *gds || !is_lds || name.starts_with("ds_read") {
+                continue;
+            }
+            let Some(base) = operand(insts, i, addr.as_ref()) else {
+                return Vec::new();
+            };
+            let single = u32::from(*offset0) | u32::from(*offset1) << 8;
+            let dword = |bytes: u32| base.wrapping_add(bytes) / 4;
+            match name {
+                "ds_write_b32" | "ds_write2_b32" => {
+                    let at: &[u32] = if name == "ds_write_b32" {
+                        &[single]
+                    } else {
+                        &[u32::from(*offset0) * 4, u32::from(*offset1) * 4]
+                    };
+                    for (n, &bytes) in at.iter().enumerate() {
+                        let Some(k) = operand(insts, i, data.get(n)) else {
+                            return Vec::new();
+                        };
+                        stores.entry(dword(bytes)).or_default().push(k);
+                    }
+                }
+                _ => {
+                    let Some(identity) = accumulator_identity(name) else {
+                        return Vec::new();
+                    };
+                    atomics.entry(dword(single)).or_default().push(identity);
+                }
+            }
+        }
+    }
+    stores
+        .into_iter()
+        .filter_map(|(dword, values)| {
+            let k = values[0];
+            let ids = atomics.get(&dword)?;
+            (dword < dwords && values.iter().all(|&v| v == k) && ids.iter().all(|&v| v == k))
+                .then_some((dword, k))
+        })
+        .collect()
+}
+
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2671,6 +2783,7 @@ impl<'a> Lower<'a> {
             }
         }
         self.cur = self.s.entry;
+        self.hoist_lds_inits();
         self.find_sections();
         self.inputs()?;
         // A compute program that reads its group id x may run spread across
@@ -4830,6 +4943,30 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
+    }
+
+    /// Hoists constant identity LDS accumulator initialisations (e.g. water-tile
+    /// min/max written by thread 0 after early returns) to the entry block behind
+    /// a group barrier (`VICTORY_LDS_INIT_HOIST=0` turns it off; hyphennn a918163).
+    fn hoist_lds_inits(&mut self) {
+        let StageIo::Cs(cs) = self.x.native.io else {
+            return;
+        };
+        if self.s.mesh.is_some() || !lds_init_hoist_on() {
+            return;
+        }
+        let inits = lds_init_hoists(self.x.p, cs.lds_bytes() / 4);
+        if inits.is_empty() {
+            return;
+        }
+        let e = self.s.entry;
+        let lds = self.s.lds();
+        for (dword, value) in inits {
+            let (at, k) = (self.s.m.i32(dword), self.s.m.i32(value));
+            let ptr = self.s.m.element(e, lds, at);
+            self.s.m.store(e, ptr, k);
+        }
+        self.group_sync(e);
     }
 
     /// A group barrier with an LDS fence in `block`.
@@ -15547,6 +15684,48 @@ mod tests {
         if let Ok(mut v) = super::super::validator::Validator::load(None) {
             v.validate(&mut lf.dxil).expect("hoisted fetched handle DXIL must pass validation");
         }
+    }
+
+    #[test]
+    fn lds_accumulator_inits_are_hoisted() {
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        let make = |max_start: u32, stray: bool, atomics: bool| {
+            let mut body = vec![
+                0xBE8C_047E, // s_mov_b64 s[12:13], exec
+                0x7DD2_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0x7E06_02FF, max_start, // v_mov_b32 v3, max_start
+                0x7E08_02C1, // v_mov_b32 v4, -1
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0xD838_0100, 0x0004_0305, // ds_write2_b32 v5, v3, v4 offset1:1
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                0x7E0A_0280, // v_mov_b32 v5, 0
+            ];
+            if stray {
+                body.extend([0xD834_0000, 0x0000_0000]); // ds_write_b32 v0, v0
+            }
+            if atomics {
+                body.extend([
+                    0xD81C_0004, 0x0000_0005, // ds_min_u32 v5, v0 offset:4
+                    0xD820_0000, 0x0000_0005, // ds_max_u32 v5, v0
+                ]);
+            }
+            body.push(S_ENDPGM);
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 16,
+                layout: layout.clone(),
+                used: vec![],
+                io: StageIo::Cs(ComputeIo { rsrc2: (1 << 15) | (4 << 1), threads: [64, 1, 1] }),
+                code: body.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::spill::build(&native).expect("spill");
+            super::lds_init_hoists(&p, 128)
+        };
+        assert_eq!(make(0, false, true), [(0, 0), (1, u32::MAX)]);
+        assert_eq!(make(5, false, true), [(1, u32::MAX)]);
+        assert_eq!(make(0, false, false), []);
+        assert_eq!(make(0, true, true), []);
     }
 
     #[test]

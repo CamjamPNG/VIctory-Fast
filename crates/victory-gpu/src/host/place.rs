@@ -86,7 +86,10 @@ impl Placed {
     /// source or destination), title memory at the destination does. Gives
     /// the bytes if it took them.
     pub(super) fn prepare(&self, free: bool) -> Option<Vec<u8>> {
-        if !free && self.from.is_none() {
+        if !free {
+            if let Some(to) = self.from {
+                copy_mapped(to as *mut u8, self.src as *const u8, self.len, false);
+            }
             return None;
         }
         let mut bytes = vec![0u8; self.len];
@@ -96,12 +99,12 @@ impl Placed {
             // SAFETY: the list's own upload memory of that many bytes.
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to as *mut u8, self.len) };
         }
-        if !free {
-            return None;
-        }
-        copy_mapped(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
+        let written = copy_mapped_ok(self.dst as *mut u8, bytes.as_ptr(), self.len, true);
         crate::watch::wrote(self.dst, self.len);
-        // Title memory that is not all there was left alone.
+        if written {
+            return Some(bytes);
+        }
+        // Title memory that is not all there was left alone; verify fallback writes.
         let mut there = vec![0u8; self.len];
         (read_into(self.dst as *const u8, &mut there) && there == bytes).then_some(bytes)
     }

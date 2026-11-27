@@ -53,6 +53,10 @@ pub(crate) enum Role {
     Air,
     /// Ends the title's reflections (`CS_UpdateHistory`).
     Reflect,
+    /// Forward/transparent/alpha reflection & transmission passes
+    /// (`CS_UpscaleAlpha`, `CS_TemporalResolveAlpha`, `CS_TemporalResolve1_Alpha`,
+    /// `CS_AlphaTransmissionHistoryResolve`, `CS_DeferredFallbacksAlpha_SkyProbe`).
+    ReflectAlpha,
 }
 
 /// The program's part in this, by its name in the container.
@@ -66,6 +70,13 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Air)
     } else if has(b"CS_UpdateHistory") {
         Some(Role::Reflect)
+    } else if has(b"CS_UpscaleAlpha")
+        || has(b"CS_TemporalResolveAlpha")
+        || has(b"CS_TemporalResolve1_Alpha")
+        || has(b"CS_AlphaTransmissionHistoryResolve")
+        || has(b"CS_DeferredFallbacksAlpha_SkyProbe")
+    {
+        Some(Role::ReflectAlpha)
     } else {
         None
     }
@@ -449,6 +460,40 @@ void hold_reflect(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef REFLECT_F
+RWTexture2D<float4> light_f : register(u0, space0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void hold_reflect_f(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    int2 p = int2(at.xy);
+    float4 raw = light_f[p];
+    float3 c = raw.rgb;
+    if (any(isnan(c)) || any(isinf(c))) { light_f[p] = float4(0, 0, 0, raw.a); return; }
+    if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) { light_f[p] = float4(0, 0, 0, raw.a); return; }
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 local = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float3 room = cells[CELLS].rgb;
+    float3 around;
+    if (constant > 0.0) {
+        around = float3(1.0, 0.98, 0.94) * constant;
+    } else {
+        float3 base = dot(local, LUMA) > 1e-5 ? lerp(room, local, 0.35) : room;
+        around = base * level;
+    }
+    float around_luma = max(dot(around, LUMA), 1e-4);
+    float cap = around_luma * reflect_cap;
+    float has = dot(c, LUMA);
+    if (has > cap) {
+        float3 clamped = c * (cap / has);
+        float excess = saturate((has / cap - 1.0) / 3.0);
+        float3 room_tint = around * (cap / around_luma);
+        light_f[p] = float4(lerp(clamped, room_tint, 0.65 * excess), raw.a);
+    }
+}
+#endif
+
 #ifdef RAISE
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
@@ -539,6 +584,7 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     reflect: ID3D12PipelineState,
+    reflect_f: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -571,6 +617,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let reflect = pipeline("REFLECT", s!("hold_reflect"))?;
+    let reflect_f = pipeline("REFLECT_F", s!("hold_reflect_f"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -581,6 +628,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         reflect,
+        reflect_f,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -616,6 +664,9 @@ pub(crate) struct Views {
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
+    /// True when the reflection UAV is a float texture (`R11G11B10_FLOAT` or
+    /// `R16G16B16A16_FLOAT`) instead of `R32_UINT`-packed `R9G9B9E5`.
+    pub(crate) float_uav: bool,
 }
 
 /// After the title's program of that role, in `list` with the program's view
@@ -637,18 +688,19 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    if role == Role::Reflect && (reflect_cap() <= 0.0 || (rays_run() && rt_band().is_none())) {
+    if matches!(role, Role::Reflect | Role::ReflectAlpha) && (reflect_cap() <= 0.0 || (rays_run() && rt_band().is_none())) {
         return false;
     }
-    static SAID: [std::sync::atomic::AtomicBool; 4] = [const { std::sync::atomic::AtomicBool::new(false) }; 4];
+    static SAID: [std::sync::atomic::AtomicBool; 5] = [const { std::sync::atomic::AtomicBool::new(false) }; 5];
     let slot = match role {
         Role::Resolve => 0,
         Role::Radiance => 1,
         Role::Air => 2,
         Role::Reflect => 3,
+        Role::ReflectAlpha => 4,
     };
     if !SAID[slot].swap(true, Ordering::Relaxed) {
-        tracing::info!(?role, size = ?views.size, level, constant, reflect = reflect_cap(), "a stand-in for the indirect light");
+        tracing::info!(?role, size = ?views.size, float_uav = views.float_uav, level, constant, reflect = reflect_cap(), "a stand-in for the indirect light");
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
@@ -693,7 +745,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
-            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::Reflect | Role::ReflectAlpha => {
+                let pso = if views.float_uav { &pass.reflect_f } else { &pass.reflect };
+                run(pso, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+            }
             Role::Resolve => {
                 if constant == 0.0 {
                     run(&pass.place, 8, 9, 1);

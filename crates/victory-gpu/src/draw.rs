@@ -1238,20 +1238,28 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     // Immutable snapshot of cached entries for lock-free validation across worker threads.
     let cached = &*ranges;
-    // Slow path for a slot that missed the lock-free cache check (no VIEWS lock held).
-    let mirror_slot = |index: u32, handle: u64, record: Option<[u32; 3]>| -> Option<SlotUpdate> {
-        let Some(view) = host.mirror_heap_pass(index, handle) else {
+    let finish_mirror = |index: u32,
+                         view: Option<crate::descriptor::View>,
+                         direct_copy: Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>,
+                         made_now: bool,
+                         record: Option<[u32; 3]>|
+     -> Option<SlotUpdate> {
+        let Some(view) = view else {
             return cached.get(index).is_some().then_some(SlotUpdate::Set(None));
         };
-        // The copy the slot shows (`buffer_copy`), not the one the
-        // view's range alone would find.
-        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+        let used_direct = direct_copy.is_some();
+        // The copy the slot shows (`buffer_copy`), reusing the one `mirror_heap_pass_batch`
+        // already resolved when freshly built.
+        let Some((shadow, address, len)) =
+            direct_copy.or_else(|| crate::descriptor::host::buffer_copy(&view))
+        else {
             return cached.get(index).is_some().then_some(SlotUpdate::Set(None));
         };
         #[cfg(feature = "diagnostics")]
-        if host.shows(index, &shadow.buffer) == Some(false) {
+        if !(made_now && used_direct) && host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
+        let _ = (made_now, used_direct);
         let key = record.map_or(0, |[_, i, generation]| u64::from(generation) << 32 | u64::from(i));
         let written = picked_on && view_kind(&view) == Some(ResourceType::Uav);
         Some(SlotUpdate::Set(Some(((shadow, key, written), address, address + len))))
@@ -1320,8 +1328,9 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
             diag_hits.fetch_add(loc_hits, Ordering::Relaxed);
             diag_mirrors.fetch_add(misses.len() as u64, Ordering::Relaxed);
         }
-        for (index, handle, record) in misses {
-            if let Some(update) = mirror_slot(index, handle, record) {
+        let mirrored = host.mirror_heap_pass_batch(&misses);
+        for ((_, _, record), (index, view, direct_copy, made_now)) in misses.into_iter().zip(mirrored) {
+            if let Some(update) = finish_mirror(index, view, direct_copy, made_now, record) {
                 looked.push((index, update));
             }
         }
@@ -3877,16 +3886,58 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
+        if role == Role::ReflectAlpha {
+            let mut ran = false;
+            let mut seen_slots = [0u64; 8];
+            let mut seen_len = 0usize;
+            for u in &t.used {
+                if u.kind != ResourceType::Uav || u.root != RootType::Table {
+                    continue;
+                }
+                let key = (u64::from(u.slot) << 32) | u64::from(u.table_offset_dwords);
+                if seen_slots[..seen_len].contains(&key) {
+                    continue;
+                }
+                if seen_len < seen_slots.len() {
+                    seen_slots[seen_len] = key;
+                    seen_len += 1;
+                }
+                let Some((of, image)) = entry(ResourceType::Uav, (u.slot, u.table_offset_dwords)) else {
+                    continue;
+                };
+                if of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || of.Width < 240 || of.Height < 135 {
+                    continue;
+                }
+                let fmt = of.Format.0;
+                if !matches!(fmt, 42 | 26 | 10) {
+                    once!(key, format = fmt, w = of.Width, h = of.Height, "alpha reflection UAV format skipped");
+                    continue;
+                }
+                once!(key, slot = u.slot, off = u.table_offset_dwords, format = fmt, w = of.Width, h = of.Height, "clamping forward/alpha reflection UAV");
+                ran |= crate::ambient::after(
+                    list,
+                    role,
+                    &Views {
+                        image,
+                        depth: image,
+                        size: [of.Width as u32, of.Height],
+                        slices: u32::from(of.DepthOrArraySize),
+                        float_uav: fmt != 42,
+                    },
+                );
+            }
+            return ran;
+        }
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
-            Role::Reflect => REFLECTIONS,
+            Role::Reflect | Role::ReflectAlpha => REFLECTIONS,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air | Role::Reflect => image,
+            Role::Radiance | Role::Air | Role::Reflect | Role::ReflectAlpha => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
@@ -3904,6 +3955,7 @@ impl State {
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
+            float_uav: false,
         })
     }
 

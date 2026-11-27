@@ -133,13 +133,118 @@ pub(crate) fn dirty4k_count(found: Option<u16>, narrowed: bool) {
     }
 }
 
+/// Pages in one journal piece (64 MiB).
+const PIECE_PAGES: usize = 1 << SHARD_SHIFT;
+const PIECE_WORDS: usize = PIECE_PAGES / 64;
+
+/// Notes for one 64 MiB piece of title address space (`piece = page >> SHARD_SHIFT`).
+struct NotePiece {
+    piece: usize,
+    max_written: u64,
+    present: [u64; PIECE_WORDS],
+    at: Box<[u64; PIECE_PAGES]>,
+}
+
+impl NotePiece {
+    fn new(piece: usize) -> NotePiece {
+        NotePiece {
+            piece,
+            max_written: 0,
+            present: [0; PIECE_WORDS],
+            at: Box::new([0; PIECE_PAGES]),
+        }
+    }
+
+    fn note(&mut self, idx: usize, now: u64) -> (u64, u64) {
+        let before = self.at[idx];
+        let latest = before.max(now);
+        self.at[idx] = latest;
+        self.present[idx / 64] |= 1u64 << (idx % 64);
+        if latest > self.max_written {
+            self.max_written = latest;
+        }
+        (before, latest)
+    }
+
+    fn for_each(&self, lo: usize, hi: usize, f: &mut impl FnMut(usize, u64) -> bool) -> bool {
+        if lo >= hi {
+            return true;
+        }
+        let base = self.piece << SHARD_SHIFT;
+        for w in lo / 64..=(hi - 1) / 64 {
+            let mut bits = self.present[w] & in_word(w * 64, lo, hi);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let idx = w * 64 + bit;
+                if !f(base + idx, self.at[idx]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn all_below(&self, lo: usize, hi: usize, floor: u64, pred: &mut impl FnMut(usize, u64) -> bool) -> bool {
+        if self.max_written <= floor || lo >= hi {
+            return true;
+        }
+        let base = self.piece << SHARD_SHIFT;
+        for w in lo / 64..=(hi - 1) / 64 {
+            let mut bits = self.present[w] & in_word(w * 64, lo, hi);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let idx = w * 64 + bit;
+                let at = self.at[idx];
+                if at > floor && !pred(base + idx, at) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
 impl Shard {
     const fn new() -> Shard {
         Shard {
-            written: BTreeMap::new(),
+            pieces: Vec::new(),
             max_written: 0,
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
         }
+    }
+
+    fn find_piece(&self, piece: usize) -> Option<&NotePiece> {
+        if self.pieces.len() <= 8 {
+            self.pieces.iter().find(|p| p.piece == piece)
+        } else {
+            self.pieces.binary_search_by_key(&piece, |p| p.piece).ok().map(|i| &self.pieces[i])
+        }
+    }
+
+    fn piece_mut(&mut self, piece: usize) -> &mut NotePiece {
+        let pos = if self.pieces.len() <= 8 {
+            match self.pieces.iter().position(|p| p.piece >= piece) {
+                Some(i) if self.pieces[i].piece == piece => return &mut self.pieces[i],
+                Some(i) => i,
+                None => self.pieces.len(),
+            }
+        } else {
+            match self.pieces.binary_search_by_key(&piece, |p| p.piece) {
+                Ok(i) => return &mut self.pieces[i],
+                Err(i) => i,
+            }
+        };
+        self.pieces.insert(pos, NotePiece::new(piece));
+        &mut self.pieces[pos]
+    }
+
+    #[cfg(test)]
+    fn written_at(&self, page: usize) -> Option<u64> {
+        let p = self.find_piece(page >> SHARD_SHIFT)?;
+        let idx = page & (PIECE_PAGES - 1);
+        ((p.present[idx / 64] >> (idx % 64)) & 1 != 0).then(|| p.at[idx])
     }
 
     /// Page `page` was found written by asking `now`: the parts in `parts`
@@ -150,9 +255,7 @@ impl Shard {
     /// (renderer port #7) another asking with a higher number may have
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.get(&page).copied().unwrap_or(0);
-        let latest = before.max(now);
-        self.written.insert(page, latest);
+        let (before, latest) = self.piece_mut(page >> SHARD_SHIFT).note(page & (PIECE_PAGES - 1), now);
         if latest > self.max_written {
             self.max_written = latest;
         }
@@ -179,6 +282,61 @@ impl Shard {
             Some(all) => all.iter().enumerate().filter(|(_, at)| **at > taken).fold(0, |m, (k, _)| m | 1 << k),
             None => WHOLE,
         }
+    }
+
+    fn for_each_piece(&self, piece: usize, lo: usize, hi: usize, f: &mut impl FnMut(usize, u64) -> bool) -> bool {
+        self.find_piece(piece).is_none_or(|p| p.for_each(lo, hi, f))
+    }
+
+    fn all_below_piece(
+        &self,
+        piece: usize,
+        lo: usize,
+        hi: usize,
+        floor: u64,
+        pred: &mut impl FnMut(usize, u64) -> bool,
+    ) -> bool {
+        self.max_written <= floor || self.find_piece(piece).is_none_or(|p| p.all_below(lo, hi, floor, pred))
+    }
+
+    fn for_each_range(&self, first: usize, last: usize, f: &mut impl FnMut(usize, u64) -> bool) -> bool {
+        if first >= last || self.pieces.is_empty() {
+            return true;
+        }
+        let (p_first, p_last) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        let start = self.pieces.partition_point(|p| p.piece < p_first);
+        for p in &self.pieces[start..] {
+            if p.piece > p_last {
+                break;
+            }
+            let base = p.piece << SHARD_SHIFT;
+            let lo = first.saturating_sub(base);
+            let hi = (last - base).min(PIECE_PAGES);
+            if !p.for_each(lo, hi, f) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn all_below_range(&self, first: usize, last: usize, floor: u64, pred: &mut impl FnMut(usize, u64) -> bool) -> bool {
+        if self.max_written <= floor || first >= last || self.pieces.is_empty() {
+            return true;
+        }
+        let (p_first, p_last) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        let start = self.pieces.partition_point(|p| p.piece < p_first);
+        for p in &self.pieces[start..] {
+            if p.piece > p_last {
+                break;
+            }
+            let base = p.piece << SHARD_SHIFT;
+            let lo = first.saturating_sub(base);
+            let hi = (last - base).min(PIECE_PAGES);
+            if !p.all_below(lo, hi, floor, pred) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -214,13 +372,18 @@ fn shards_of_pages(pages: impl IntoIterator<Item = usize>) -> u64 {
 /// holder changes them with no part's lock; held shared, a reader reads a
 /// part at a time, and who notes or needs a number that counts holds the
 /// parts it touches ([`Notes::hold`]).
-struct Notes([RwLock<Shard>; SHARDS]);
+struct Notes {
+    shards: [RwLock<Shard>; SHARDS],
+    /// Lock-free upper bound of each shard's `max_written`, updated under the
+    /// shard write lock (or exclusive journal lock) before/during noting.
+    shard_max: [std::sync::atomic::AtomicU64; SHARDS],
+}
 
 /// A part of [`Notes`].
 struct Shard {
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-    /// Largest asking recorded in `written`, for O(1) clean-shard skipping.
+    /// Active 64 MiB pieces sorted by `piece` (`page >> SHARD_SHIFT`).
+    pieces: Vec<NotePiece>,
+    /// Largest asking recorded in `pieces`, for O(1) clean-shard skipping.
     max_written: u64,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
@@ -230,69 +393,109 @@ struct Shard {
 
 impl Notes {
     const fn new() -> Notes {
-        Notes([const { RwLock::new(Shard::new()) }; SHARDS])
-    }
-
-    /// The part of `page`, with the journal held alone.
-    fn shard_mut(&mut self, page: usize) -> &mut Shard {
-        self.0[shard_of(page)].get_mut().unwrap_or_else(|e| e.into_inner())
+        Notes {
+            shards: [const { RwLock::new(Shard::new()) }; SHARDS],
+            shard_max: [const { std::sync::atomic::AtomicU64::new(0) }; SHARDS],
+        }
     }
 
     /// A part to read, the journal held shared or alone.
     fn read(&self, shard: usize) -> std::sync::RwLockReadGuard<'_, Shard> {
-        if let Ok(s) = self.0[shard].try_read() {
+        if let Ok(s) = self.shards[shard].try_read() {
             return s;
         }
         let began = std::time::Instant::now();
-        let s = self.0[shard].read().unwrap_or_else(|e| e.into_inner());
+        let s = self.shards[shard].read().unwrap_or_else(|e| e.into_inner());
         port7_waited(P7_PART_WAITS, began);
         s
     }
 
-    /// See [`Shard::note`]; the journal held alone.
-    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        self.shard_mut(page).note(page, parts, now)
+    #[inline]
+    fn shard_max(&self, shard: usize) -> u64 {
+        self.shard_max[shard].load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// See [`Shard::parts_since`].
-    fn parts_since(&self, page: usize, taken: u64) -> u16 {
-        self.read(shard_of(page)).parts_since(page, taken)
+    /// See [`Shard::note`]; the journal held alone.
+    fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let shard = shard_of(page);
+        let s = self.shards[shard].get_mut().unwrap_or_else(|e| e.into_inner());
+        let before = s.note(page, parts, now);
+        self.shard_max[shard].store(s.max_written, std::sync::atomic::Ordering::Release);
+        before
     }
 
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
-        match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
-                let s = self.read(shard_of(from));
-                s.written.range(from..to).all(|(&p, &w)| each(p, w))
-            }),
-            None => {
-                let mut all: Vec<(usize, u64)> = Vec::new();
-                for shard in 0..SHARDS {
-                    all.extend(self.read(shard).written.range(first..last).map(|(&p, &w)| (p, w)));
+        if first >= last {
+            return true;
+        }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a < 4 * SHARDS {
+            for piece in a..=b {
+                let shard = piece % SHARDS;
+                if self.shard_max(shard) == 0 {
+                    continue;
                 }
-                all.sort_unstable();
-                all.into_iter().all(|(p, w)| each(p, w))
+                let base = piece << SHARD_SHIFT;
+                let lo = first.saturating_sub(base);
+                let hi = (last - base).min(PIECE_PAGES);
+                let s = self.read(shard);
+                if !s.for_each_piece(piece, lo, hi, &mut each) {
+                    return false;
+                }
             }
+            true
+        } else {
+            let mut all: Vec<(usize, u64)> = Vec::new();
+            for shard in 0..SHARDS {
+                if self.shard_max(shard) == 0 {
+                    continue;
+                }
+                self.read(shard).for_each_range(first, last, &mut |p, w| {
+                    all.push((p, w));
+                    true
+                });
+            }
+            all.sort_unstable();
+            all.into_iter().all(|(p, w)| each(p, w))
         }
     }
 
     /// Order-independent predicate over notes in `[first, last)`, skipping any
-    /// shard whose `max_written <= floor` in O(1) without allocating or sorting.
+    /// shard whose `shard_max <= floor` lock-free in O(1).
+    #[cfg(test)]
     fn all_below(&self, first: usize, last: usize, floor: u64, mut pred: impl FnMut(usize, u64) -> bool) -> bool {
         if first >= last {
             return true;
         }
-        match pieces(first, last) {
-            Some(pieces) => pieces.into_iter().all(|(from, to)| {
-                let s = self.read(shard_of(from));
-                s.max_written <= floor || s.written.range(from..to).all(|(&p, &w)| w <= floor || pred(p, w))
-            }),
-            None => (0..SHARDS).all(|shard| {
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a < 4 * SHARDS {
+            for piece in a..=b {
+                let shard = piece % SHARDS;
+                if self.shard_max(shard) <= floor {
+                    continue;
+                }
+                let base = piece << SHARD_SHIFT;
+                let lo = first.saturating_sub(base);
+                let hi = (last - base).min(PIECE_PAGES);
                 let s = self.read(shard);
-                s.max_written <= floor || s.written.range(first..last).all(|(&p, &w)| w <= floor || pred(p, w))
-            }),
+                if !s.all_below_piece(piece, lo, hi, floor, &mut pred) {
+                    return false;
+                }
+            }
+            true
+        } else {
+            for shard in 0..SHARDS {
+                if self.shard_max(shard) <= floor {
+                    continue;
+                }
+                let s = self.read(shard);
+                if !s.all_below_range(first, last, floor, &mut pred) {
+                    return false;
+                }
+            }
+            true
         }
     }
 
@@ -310,12 +513,12 @@ impl Notes {
     /// (`write`) or reading. Taken in order: whoever waits for a part holds
     /// only lower ones, so no two holders wait for each other.
     fn hold(&self, shards: u64, write: bool) -> Held<'_> {
-        let mut held = Held { shards, read: Vec::new(), write: Vec::new() };
+        let mut held = Held { notes: self, shards, read: Vec::new(), write: Vec::new() };
         let mut m = shards;
         while m != 0 {
             let shard = m.trailing_zeros() as usize;
             m &= m - 1;
-            let lock = &self.0[shard];
+            let lock = &self.shards[shard];
             if write {
                 let guard = match lock.try_write() {
                     Ok(g) => g,
@@ -338,6 +541,7 @@ impl Notes {
 /// The pieces of pages `[first, last)` in page order, each in one part;
 /// `None` for a range of more pieces than is worth walking (then each part
 /// is looked at once).
+#[cfg(test)]
 fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
     if first >= last {
         return Some(Vec::new());
@@ -351,6 +555,7 @@ fn pieces(first: usize, last: usize) -> Option<Vec<(usize, usize)>> {
 
 /// Parts of [`Notes`] held ([`Notes::hold`]).
 struct Held<'a> {
+    notes: &'a Notes,
     shards: u64,
     read: Vec<std::sync::RwLockReadGuard<'a, Shard>>,
     write: Vec<std::sync::RwLockWriteGuard<'a, Shard>>,
@@ -371,28 +576,50 @@ impl Held<'_> {
 
     /// See [`Shard::note`]; held for writing.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        let shard = shard_of(page);
+        // Publish upper bound before inserting while holding the shard write lock
+        // so lock-free `shard_max` readers linearize cleanly.
+        self.notes.shard_max[shard].fetch_max(now, std::sync::atomic::Ordering::Release);
         let at = self.place(page);
         self.write[at].note(page, parts, now)
     }
 
     /// The notes of pages `[first, last)` in page order; their parts held.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
-        match pieces(first, last) {
-            Some(pieces) => pieces
-                .into_iter()
-                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
-                .collect(),
-            None => {
-                let all = if self.write.is_empty() {
-                    self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
-                } else {
-                    self.write.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
-                };
-                let mut all = all;
-                all.sort_unstable();
-                all
-            }
+        if first >= last {
+            return Vec::new();
         }
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        let mut all = Vec::new();
+        if b - a < 4 * SHARDS {
+            for piece in a..=b {
+                let base = piece << SHARD_SHIFT;
+                let lo = first.saturating_sub(base);
+                let hi = (last - base).min(PIECE_PAGES);
+                self.shard(base).for_each_piece(piece, lo, hi, &mut |p, w| {
+                    all.push((p, w));
+                    true
+                });
+            }
+        } else {
+            if self.write.is_empty() {
+                for s in &self.read {
+                    s.for_each_range(first, last, &mut |p, w| {
+                        all.push((p, w));
+                        true
+                    });
+                }
+            } else {
+                for s in &self.write {
+                    s.for_each_range(first, last, &mut |p, w| {
+                        all.push((p, w));
+                        true
+                    });
+                }
+            }
+            all.sort_unstable();
+        }
+        all
     }
 }
 
@@ -401,7 +628,17 @@ impl Held<'_> {
 /// 4 KiB, in the same order.
 pub(crate) fn parts_written(pages: &[(usize, u64)]) -> Vec<u16> {
     let j = journal();
-    pages.iter().map(|&(page, taken)| j.notes.parts_since(page, taken)).collect()
+    let mut cached: Option<(usize, std::sync::RwLockReadGuard<'_, Shard>)> = None;
+    let mut out = Vec::with_capacity(pages.len());
+    for &(page, taken) in pages {
+        let shard = shard_of(page);
+        if cached.as_ref().is_none_or(|(id, _)| *id != shard) {
+            drop(cached.take());
+            cached = Some((shard, j.notes.read(shard)));
+        }
+        out.push(cached.as_ref().unwrap().1.parts_since(page, taken));
+    }
+    out
 }
 
 /// Numbers the askings; 0 is "never". Counted up with the journal held
@@ -468,6 +705,68 @@ pub(crate) struct JournalRead(std::sync::RwLockReadGuard<'static, Journal>);
 /// Acquires a shared read lock on [`JOURNAL`] for [`nothing_new_in`].
 pub(crate) fn journal_read() -> JournalRead {
     JournalRead(journal())
+}
+
+/// Reusable scanner over a held [`JournalRead`] that caches at most one shard
+/// read guard across spans (avoiding per-span SRWLock RMW contention across
+/// worker threads while never holding two shard locks simultaneously).
+pub(crate) struct JournalScan<'a> {
+    journal: &'a JournalRead,
+    cached: Option<(usize, std::sync::RwLockReadGuard<'a, Shard>)>,
+}
+
+impl JournalRead {
+    pub(crate) fn scan(&self) -> JournalScan<'_> {
+        JournalScan {
+            journal: self,
+            cached: None,
+        }
+    }
+}
+
+impl<'a> JournalScan<'a> {
+    #[inline]
+    fn shard(&mut self, shard: usize) -> &Shard {
+        if self.cached.as_ref().is_none_or(|(id, _)| *id != shard) {
+            // Drop any previously held shard guard before locking another.
+            drop(self.cached.take());
+            self.cached = Some((shard, self.journal.0.notes.read(shard)));
+        }
+        &self.cached.as_ref().unwrap().1
+    }
+
+    fn all_below(&mut self, first: usize, last: usize, floor: u64, mut pred: impl FnMut(usize, u64) -> bool) -> bool {
+        if first >= last {
+            return true;
+        }
+        let notes = &self.journal.0.notes;
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        if b - a < 4 * SHARDS {
+            for piece in a..=b {
+                let shard = piece % SHARDS;
+                if notes.shard_max(shard) <= floor {
+                    continue;
+                }
+                let base = piece << SHARD_SHIFT;
+                let lo = first.saturating_sub(base);
+                let hi = (last - base).min(PIECE_PAGES);
+                if !self.shard(shard).all_below_piece(piece, lo, hi, floor, &mut pred) {
+                    return false;
+                }
+            }
+            true
+        } else {
+            for shard in 0..SHARDS {
+                if notes.shard_max(shard) <= floor {
+                    continue;
+                }
+                if !self.shard(shard).all_below_range(first, last, floor, &mut pred) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
 }
 
 /// Sorts and merges overlapping/adjacent `(first, last)` page ranges so
@@ -727,10 +1026,10 @@ thread_local! {
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The pages of `[first, last)` the kernel says were written since it was
-/// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
+/// Appends the pages of `[first, last)` the kernel says were written since it
+/// was last asked to `out`, returning `false` if the range is not write-watched
 /// memory of one reservation. The caller holds the range ([`Asking`]).
-fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+fn kernel_written_into(first: usize, last: usize, out: &mut Vec<(usize, u16)>) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     FOUND.with(|found| {
@@ -759,7 +1058,7 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(11, started.elapsed().as_nanos() as u64);
         }
         if failed {
-            return None;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -771,16 +1070,175 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             tally(0, 1);
             tally(1, ((last - first) * (PAGE >> 10)) as u64);
         }
-        let mut pages: Vec<(usize, u16)> = Vec::new();
         for &at in &found[..count] {
             let (page, part) = (at / PAGE, 1u16 << (at % PAGE / KERNEL_PAGE));
-            match pages.last_mut() {
+            match out.last_mut() {
                 Some((last, parts)) if *last == page => *parts |= part,
-                _ => pages.push((page, part)),
+                _ => out.push((page, part)),
             }
         }
-        Some(pages)
+        true
     })
+}
+
+/// The pages of `[first, last)` the kernel says were written since it was
+/// last asked, in order, each once, with their written parts; `None` if the range is not write-watched
+/// memory of one reservation. The caller holds the range ([`Asking`]).
+fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
+    let mut pages = Vec::new();
+    kernel_written_into(first, last, &mut pages).then_some(pages)
+}
+
+/// Merges sorted page ranges that strictly overlap (sharing at least one 64 KiB
+/// page, which guarantees they lie in the same VirtualAlloc reservation).
+/// Touching ranges (`a.1 == b.0`) are kept separate so `ask_all_run`/`ask_run`
+/// can still split across adjacent reservations.
+fn coalesce_overlapping_pieces(pieces: &mut Vec<(usize, usize)>) {
+    if pieces.len() <= 1 {
+        return;
+    }
+    let mut write = 0usize;
+    for read in 1..pieces.len() {
+        let (a, b) = pieces[read];
+        if a < pieces[write].1 {
+            pieces[write].1 = pieces[write].1.max(b);
+        } else {
+            write += 1;
+            pieces[write] = (a, b);
+        }
+    }
+    pieces.truncate(write + 1);
+}
+
+/// Opt-in thread count for parallel `GetWriteWatch` across disjoint groups in
+/// `ask_once` (`VICTORY_WATCH_THREADS=<N>`, default `1` / single-threaded).
+fn watch_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WATCH_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8)
+    })
+}
+
+/// Dedicated lazy worker pool for `VICTORY_WATCH_THREADS >= 2`.
+struct WatchPool {
+    state: Mutex<WatchPoolState>,
+    more: Condvar,
+    idle: Condvar,
+    threads: usize,
+    next: std::sync::atomic::AtomicUsize,
+    running: std::sync::atomic::AtomicUsize,
+}
+
+struct WatchPoolState {
+    work: Option<WatchWork>,
+    count: usize,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WatchWork(*const (dyn Fn(usize) + Sync));
+
+// SAFETY: `WatchPool::each` waits for all helpers to leave `work` before returning.
+unsafe impl Send for WatchWork {}
+
+impl WatchPool {
+    fn get(threads: usize) -> &'static WatchPool {
+        static POOL: std::sync::OnceLock<&'static WatchPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            let pool: &'static WatchPool = Box::leak(Box::new(WatchPool {
+                state: Mutex::new(WatchPoolState {
+                    work: None,
+                    count: 0,
+                    generation: 0,
+                }),
+                more: Condvar::new(),
+                idle: Condvar::new(),
+                threads,
+                next: std::sync::atomic::AtomicUsize::new(0),
+                running: std::sync::atomic::AtomicUsize::new(0),
+            }));
+            for i in 1..threads {
+                let _ = std::thread::Builder::new().name(format!("victory-watch-{i}")).spawn(move || {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                    // SAFETY: matches `victory-submit` priority.
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+                    crate::cores::keep_helper_on_fast_cores("victory-watch");
+                    pool.help();
+                });
+            }
+            pool
+        })
+    }
+
+    fn help(&self) {
+        use std::sync::atomic::Ordering;
+        let mut seen = 0u64;
+        loop {
+            let (work, count) = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                while state.generation == seen || state.work.is_none() {
+                    state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+                seen = state.generation;
+                let work = state.work.unwrap();
+                let count = state.count;
+                self.running.fetch_add(1, Ordering::AcqRel);
+                (work, count)
+            };
+            loop {
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count {
+                    break;
+                }
+                // SAFETY: counted in `running`, so `each` has not returned.
+                unsafe { (*work.0)(i) };
+            }
+            if self.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+                let _state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                self.idle.notify_all();
+            }
+        }
+    }
+
+    fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
+        use std::sync::atomic::Ordering;
+        if count < 2 || self.threads < 2 {
+            (0..count).for_each(f);
+            return;
+        }
+        // SAFETY: erased lifetime does not escape `each`, which waits for `running == 0`.
+        let work = WatchWork(unsafe {
+            std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f)
+        });
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.next.store(0, Ordering::Relaxed);
+            state.work = Some(work);
+            state.count = count;
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if count >= self.threads {
+            self.more.notify_all();
+        } else {
+            (1..count).for_each(|_| self.more.notify_one());
+        }
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if i >= count {
+                break;
+            }
+            f(i);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.work = None;
+        while self.running.load(Ordering::Acquire) > 0 {
+            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -814,6 +1272,10 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
+    coalesce_overlapping_pieces(&mut pieces);
+    if pieces.len() < 2 {
+        return;
+    }
     let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
@@ -1085,6 +1547,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
+    coalesce_overlapping_pieces(&mut pieces);
     let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
@@ -1102,13 +1565,33 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         i = k;
     }
     let _held = AskingMany::hold(groups.iter().map(|&(_, _, first, last)| (first, last)).collect());
-    let (mut asked, mut written) = (Vec::new(), Vec::new());
-    for (i, k, first, last) in groups {
-        if k - i >= 2 {
-            ask_all_run(&pieces[i..k], &mut asked, &mut written);
-        } else if let Some(pages) = kernel_written(first, last) {
-            written.extend(pages);
-            asked.push((first, last));
+    let (mut asked, mut written) = (Vec::with_capacity(groups.len()), Vec::new());
+    let threads = watch_threads();
+    if threads >= 2 && groups.len() >= 2 {
+        let slots: Vec<Mutex<(Vec<(usize, usize)>, Vec<(usize, u16)>)>> =
+            (0..groups.len()).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
+        WatchPool::get(threads).each(groups.len(), &|g| {
+            let (i, k, first, last) = groups[g];
+            let (mut g_asked, mut g_written) = (Vec::new(), Vec::new());
+            if k - i >= 2 {
+                ask_all_run(&pieces[i..k], &mut g_asked, &mut g_written);
+            } else if kernel_written_into(first, last, &mut g_written) {
+                g_asked.push((first, last));
+            }
+            *slots[g].lock().unwrap_or_else(|e| e.into_inner()) = (g_asked, g_written);
+        });
+        for slot in slots {
+            let (g_asked, g_written) = slot.into_inner().unwrap_or_else(|e| e.into_inner());
+            asked.extend(g_asked);
+            written.extend(g_written);
+        }
+    } else {
+        for (i, k, first, last) in groups {
+            if k - i >= 2 {
+                ask_all_run(&pieces[i..k], &mut asked, &mut written);
+            } else if kernel_written_into(first, last, &mut written) {
+                asked.push((first, last));
+            }
         }
     }
     sort_coalesce_ahead(&mut asked);
@@ -1139,8 +1622,7 @@ fn ask_all_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, writt
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
-        written.extend(pages);
+    if kernel_written_into(first, last, written) {
         asked.push((first, last));
         return;
     }
@@ -1215,8 +1697,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if let Some(pages) = kernel_written(first, last) {
-        written.extend(pages);
+    if kernel_written_into(first, last, written) {
         asked.push((first, last));
         return;
     }
@@ -1353,55 +1834,56 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     Some(answer)
 }
 
-/// Whether nothing of `[start, end)` was written that a copy with the notes
-/// `copied` (the asking after which each page from page `base` on was taken)
-/// and `ranged` (the asking after which a range that holds this one was
-/// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
-/// asked: the submission's asking covers the range, or its blocks are known
-/// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
-    nothing_new_in(&journal_read(), start, end, base, copied, ranged)
+fn covered_in_journal(j: &Journal, start: usize, end: usize, first: usize, last: usize, prefer_published: bool) -> bool {
+    if prefer_published {
+        if published(start, end) {
+            #[cfg(feature = "diagnostics")]
+            crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+            return true;
+        }
+        return ahead_covers(&j.ahead, first, last);
+    }
+    if ahead_covers(&j.ahead, first, last) {
+        return true;
+    }
+    if published(start, end) {
+        #[cfg(feature = "diagnostics")]
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+        return true;
+    }
+    false
 }
 
-/// Fast path for [`nothing_new_in`] when the caller already proved lock-free
+/// Fast path for [`nothing_new_scan`] when the caller already proved lock-free
 /// that `[start, end)` lies inside a range copied whole at asking `ranged > 0`.
-pub(crate) fn nothing_new_ranged_in(j: &JournalRead, start: usize, end: usize, ranged: u64) -> bool {
+pub(crate) fn nothing_new_ranged_scan(
+    scan: &mut JournalScan<'_>,
+    start: usize,
+    end: usize,
+    ranged: u64,
+    prefer_published: bool,
+) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let known = published(start, end);
-    #[cfg(feature = "diagnostics")]
-    if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
-    }
-    if !known && !ahead_covers(&j.0.ahead, first, last) {
+    if !covered_in_journal(&scan.journal.0, start, end, first, last, prefer_published) {
         return false;
     }
-    j.0.notes.all_below(first, last, ranged, |_, write| write <= ranged)
+    scan.all_below(first, last, ranged, |_, write| write <= ranged)
 }
 
-/// Same as [`nothing_new_ranged_in`], acquiring `JOURNAL.read()` once.
-pub(crate) fn nothing_new_ranged(start: usize, end: usize, ranged: u64) -> bool {
-    let j = journal_read();
-    nothing_new_ranged_in(&j, start, end, ranged)
-}
-
-/// Same as [`nothing_new`], reusing an already-held [`JournalRead`] guard so a
-/// batch of spans pays only one `JOURNAL.read()` lock acquisition.
-pub(crate) fn nothing_new_in(
-    j: &JournalRead,
+/// Whether nothing of `[start, end)` was written that a copy with `copied` and
+/// `ranged` does not hold, reusing a [`JournalScan`] to cache the active shard
+/// read lock across spans.
+pub(crate) fn nothing_new_scan(
+    scan: &mut JournalScan<'_>,
     start: usize,
     end: usize,
     base: usize,
     copied: &[u64],
     ranged: u64,
+    prefer_published: bool,
 ) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    // The bits first, then the journal, as in `writes`.
-    let known = published(start, end);
-    #[cfg(feature = "diagnostics")]
-    if known {
-        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
-    }
-    if !known && !ahead_covers(&j.0.ahead, first, last) {
+    if !covered_in_journal(&scan.journal.0, start, end, first, last, prefer_published) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -1421,7 +1903,81 @@ pub(crate) fn nothing_new_in(
         }
         min_taken
     };
-    j.0.notes.all_below(first, last, floor, |page, write| write <= taken[page - first].max(ranged))
+    scan.all_below(first, last, floor, |page, write| write <= taken[page - first].max(ranged))
+}
+
+/// Directly finds stale `(page, taken)` pairs in `[start, end)` from an
+/// already-held [`JournalRead`] when covered by `ahead` or `PUBLISHED`,
+/// avoiding an intermediate `written` Vec allocation and binary search.
+pub(crate) fn stale_pages_in_journal(
+    j: &JournalRead,
+    start: usize,
+    end: usize,
+    base: usize,
+    copied: &[u64],
+) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (req_first, req_last) = (start / PAGE, end.div_ceil(PAGE));
+    let in_ahead = ahead_covers(&j.0.ahead, req_first, req_last);
+    if !in_ahead && !published(start, end) {
+        return None;
+    }
+    let first = req_first.max(base);
+    let last = req_last.min(base + copied.len());
+    let mut out = Vec::new();
+    let scan_piece = |shard: &Shard, piece: usize, p_lo: usize, p_hi: usize, out: &mut Vec<(usize, u64)>| {
+        if let Some(np) = shard.find_piece(piece) {
+            let base_p = piece << SHARD_SHIFT;
+            for p in p_lo..p_hi {
+                let at = copied[p - base];
+                if at == 0 || np.at[p - base_p] > at {
+                    out.push((p, at));
+                }
+            }
+        } else {
+            for p in p_lo..p_hi {
+                if copied[p - base] == 0 {
+                    out.push((p, 0));
+                }
+            }
+        }
+    };
+    if in_ahead {
+        if first < last {
+            let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+            for piece in a..=b {
+                let p_lo = first.max(piece << SHARD_SHIFT);
+                let p_hi = last.min((piece + 1) << SHARD_SHIFT);
+                let shard = piece % SHARDS;
+                if j.0.notes.shard_max(shard) == 0 {
+                    for p in p_lo..p_hi {
+                        if copied[p - base] == 0 {
+                            out.push((p, 0));
+                        }
+                    }
+                } else {
+                    let s = j.0.notes.read(shard);
+                    scan_piece(&s, piece, p_lo, p_hi, &mut out);
+                }
+            }
+        }
+        return Some((j.0.ahead_asked, out));
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(2, 1);
+        crate::faultbook::note(crate::faultbook::What::Known, req_first, req_last, 0);
+    }
+    let held = j.0.notes.hold(shards_of(req_first, req_last), false);
+    let now = next_asking();
+    if first < last {
+        let (a, b) = (first >> SHARD_SHIFT, (last - 1) >> SHARD_SHIFT);
+        for piece in a..=b {
+            let p_lo = first.max(piece << SHARD_SHIFT);
+            let p_hi = last.min((piece + 1) << SHARD_SHIFT);
+            scan_piece(held.shard(p_lo), piece, p_lo, p_hi, &mut out);
+        }
+    }
+    Some((now, out))
 }
 
 impl Tracked {
@@ -1540,6 +2096,7 @@ pub(crate) fn port_guard() -> bool {
 /// others) is made on the threads beside the submitting one, as it already
 /// was for more than 256 refreshes (`VICTORY_PORT_GUARD_PLAN=0`: on the
 /// submitting thread, as before; A/B-able by that name).
+#[allow(dead_code)]
 pub(crate) fn port_guard_plan() -> bool {
     if !port_guard() {
         return false;
@@ -2057,10 +2614,9 @@ fn known_holes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_HOLES").is_none_or(|v| v != "0") && light())
 }
 
-/// Whether `block` lies in a placeholder: a reservation in which pages come
-/// to be only by mapping a view (or an allocation) in its place, which an
-/// ordinary commit cannot do.
-fn placeholder(block: usize) -> bool {
+/// If `block` lies in a placeholder reservation, returns the exclusive end
+/// block of that placeholder region (`>= block + 1`); otherwise `None`.
+fn placeholder_end(block: usize) -> Option<usize> {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -2099,7 +2655,19 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    if status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0 {
+        let end = region.allocation_base.saturating_add(region.region_size) / BLOCK;
+        Some(end.max(block + 1))
+    } else {
+        None
+    }
+}
+
+/// Whether `block` lies in a placeholder: a reservation in which pages come
+/// to be only by mapping a view (or an allocation) in its place, which an
+/// ordinary commit cannot do.
+fn placeholder(block: usize) -> bool {
+    placeholder_end(block).is_some()
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -2372,6 +2940,7 @@ struct Guards {
     /// is ([`hot_rest`]). Behind a lock of its own: faults note in it holding
     /// [`GUARDS`] shared.
     opened: Mutex<std::collections::HashMap<usize, Opened, std::hash::BuildHasherDefault<PageHash>>>,
+    opened_nonempty: std::sync::atomic::AtomicBool,
 }
 
 /// When a write fault opened a block, and how often it had been written again
@@ -2468,7 +3037,7 @@ impl Guards {
 
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
-        if rest.is_zero() {
+        if rest.is_zero() || !self.opened_nonempty.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
         let opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
@@ -2505,6 +3074,7 @@ impl Guards {
             _ => 0,
         };
         opened.insert(block, Opened { at: now, hot });
+        self.opened_nonempty.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -2519,6 +3089,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     kernel: Vec::new(),
     aliased: Blocks::new(),
     opened: Mutex::new(std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new())),
+    opened_nonempty: std::sync::atomic::AtomicBool::new(false),
 });
 
 /// The guards, alone.
@@ -3212,11 +3783,17 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
             let until = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).min(to);
             if until > block {
                 let holes = known_holes();
+                let mut ph_until = 0usize;
                 for b in block..until {
                     PROTECTED.clear(b);
                     g.absent.insert(b);
-                    if holes && placeholder(b) {
-                        g.held.insert(b);
+                    if holes {
+                        if b < ph_until {
+                            g.held.insert(b);
+                        } else if let Some(end) = placeholder_end(b) {
+                            ph_until = end;
+                            g.held.insert(b);
+                        }
                     }
                 }
                 block = until;
@@ -5938,7 +6515,7 @@ mod port7_tests {
         let mut s = Shard::new();
         assert_eq!(s.note(3, WHOLE, 9), 0);
         assert_eq!(s.note(3, 0b11, 5), 9);
-        assert_eq!(s.written[&3], 9);
+        assert_eq!(s.written_at(3), Some(9));
         assert_eq!(s.parts_since(3, 8), WHOLE, "all of it at 9");
         assert_eq!(s.note(3, 0b100, 12), 9);
         assert_eq!(s.parts_since(3, 9), 0b100);
@@ -5946,7 +6523,7 @@ mod port7_tests {
         assert_eq!(s.note(3, WHOLE, 10), 12);
         assert_eq!(s.parts_since(3, 10), 0b100);
         assert_eq!(s.parts_since(3, 9), WHOLE);
-        assert_eq!(s.written[&3], 12);
+        assert_eq!(s.written_at(3), Some(12));
     }
 
     /// Many threads note pages (holding their parts for writing, a number
@@ -6184,5 +6761,43 @@ mod port7_tests {
         }
         // SAFETY: private allocation from above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn coalesce_overlapping_pieces_merges_overlaps_and_preserves_touching() {
+        let mut pieces = vec![(1, 3), (2, 5), (4, 4), (5, 7), (7, 10), (15, 20), (16, 18)];
+        super::coalesce_overlapping_pieces(&mut pieces);
+        // (1,3)+(2,5)+(4,4) -> (1,5); touching (5,7) and (7,10) stay separate; (15,20)+(16,18) -> (15,20).
+        assert_eq!(pieces, vec![(1, 5), (5, 7), (7, 10), (15, 20)]);
+    }
+
+    #[test]
+    fn notes_piece_bitmap_all_below_matches_range() {
+        const P: usize = 1 << super::SHARD_SHIFT;
+        let mut notes = super::Notes::new();
+        notes.note(5, super::WHOLE, 10);
+        notes.note(P + 2, 0b0101, 20);
+        notes.note(P + 900, super::WHOLE, 15);
+        notes.note(65 * P + 7, super::WHOLE, 30); // same shard (1) as P+2
+        assert!(notes.all_below(0, 5, 0, |_, _| false));
+        assert!(notes.all_below(0, 10, 10, |_, _| false));
+        assert!(!notes.all_below(0, 10, 9, |_, _| false));
+        assert!(notes.all_below(P + 3, P + 900, 10, |_, _| false));
+        assert!(notes.all_below(P, P + 1000, 20, |_, _| false));
+        assert!(!notes.all_below(P, P + 1000, 19, |_, _| false));
+        assert_eq!(
+            notes.range(0, 66 * P),
+            vec![(5, 10), (P + 2, 20), (P + 900, 15), (65 * P + 7, 30)]
+        );
+    }
+
+    #[test]
+    fn watch_pool_runs_all_items_exactly_once() {
+        let pool = super::WatchPool::get(3);
+        let hits: Vec<std::sync::atomic::AtomicUsize> = (0..64).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
+        pool.each(hits.len(), &|i| {
+            hits[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(std::sync::atomic::Ordering::Relaxed) == 1));
     }
 }

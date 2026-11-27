@@ -206,17 +206,20 @@ const RUNS_AT_A_TIME: usize = 4096;
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
-    // Classify short (word-pair) vs long (copy) runs in a single pass per copy.
+    // Classify short (word-pair) vs long (copy) runs in a single pass per copy
+    // using flat buffers to avoid nested per-buffer `Vec` allocations.
     let mut at = 0u64;
     let mut total_bytes = 0u64;
     let mut total_words = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    let mut short_ranges: Vec<Vec<(usize, usize)>> = Vec::with_capacity(dirty.len());
-    let mut short_chunk_words: Vec<Vec<usize>> = Vec::with_capacity(dirty.len());
+    let mut all_shorts: Vec<(usize, usize)> = Vec::new();
+    let mut all_chunk_words: Vec<usize> = Vec::new();
+    let mut copy_short_spans: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> =
+        Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {
         let mut runs = Vec::new();
-        let mut shorts = Vec::new();
-        let mut chunk_words = Vec::new();
+        let short_start = all_shorts.len();
+        let chunk_start = all_chunk_words.len();
         let mut cur_chunk_words = 0usize;
         let mut words = 0usize;
         for &(a, b) in ranges {
@@ -225,9 +228,9 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
                 let w = len / 4;
                 words += w;
                 cur_chunk_words += w;
-                shorts.push((a, b));
-                if shorts.len() % RUNS_AT_A_TIME == 0 {
-                    chunk_words.push(cur_chunk_words);
+                all_shorts.push((a, b));
+                if (all_shorts.len() - short_start) % RUNS_AT_A_TIME == 0 {
+                    all_chunk_words.push(cur_chunk_words);
                     cur_chunk_words = 0;
                 }
             } else {
@@ -237,12 +240,11 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
         if cur_chunk_words > 0 {
-            chunk_words.push(cur_chunk_words);
+            all_chunk_words.push(cur_chunk_words);
         }
         total_words += words as u64;
         copies.push(Copy { runs, pairs: (at, words as u32) });
-        short_ranges.push(shorts);
-        short_chunk_words.push(chunk_words);
+        copy_short_spans.push((short_start..all_shorts.len(), chunk_start..all_chunk_words.len()));
         at += (words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
@@ -251,14 +253,18 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for (((shadow, _), copy), (shorts, chunk_words)) in dirty.iter().zip(&copies).zip(short_ranges.iter().zip(&short_chunk_words)) {
+    for (((shadow, _), copy), (short_span, chunk_span)) in
+        dirty.iter().zip(&copies).zip(copy_short_spans)
+    {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for (chunk, &words) in shorts.chunks(RUNS_AT_A_TIME).zip(chunk_words) {
-            work.push((from, chunk, to));
-            to += words * 8;
+        if !short_span.is_empty() {
+            // (80,000 runs of some words a frame: in pieces of work.)
+            let mut to = memory.data + copy.pairs.0 as usize;
+            for (chunk, &words) in all_shorts[short_span].chunks(RUNS_AT_A_TIME).zip(&all_chunk_words[chunk_span]) {
+                work.push((from, chunk, to));
+                to += words * 8;
+            }
         }
     }
     let one = |i: usize| {

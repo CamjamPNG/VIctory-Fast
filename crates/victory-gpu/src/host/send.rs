@@ -27,6 +27,13 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether card-copy CPU sides can live in plain CPU memory instead of D3D12
+/// `shared_buffer`s: true when every upload goes through `send::take` and
+/// `upcheck` does not need a GPU-readable `Card::staging`.
+pub(crate) fn cpu_staging_safe(host: &Host) -> bool {
+    own() && !upcheck::on() && pass(host).is_some()
+}
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
@@ -120,7 +127,13 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() {
+        192 << 20
+    } else if crate::residency::limited_host_ram() {
+        192 << 20
+    } else {
+        256 << 20
+    }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -143,9 +156,9 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
             return Some(spare.swap_remove(i));
         }
     }
-    // By doubles, so that the next of about this size finds it: what
-    // submissions send differs from frame to frame.
-    let size = size.max(8 << 20).next_power_of_two();
+    // By doubles from 512 KiB (average flight sends ~1-2 MiB), so small flights
+    // don't pin 8 MiB BAR buffers and overflow `kept()`.
+    let size = size.max(512 << 10).next_power_of_two();
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,

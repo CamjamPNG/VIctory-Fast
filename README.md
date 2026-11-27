@@ -41,7 +41,7 @@ Measured on **AMD Ryzen 7 7800X3D · AMD Radeon RX 9070 XT (16 GB, RDNA 4) · 32
 | Configuration | Build | Median / Typical FPS | Peak FPS | Notes |
 |---|---|---:|---:|---|
 | **Series S — RT Off** | `--release` (measured, warm) | **~18.8 fps** | **29.3 fps** | CPU `preparing`-bound (`~45.5 ms` prep, `0.5 ms` GPU wait) |
-| **Series X (1440p) — RT Off** | `--release` (measured, `c9de853`) | **~18.9 fps** settled (`19.0 fps` overall med) | **31.0 fps** | CPU `preparing` cut to **`37.5 ms`** (from `58.0 ms`), `3.9 ms` GPU wait, `20.2 ms` copyback, `0` faults |
+| **Series X (1440p, FSR 4.1.2) — RT Off** | `--release` (measured, `de485f8`) | **~28.9–29.8 fps** steady (`29.4–29.8` plateau) | **29.8 fps** (`30.2` peak `v48`) | `1080p → 1440p` PC FSR 4.1.2 + `VICTORY_RDNA_WAVE32=2`: `33.5–34.6 ms/f`, **`23.6 ms`** prep, **`0.15 ms`** GPU wait, `15.9 ms` copyback, `19.7 GB` RAM / `10.0 GB` VRAM / `1.70 GB` SHR, `0` faults |
 | **Series S — Software RT** | `--release` (measured, `d1686f1`, 165s) | **~11.7 fps** settled (`12.0 fps` overall med) | **18.8 fps** | `1.4 ms` med / `4.7 ms` settled GPU wait, `54.4 ms` prep, `11.3 GB` max VRAM (`128.6 ms` timed `diag`) |
 | **Series X (1440p) — Software RT** | `--release` (measured) | **~8.2 fps** | **19.9 fps** | Software BVH emulation (`175.8 ms` GPU in timed `diag`) |
 | **Series S — Native DXR 1.1 RT** | `--release` (measured, `6a4ee3c`, parity default) | **~11.6 fps** settled (`10.9` med; `13.5` opt-in FBT) | **17.9 fps** (`25.1` peak `c9de853`) | Visual-parity default: `86.6 ms/f`, `36.9 ms` prep, `36.1 ms` GPU wait, `20.9 ms` copyback, **`13.4 GB`** max VRAM, `0` faults |

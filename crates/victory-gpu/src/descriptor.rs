@@ -218,6 +218,10 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+            // SAFETY: raises priority of this thread so `victory-submit`
+            // (ABOVE_NORMAL) is not priority-inverted while waiting in `wait_heaps`.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
             crate::cores::keep_on_fast_cores("victory-heap-sync");
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
@@ -567,7 +571,7 @@ pub(crate) fn sync_heaps() {
                             // slot from this anyway, they wait for a draw
                             // or a pass: noted some frames on, unless a
                             // draw's table turns out to hold them.
-                            if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                            if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED | OBJECT_BUFFER) && host.copied_waits() {
                                 out.wait.push(index);
                                 continue;
                             }
@@ -1179,6 +1183,9 @@ const KIND_SHIFT: u32 = 30;
 const GENERATIONS: u32 = (1 << KIND_SHIFT) - 1;
 const CONSTANT: u32 = 1;
 const PLACED: u32 = 2;
+/// Table entry whose descriptor is a buffer SRV/UAV (`ViewDimension == BUFFER`),
+/// allowing `sync_heaps` to defer it to `out.wait` without looking up `VIEWS`.
+const OBJECT_BUFFER: u32 = 3;
 /// Bits of a constant buffer view's address in its record: any address a
 /// program can have. The 15 bits above them are its size.
 const CONSTANT_ADDRESS_BITS: u32 = 47;
@@ -1346,11 +1353,22 @@ fn words_for(view: View) -> [u32; 2] {
             _ => {}
         }
     }
+    let obj_buffer = matches!(
+        &view,
+        View::Shader(_, Some(d)) | View::Unordered(_, _, Some(d)) if d[1] == 1
+    );
     // A view written before keeps its entry and generation.
-    if let Some(words) = views_read().entry_of(&view) {
-        return words;
-    }
-    views_write().entry(view)
+    let [i, generation] = if let Some(words) = views_read().entry_of(&view) {
+        words
+    } else {
+        views_write().entry(view)
+    };
+    let generation = if obj_buffer {
+        generation | (OBJECT_BUFFER << KIND_SHIFT)
+    } else {
+        generation
+    };
+    [i, generation]
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
@@ -1554,10 +1572,10 @@ pub(crate) fn forget(resource: usize) {
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
-        0 => {
+        0 | OBJECT_BUFFER => {
             let views = views_read();
             let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
+            (*current == (generation & GENERATIONS)).then(|| view.clone())
         }
         CONSTANT => Some(constant_of(i, generation)),
         PLACED => views_read().placed_of(i, generation),

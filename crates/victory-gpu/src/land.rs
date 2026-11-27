@@ -238,6 +238,12 @@ impl Pool {
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                if name == "victory-records" || name == "victory-under" {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                    // SAFETY: matches `victory-heap-sync` / `victory-submit` priority
+                    // so `sync_heaps` and `send::take` helpers are not preempted behind `victory-list`.
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+                }
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {

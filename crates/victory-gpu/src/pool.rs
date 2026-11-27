@@ -49,15 +49,22 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
+        let texture_limit = if crate::residency::limited_host_ram() {
+            limit.min(8)
+        } else {
+            limit
+        };
+        pool.reclaim(tick, texture_limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
             1
+        } else if crate::residency::limited_host_ram() {
+            limit.min(2)
         } else {
-            limit
+            limit.min(STAGING_KEPT)
         };
         pool.reclaim(tick, staging_limit, true);
     }

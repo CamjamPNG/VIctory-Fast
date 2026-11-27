@@ -3,8 +3,8 @@
 //! every changed heap page goes (`VICTORY_PORT_DESCRIPTORS=1`, off by
 //! default; read in [`on`]).
 //!
-//! What the title does (the target executable; `victory-loader`'s
-//! `descriptor_sites` has the code): its placed shader-visible view heap is
+//! What the title does (see `victory-loader`'s
+//! `descriptor_sites`): its placed shader-visible view heap is
 //! the memory of its frame allocator (image +0x4d9f400), which hands out the
 //! draws' and dispatches' descriptor tables and much else (constants, list
 //! nodes). The tables are filled one 32-byte record at a time by six stores
@@ -332,8 +332,8 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
         CHECKED[3].fetch_add(1, Relaxed);
         return;
     }
-    let n = CHECKED[1].fetch_add(1, Relaxed);
-    MISSED_ALL.fetch_add(1, Relaxed);
+    CHECKED[1].fetch_add(1, Relaxed);
+    let n = MISSED_ALL.fetch_add(1, Relaxed);
     let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
     let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };

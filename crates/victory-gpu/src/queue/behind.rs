@@ -527,6 +527,7 @@ impl Work for Job {
         }
         match self {
             Job::Value(wait) => wait.met(),
+            &Job::Wait(fence, value) => crate::fence::completed(fence as This) >= value,
             _ => true,
         }
     }
@@ -537,7 +538,10 @@ impl Work for Job {
 
     fn met(ask: &Ask) -> bool {
         match ask {
-            &Ask::Wait(fence, value) => crate::fence::completed(fence as This) >= value,
+            &Ask::Wait(fence, value) => {
+                crate::fence::completed(fence as This) >= value
+                    || (crate::host::late() && crate::host::late_signalled(fence, value))
+            }
             Ask::Value(wait) => super::value_met(wait),
             Ask::Lists(recordings) => recordings.iter().all(|r| r.done()),
         }
@@ -573,7 +577,10 @@ impl Work for Job {
                 }
             }
             &Job::Wait(fence, value) => {
-                if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                if crate::fence::completed(fence as This) < value
+                    && !(crate::host::late() && crate::host::late_signalled(fence, value))
+                    && !signals.iter().any(|&(f, v)| f == fence && v >= value)
+                {
                     return Err(next);
                 }
             }
@@ -712,10 +719,13 @@ fn default_runs_most(limited_ram: bool) -> usize {
 }
 
 fn effective_runs_most(configured: usize, pressured: bool, critical: bool) -> usize {
+    // A full frame queues ~28 submissions; clamping below 32 under
+    // ordinary RAM pressure splits a single frame in half, stalls title
+    // recording threads (~14 ms/frame), and breaks `VICTORY_JOIN_PARTS`.
     if critical {
-        configured.min(8).max(1)
-    } else if pressured {
         configured.min(16).max(1)
+    } else if pressured {
+        configured.min(32).max(1)
     } else {
         configured.max(1)
     }
@@ -1265,8 +1275,9 @@ mod tests {
         assert_eq!(super::default_runs_most(true), 32);
         assert_eq!(super::default_runs_most(false), 64);
         assert_eq!(super::effective_runs_most(64, false, false), 64);
-        assert_eq!(super::effective_runs_most(32, true, false), 16);
-        assert_eq!(super::effective_runs_most(32, true, true), 8);
+        assert_eq!(super::effective_runs_most(64, true, false), 32);
+        assert_eq!(super::effective_runs_most(32, true, false), 32);
+        assert_eq!(super::effective_runs_most(32, true, true), 16);
         assert_eq!(super::effective_runs_most(4, true, true), 4);
     }
 }

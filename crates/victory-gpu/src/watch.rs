@@ -1041,64 +1041,56 @@ pub(crate) fn once() -> bool {
 }
 
 /// With [`once`]: asks about `ranges` (everything a submission's lists
-/// refresh) as [`ask_ahead`] does, and lets that asking stand until
+/// refresh) in a single pass, and lets that asking stand until
 /// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
-    ask_once_end();
-    ask_ahead(ranges);
-    ask_rest(ranges);
-}
-
-/// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
-/// asking stands.
-fn ask_rest(ranges: &[(usize, usize)]) {
-    let mut ahead = {
-        let mut j = journal_mut();
-        std::mem::take(&mut j.ahead)
-    };
-    // `ask_ahead` leaves a range that lies alone to `writes`, which asks
-    // once per flush: with one asking for the submission that was every
-    // such range asked again at each of its 70 flushes (run 76: 2,300
-    // askings a frame with the switch on, as without it). They are asked
-    // here, once; what is not write-watched stays with `writes`.
-    let mut rest: Vec<(usize, usize)> = Vec::new();
-    for &(start, end) in ranges {
-        if start >= end || published(start, end) || refused_as_view(start, end) {
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead_covers(&ahead, first, last) {
-            rest.push((first, last));
-        }
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1) && !refused_as_view(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.is_empty() {
+        ask_once_end();
+        return;
     }
-    let mut holds = rest.clone();
-    sort_coalesce_ahead(&mut holds);
-    let _held = AskingMany::hold(holds);
-    let mut written = Vec::new();
-    for (first, last) in rest {
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
-            && let Some(pages) = kernel_written(first, last)
+    pieces.sort_unstable();
+    let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + AHEAD_GAP
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        groups.push((i, k, first, last));
+        i = k;
+    }
+    let _held = AskingMany::hold(groups.iter().map(|&(_, _, first, last)| (first, last)).collect());
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for (i, k, first, last) in groups {
+        if k - i >= 2 {
+            ask_all_run(&pieces[i..k], &mut asked, &mut written);
+        } else if let Some(pages) = kernel_written(first, last) {
             written.extend(pages);
-            ahead.push((first, last));
+            asked.push((first, last));
         }
     }
-    sort_coalesce_ahead(&mut ahead);
+    sort_coalesce_ahead(&mut asked);
     note_hot(&written);
-    // A number of its own, and the one this asking stands under: between
-    // the two parts another thread may have asked about a range of the
-    // second, copied it, and the title written it since. Under the first
-    // part's number that write was older than the copy, and never copied.
     if port_journal() {
-        // Renderer port #7: noted shared first (see `ask_ahead`).
         let now = note_shared(&written);
         let mut j = journal_mut();
         j.ahead_asked = now;
-        j.kept = !ahead.is_empty();
-        j.ahead = ahead;
+        j.kept = !asked.is_empty();
+        j.ahead = asked;
         return;
     }
     let mut j = journal_mut();
@@ -1107,8 +1099,29 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
-    j.kept = !ahead.is_empty();
-    j.ahead = ahead;
+    j.kept = !asked.is_empty();
+    j.ahead = asked;
+}
+
+/// Like [`ask_run`], but also asks singleton ranges left after a split so
+/// `ask_once` finishes every write-watched range in one pass.
+fn ask_all_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: &mut Vec<(usize, u16)>) {
+    if pieces.is_empty() {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if let Some(pages) = kernel_written(first, last) {
+        written.extend(pages);
+        asked.push((first, last));
+        return;
+    }
+    if pieces.len() < 2 {
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_all_run(a, asked, written);
+    ask_all_run(b, asked, written);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -4418,13 +4431,13 @@ mod tests {
             VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
         } as usize;
         assert_ne!(p, 0);
-        // One range: `ask_ahead` leaves it.
+        // One range: `ask_ahead` leaves it; `ask_once` asks it with a newer number.
         let ranges = [(p, p + 4 * PAGE)];
         ask_ahead(&ranges);
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
-        ask_rest(&ranges);
+        ask_once(&ranges);
         let last = journal().notes.range(p / PAGE + 1, p / PAGE + 2).first().map(|n| n.1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");

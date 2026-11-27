@@ -39,7 +39,7 @@ it set, so your own overrides win.
 | Switch | Value | Expected trade |
 |---|---|---|
 | `VICTORY_OUTPUT` | `1920x1080` | The swap chain and the display. One of the five sizes the title has a display mode for (`victory-loader/src/resolution.rs`, `MODES`). |
-| `VICTORY_RENDER_SCALE` | `0.5` | Image sharpness for GPU time: the title renders 960x540 and its own upscaler stretches that to 1080p. Below 2/3 the title's *largest* render size stays at 2/3, so its dynamic resolution may climb back toward 720p on its own (`resolution.rs`, the module's notes). |
+| `VICTORY_RENDER_SCALE` | `0.5` | Image sharpness for GPU time: the title renders 960x540 and its own upscaler stretches that to 1080p. **Read the clamp below**: below 2/3 the title's *largest* render size stays at 2/3, so this may render 1280x720 instead. |
 | `VICTORY_UPSCALER` | `6` | The title's own upscaler instead of FidelityFX. On Series S the picker returns FidelityFX, which reads its own scale constant, so `VICTORY_RENDER_SCALE` would do nothing; 6 is the picker that honours it. `VICTORY_FFX_SCALE` is not used: it is documented unsafe at 0.5 (the title divided by a zero jitter phase count). |
 | `VICTORY_TEXTURE_BUDGET_MB` | `3200` | Texture detail and eviction churn for room. A cap on the bytes of host copies of textures the title fills; past it the queue makes no more, which leaves ~2.9 GB of the card for render targets and buffer copies. Without it the policy allows up to nine tenths of the budget for textures alone, with nothing reserved. |
 | `VICTORY_TEXTURE_MAX` | `512` | Distant texture detail for memory, pinned: a streamed texture skips levels until no side passes 512. The default follows pressure (1024, then 512 from 92 %, 256 from 97 %), so it would keep changing step on this card; a fixed value keeps the copy each view reads the same across a run. |
@@ -55,6 +55,32 @@ it set, so your own overrides win.
 | `VICTORY_PIPELINE_WORKERS` | `4` | First-run stalls for frame time: pipeline making happens below the title's own threads, 8 workers by default on this machine's 12 logical processors. Four means a cold cache takes longer to fill; it also means fewer threads stealing frames while it fills. |
 | `VICTORY_JOIN_PARTS` | `4` | How many parts of a submission are prepared as one (8 in `pareto-residency`): fewer parts joined is less work stolen from the frame, and a little more per-submission latency. |
 
+### The 2/3 clamp, and `weak-540`
+
+`VICTORY_RENDER_SCALE` sets the title's own upscaler's scale, but the same module records
+that below 2/3 the title's *largest* render size (`+0x94`, `max(2/3, scale)`) stays at
+2/3. So `0.5` on a 1920x1080 output may render 1280x720 rather than 960x540, which the
+programme's own arithmetic puts at roughly 50 ms against 38 ms of card time here — enough
+to decide whether a 33 ms frame is reachable. Whether the title clamps is not known until
+there is a row for it, and this page states no measured figure of its own.
+
+A clamped row is recognisable without the panel: its `peak_local_vram_mb` and its fps sit
+within noise of a run at render scale 1.0, where two rows that really differ by 35 % of
+the picture cannot. On screen, F3's `FRAME` number stays within a few milliseconds of what
+the 1.0 run showed.
+
+For a true 960x540 there is `Play-VIctory.cmd weak-540`: the same preset with
+`VICTORY_OUTPUT=1280x720` and `VICTORY_RENDER_SCALE=0.75`. At a 720p output the clamp is
+`max(2/3, 0.75)` = 0.75, so 960x540 is rendered and stretched to a 720p swap chain, which
+Windows or the monitor then stretches to 1080p. Two things about the pair are untested
+until a row exists: that the title's own upscaler takes 0.75 at a 720p output, and how that
+image looks stretched. Measure both presets in one sitting:
+
+```powershell
+scripts\measure.ps1 -Exe $env:VICTORY_GAME_EXE -Tag r1080 -Preset weak
+scripts\measure.ps1 -Exe $env:VICTORY_GAME_EXE -Tag r540 -Preset weak-540
+```
+
 ### Kept from `pareto-residency`
 
 The rest of that preset is inherited unchanged, because none of it depends on
@@ -66,6 +92,21 @@ memory size or core count: `VICTORY_RELAY=2`, `VICTORY_THIN=1`,
 `VICTORY_CARD_BUFFERS_MIN_KB=64`, `VICTORY_LEVELS_ON_DEMAND=1`,
 `VICTORY_UPLOAD_AHEAD=1`, `VICTORY_MAP_THREADS=1`, `VICTORY_AMBIENT=0.8`,
 `VICTORY_AMBIENT_AIR=1.5`, and the cache folder.
+
+### Where its files go
+
+The preset keeps everything off the system SSD: `VICTORY_CACHE_DIR=D:\VIctory\cache`
+(the shader and pipeline cache, and the converted images) and `VICTORY_DATA_DIR=D:\VIctory\data`
+(saves, settings, `crashes.log`), both made if they are not there, and both only if you have
+not set them yourself. The measurements go to `D:\VIctory\measurements` the same way
+(`-Out` says otherwise). If `D:\` cannot be written, the preset says so once and leaves both
+at their previous defaults under `%LOCALAPPDATA%` rather than failing the launch.
+
+**The checkout belongs on D: too.** Build `target\` follows the repository, so a clone under
+`D:\` keeps a release build of this workspace (and a 60-100 GB title dump) off a 256 GB
+system SSD that Windows shares. The trade is real: D: is a mechanical drive, so reading the
+shader cache and streaming the dump is slower than from the SSD. If space on C: frees up
+later, moving the cache back is one line — set `VICTORY_CACHE_DIR` before the preset runs.
 
 ### Deliberately not set
 
@@ -97,8 +138,9 @@ scripts\measure.ps1 -Exe $env:VICTORY_GAME_EXE -Tag water -Seconds 90
 ```
 
 That starts `Play-VIctory.cmd weak`, runs it 90 seconds, closes it, writes the
-log to `measurements\<stamp>-<tag>.log`, and appends one row to
-`measurements.csv`: build commit and binary hash, median fps, preparation and
+log to `D:\VIctory\measurements\<stamp>-<tag>.log`, and appends one row to
+`D:\VIctory\measurements\measurements.csv` (`-Out` says elsewhere): build commit and
+binary hash, median fps, preparation and
 copyback milliseconds, peak local VRAM and commit, page faults per frame, and
 whether the process exited cleanly. `-Preset pareto-residency` runs the old
 configuration through the same harness, which is what makes the two
@@ -111,4 +153,5 @@ frame of the last half second, not a p99 — `host/panel.rs`.) And scenes differ
 from run to run, so start each run from the same place, and read differences
 under about 5 % as nothing.
 
-`measurements.csv` and `measurements/` are yours: they are not tracked here.
+Nothing the harness writes is tracked in the repository; it all lives under
+`D:\VIctory\measurements` unless `-Out` says otherwise.

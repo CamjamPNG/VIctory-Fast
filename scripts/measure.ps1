@@ -3,10 +3,12 @@
 #
 # -Exe       the title's executable (what VICTORY_GAME_EXE takes)
 # -Seconds   how long the title runs before it is closed (default 90)
-# -Preset    weak (the default), pareto-residency or native-rt, as Play-VIctory.cmd takes it
+# -Preset    weak (the default), weak-540, pareto-residency or native-rt, as Play-VIctory.cmd takes it
 # -Save      a folder or file of your own save, put back before the run: the save in the
-#            data folder is copied aside first, under measurements\
+#            data folder is copied aside first, into -Out
 # -Tag       what this run is, for the row (default: <preset>-<time>)
+# -Out       where measurements.csv and the logs go (default D:\VIctory\measurements,
+#            off the system SSD; the repository's measurements\ if D: cannot be written)
 #
 # The log has to be at info: VICTORY_LOG=warn (Play-VIctory.cmd's default) hides the
 # per-second "N fps, M ms/frame (...)" line and the "memory summary: ..." line this
@@ -20,8 +22,9 @@ param(
     [Parameter(Mandatory)][string]$Exe,
     [ValidateRange(5, 3600)][int]$Seconds = 90,
     [string]$Tag = '',
-    [ValidateSet('weak', 'pareto-residency', 'native-rt')][string]$Preset = 'weak',
-    [string]$Save = ''
+    [ValidateSet('weak', 'weak-540', 'pareto-residency', 'native-rt')][string]$Preset = 'weak',
+    [string]$Save = '',
+    [string]$Out = 'D:\VIctory\measurements'
 )
 $ErrorActionPreference = 'Stop'
 $culture = [System.Globalization.CultureInfo]::InvariantCulture
@@ -41,13 +44,18 @@ function Median([double[]]$values) {
 
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $launcher = Join-Path $root 'Play-VIctory.cmd'
-$csv = Join-Path $root 'measurements.csv'
 $exePath = (Resolve-Path -LiteralPath $Exe).Path
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if (-not $Tag) { $Tag = "$Preset-$stamp" }
-$out = Join-Path $root 'measurements'
-New-Item -ItemType Directory -Force -Path $out | Out-Null
-$log = Join-Path $out "$stamp-$Tag.log"
+try {
+    New-Item -ItemType Directory -Force -Path $Out | Out-Null
+} catch {
+    Write-Warning "Cannot write to $Out ($($_.Exception.Message)); using the repository's measurements this time."
+    $Out = Join-Path $root 'measurements'
+    New-Item -ItemType Directory -Force -Path $Out | Out-Null
+}
+$csv = Join-Path $Out 'measurements.csv'
+$log = Join-Path $Out "$stamp-$Tag.log"
 
 if (-not (Test-Path $launcher)) { throw "No $launcher." }
 # What Play-VIctory.cmd will run (its own choice: release, else diag).
@@ -63,7 +71,11 @@ $buildSha = (Get-FileHash -LiteralPath $runner -Algorithm SHA256).Hash.ToLowerIn
 
 # -Save: put the owner's save back, keeping the one there first.
 if ($Save) {
-    $dataDir = if ($env:VICTORY_DATA_DIR) { $env:VICTORY_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'victory\data' }
+    # Where Play-VIctory.cmd puts it: what is set here, else the weak preset's own default
+    # on D: if that folder is there, else the title's default under %LOCALAPPDATA%.
+    $dataDir = if ($env:VICTORY_DATA_DIR) { $env:VICTORY_DATA_DIR }
+        elseif (Test-Path 'D:\VIctory\data') { 'D:\VIctory\data' }
+        else { Join-Path $env:LOCALAPPDATA 'victory\data' }
     $stores = @(Get-ChildItem -LiteralPath $dataDir -Directory -ErrorAction SilentlyContinue |
         ForEach-Object { Join-Path $_.FullName 'storage' } |
         Where-Object { Test-Path -LiteralPath $_ } |
@@ -71,7 +83,7 @@ if ($Save) {
     if ($stores.Count -eq 0) { throw "No save folder under $dataDir. Run the title once first." }
     $storage = $stores[0]
     Write-Host "save           $storage (backed up, then what -Save has is put there)"
-    $backup = Join-Path $out "$stamp-$Tag-save-before"
+    $backup = Join-Path $Out "$stamp-$Tag-save-before"
     Copy-Item -LiteralPath $storage -Destination $backup -Recurse -Force
     $from = (Resolve-Path -LiteralPath $Save).Path
     if (Test-Path -LiteralPath $from -PathType Container) {

@@ -1,0 +1,15 @@
+# The Tests step's per-test bound.
+#
+# A test that runs a minute is reported slow; one that runs two is stopped and
+# the run fails. A deadlock used to cost the job its 60-minute timeout instead,
+# and it did it in a way that read as "still running": four tests named at 60
+# seconds and then nothing for the rest of the hour (PR #8, head a6290ce). A
+# bound that turned a hang into a pass would be worse than none, so
+# `terminate-after` marks the test failed.
+#
+# The suite's slowest test is a few seconds: see `.github/workflows/ci.yml`.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# A failed test stops the run: the gate answers as soon as it is not green.
+fail-fast = true

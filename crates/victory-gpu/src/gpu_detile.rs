@@ -527,10 +527,10 @@ pub(crate) fn shared_scratch(host: &Host, size: u64) -> Option<ID3D12Resource> {
     }
     let buffer = host.uav_buffer(class)?;
     crate::host::name(&buffer, || format!("gpu detile scratch {class:#x}"));
-    if class <= MAX_RETAINED {
-        if let Some((_, old)) = slot.0.replace((class, buffer.clone())) {
-            crate::host::retire(old);
-        }
+    if class <= MAX_RETAINED
+        && let Some((_, old)) = slot.0.replace((class, buffer.clone()))
+    {
+        crate::host::retire(old);
     }
     Some(buffer)
 }

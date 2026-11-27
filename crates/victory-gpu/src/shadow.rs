@@ -435,10 +435,12 @@ fn demote_overlapping_gpu_only(start: u64, len: u64, skip_id: u64, reason: &'sta
     {
         let watched = GPU_ONLY_WATCHED.read().unwrap_or_else(|e| e.into_inner());
         for &(s_start, s_end, s_id, ref weak) in watched.iter() {
-            if s_id != skip_id && s_start < end && s_end > start {
-                if let Some(shadow) = weak.upgrade() {
-                    hits.push(shadow);
-                }
+            if s_id != skip_id
+                && s_start < end
+                && s_end > start
+                && let Some(shadow) = weak.upgrade()
+            {
+                hits.push(shadow);
             }
         }
     }
@@ -2748,7 +2750,7 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_avx2(title, held) };
     }
@@ -2814,7 +2816,7 @@ fn under_fused() -> bool {
 /// `held` is `title` afterwards.
 fn word_runs_put(at: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
         // SAFETY: the processor has AVX2, and the lengths are the same.
         return unsafe { word_runs_put_avx2(title, held) };
     }
@@ -3555,10 +3557,10 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// Resolves `VICTORY_WINDOW_BUDGET_MB`: explicit `0` disables the budget cap,
 /// a positive integer overrides it, and unset defaults to 1280 MiB.
 fn resolve_window_budget_mb(env: Option<&str>, limited_ram: bool) -> Option<u64> {
-    if let Some(raw) = env {
-        if let Ok(v) = raw.trim().parse::<u64>() {
-            return (v > 0).then_some(v);
-        }
+    if let Some(raw) = env
+        && let Ok(v) = raw.trim().parse::<u64>()
+    {
+        return (v > 0).then_some(v);
     }
     let _ = limited_ram;
     Some(1280)
@@ -3624,20 +3626,20 @@ pub(crate) fn let_go_idle() {
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let mut keep = u64::MAX;
-    if let Some(bytes) = budget {
-        if let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample() {
-            let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
-            *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
-            match *band {
-                crate::host::RamBand::Calm => {}
-                crate::host::RamBand::Watch => {
-                    idle_ms = idle_ms.min(10_000);
-                    keep = bytes;
-                }
-                crate::host::RamBand::High => {
-                    idle_ms = idle_ms.min(2_000);
-                    keep = bytes / 2;
-                }
+    if let Some(bytes) = budget
+        && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()
+    {
+        let mut band = WINDOW_BAND.lock().unwrap_or_else(|e| e.into_inner());
+        *band = crate::host::ram_band(*band, working, private, free, commit, total, limit);
+        match *band {
+            crate::host::RamBand::Calm => {}
+            crate::host::RamBand::Watch => {
+                idle_ms = idle_ms.min(10_000);
+                keep = bytes;
+            }
+            crate::host::RamBand::High => {
+                idle_ms = idle_ms.min(2_000);
+                keep = bytes / 2;
             }
         }
     }
@@ -4555,9 +4557,9 @@ impl Shadow {
                 let fused = crate::host::words_under()
                     && under_fused()
                     && !crate::host::upcheck::on()
-                    && at % 4 == 0
-                    && lo % 4 == 0
-                    && n % 4 == 0
+                    && at.is_multiple_of(4)
+                    && lo.is_multiple_of(4)
+                    && n.is_multiple_of(4)
                     && {
                         if left.fetch_sub(most, Ordering::Relaxed) >= most {
                             true

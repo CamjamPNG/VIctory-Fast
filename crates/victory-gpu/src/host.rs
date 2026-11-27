@@ -3849,6 +3849,7 @@ struct Flight {
 }
 
 /// One thing in the line of what waits for the card, in order.
+#[allow(clippy::large_enum_variant)]
 enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
@@ -4959,6 +4960,9 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+// The record of indirect executions a removed device's report reads: written by
+// nothing yet, kept for the report that is to take it up (docs/findings.md).
+#[allow(dead_code)]
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -8872,7 +8876,7 @@ impl HostList {
             return src;
         }
         let seen = deferred.copies.iter().rev().map(|step| match step {
-            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
+            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.is_from_upload() },
             &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
             &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
             Step::Run(_) => crate::port_rt::Seen::Anything,
@@ -10214,11 +10218,11 @@ fn join_fronts(
         let mut shadows = front.shadows.into_iter();
         let mut spans = Vec::with_capacity(shadows.len());
         for (key, from, to, _) in front.copies {
-            if from < to {
-                if let Some((s_key, shadow)) = shadows.next() {
-                    debug_assert_eq!(s_key, key);
-                    spans.push((shadow, from, to));
-                }
+            if from < to
+                && let Some((s_key, shadow)) = shadows.next()
+            {
+                debug_assert_eq!(s_key, key);
+                spans.push((shadow, from, to));
             }
         }
         return (spans, covered);
@@ -10372,6 +10376,7 @@ enum Touch {
     /// The copy is given to shaders.
     Write(usize),
     /// Title memory is written.
+    #[allow(dead_code)]
     Title,
     Nothing,
     /// Another part of the submission begins.

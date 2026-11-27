@@ -536,12 +536,10 @@ impl<B: Clone> SlabAllocator<B> {
         let mut best: Option<(usize, usize, u64)> = None;
         'search: for (slab_idx, slab) in self.slabs.iter().enumerate() {
             for (free_idx, &(_, range_size)) in slab.free.iter().enumerate() {
-                if range_size >= need {
-                    if best.is_none_or(|(_, _, best_sz)| range_size < best_sz) {
-                        best = Some((slab_idx, free_idx, range_size));
-                        if range_size == need {
-                            break 'search;
-                        }
+                if range_size >= need && best.is_none_or(|(_, _, best_sz)| range_size < best_sz) {
+                    best = Some((slab_idx, free_idx, range_size));
+                    if range_size == need {
+                        break 'search;
                     }
                 }
             }
@@ -1368,7 +1366,7 @@ pub(crate) fn log_stats(frames: f64) {
 
 /// Sentinel guest key for the shared valid 0-instance empty TLAS used whenever
 /// a shader binds a null (`Location = 0`) RTAS SRV.
-const EMPTY_TLAS_KEY: u64 = u64::MAX & !0xFF;
+const EMPTY_TLAS_KEY: u64 = !0xFF;
 
 /// Ensures `guest_va` has a stable host TLAS slot of at least `min_bytes`.
 pub(crate) fn ensure_tlas_slot(guest_va: u64, min_bytes: u64) -> Option<(u64, ID3D12Resource)> {
@@ -1602,6 +1600,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
 /// - `dw[14]`: `tri1` `PrimitiveIndex`
 /// - `dw[15]`: per-triangle permutation bytes matching `bvh.rs::TRIANGLE_VERTICES`
 ///   (`tri0: [0,1,2]`, `tri1: [1,3,2]`, winding `[first, i, j]` where `first = (3-i-j)&3`).
+///
 /// Unused or out-of-range slots emit degenerate NaN triangles (`0x7FC00000`) which
 /// DXR treats as inactive primitives.
 const EXTRACT_BVH4_HLSL: &str = r#"
@@ -1867,6 +1866,7 @@ pub fn prebuild_info(inputs: &GuestBuildAsInputs) -> Option<GuestPrebuildInfo> {
 }
 
 /// Queues a batch of dynamic BLAS/TLAS builds from `XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn enqueue_build_batched(cmd_list: *const c_void, num_descs: u32, descs: *const GuestBatchedDesc2) {
     if !enabled() || cmd_list.is_null() || descs.is_null() || num_descs == 0 {
         return;
@@ -1934,6 +1934,7 @@ pub fn enqueue_copy(cmd_list: *const c_void, dest_va: u64, source_va: u64, mode:
 
 /// Queues static BLAS extraction + DXR build for a batch of rehydrated console BVH4s from
 /// `XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn enqueue_rehydrate_batched(
     cmd_list: *const c_void,
     num_descs: u32,
@@ -2023,7 +2024,7 @@ fn probe_bvh_bounds(va: u64, hint_bytes: u64) -> Option<(u64, u64)> {
             bytes = unpacked;
         }
     }
-    if bytes < 128 || bytes > MAX_PACKED_BVH_BYTES {
+    if !(128..=MAX_PACKED_BVH_BYTES).contains(&bytes) {
         return None;
     }
     // Use exact `num_elements` when header looks unpacked; otherwise conservative upper bound

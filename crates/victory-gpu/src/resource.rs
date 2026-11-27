@@ -101,7 +101,7 @@ pub(crate) struct ResourceDesc {
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
-    fn from_level(&self, base: u32) -> ResourceDesc {
+    fn levels_from(&self, base: u32) -> ResourceDesc {
         let mut d = *self;
         if base > 0 {
             d.width = (d.width >> base).max(1);
@@ -1314,7 +1314,7 @@ fn over_cap_for(desc: &ResourceDesc, set: Option<u64>, vram_pct: u64) -> u32 {
     if set == Some(0) {
         return 0;
     }
-    let max = set.unwrap_or_else(|| match vram_pct {
+    let max = set.unwrap_or(match vram_pct {
         0..92 => 1024,
         92..97 => 512,
         _ => 256,
@@ -1694,7 +1694,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Ok(texture),
-            None => host_texture(&r.desc.from_level(base), r.host.state, clear),
+            None => host_texture(&r.desc.levels_from(base), r.host.state, clear),
         };
         let texture = match texture {
             Ok(texture) => texture,
@@ -3143,6 +3143,7 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }

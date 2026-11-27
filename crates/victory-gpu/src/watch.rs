@@ -999,7 +999,7 @@ fn ask_early(every: std::time::Duration) {
                 idle = 0;
             }
             round += 1;
-            if round % 64 == 0 {
+            if round.is_multiple_of(64) {
                 hot.retain(|_, n| {
                     *n /= 2;
                     *n > 0
@@ -5216,7 +5216,7 @@ mod tests {
                 assert_eq!(set.insert(block), other.insert(block));
             }
             assert_eq!(set.contains(block), other.contains(&block));
-            if round % 64 == 0 {
+            if round.is_multiple_of(64) {
                 let a = [0, 63, Blocks::IN_PIECE, 3 * Blocks::IN_PIECE - 70][next(4)] + next(140);
                 let b = a + [next(10), next(300), 2 * Blocks::IN_PIECE + next(100)][next(3)];
                 assert!(set.range(a..b).eq(other.range(a..b).copied()), "{a}..{b}");

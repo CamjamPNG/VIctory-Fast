@@ -1272,7 +1272,7 @@ static RESERVATIONS: RwLock<Vec<Reservation>> = RwLock::new(Vec::new());
 
 /// Maximum intra-reservation gap (in 64 KiB pages) bridged between ranges in
 /// the same confirmed `MEM_PRIVATE` reservation (`VICTORY_WATCH_GAP_MB=<MiB>`,
-/// default `64` MiB; `0`: only touching/overlapping ranges merge).
+/// default `8` MiB; `0`: only touching/overlapping ranges merge).
 fn watch_gap_pages() -> usize {
     #[cfg(test)]
     if let Some(pages) = WATCH_GAP_IN_TEST.get() {
@@ -1283,7 +1283,7 @@ fn watch_gap_pages() -> usize {
         let mb = std::env::var("VICTORY_WATCH_GAP_MB")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(64)
+            .unwrap_or(8)
             .min(1024);
         (mb << 20) / PAGE
     })
@@ -3185,8 +3185,9 @@ struct Opened {
 /// writable without re-protecting mid-burst, while re-protecting promptly
 /// once writes stop. `VICTORY_GUARD_HOT=0` disables hot-rest extension.
 const DEFAULT_HOT_REST_MS: u64 = 16;
-/// Repeat-fault window past the previous rest before a block cools down.
-const HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+/// Repeat-fault window past the previous rest before a block cools down
+/// (covers per-frame faults at ~20–60 FPS so steady per-frame blocks promote).
+const HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(55);
 /// Repeat-fault streak required before extending rest (probation avoids
 /// extending rest for one-off 2-write streaming bursts).
 const HOT_PROMOTE_AT: u8 = 2;

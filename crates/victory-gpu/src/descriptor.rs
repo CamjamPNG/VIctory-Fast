@@ -1569,6 +1569,20 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// Fast liveness check for a previously resolved view record `(i, generation)`
+/// without cloning the [`View`]. `CONSTANT` and `PLACED` records stay valid
+/// once emitted (`shapes` is append-only).
+pub(crate) fn view_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        0 | OBJECT_BUFFER => {
+            let views = views_read();
+            views.list.get(i as usize).is_some_and(|(_, current)| *current == (generation & GENERATIONS))
+        }
+        CONSTANT | PLACED => true,
+        _ => false,
+    }
+}
+
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {

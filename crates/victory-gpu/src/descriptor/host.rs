@@ -2802,6 +2802,14 @@ impl HostHeap {
         self.tabled_in(index, false, crate::frame::current());
     }
 
+    /// Whether slot `index` still mirrors `key` on the lock-free quick table.
+    #[inline]
+    pub(crate) fn quick_matches(&self, index: u32, key: u64) -> bool {
+        key != 0
+            && quick_mirror()
+            && self.quick.get(index as usize).is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
+    }
+
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         self.buffers.all(|_| true)

@@ -44,6 +44,12 @@ pub(crate) struct Shadow {
     /// after which it was last copied (0: never), paired with the two ranges
     /// taken whole (the last one and the longest; [`Shadow::copy_stale`]).
     copied: Mutex<(Vec<u64>, [(usize, usize, u64); 2])>,
+    /// Lock-free mirror of the longest range copied whole (`copied.1[1]`),
+    /// guarded by a seqlock (`ranged_seq`: even = stable, odd = updating).
+    ranged_seq: AtomicU64,
+    ranged_from: AtomicUsize,
+    ranged_to: AtomicUsize,
+    ranged_at: AtomicU64,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -90,6 +96,10 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Set once this buffer/window is unregistered or replaced in-place, so
+    /// cached descriptor-sweep entries can skip global epoch checks for live
+    /// buffer shadows.
+    dead: std::sync::atomic::AtomicBool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -3336,6 +3346,7 @@ pub(crate) fn let_go_idle() {
         });
     }
     for shadow in gone {
+        shadow.dead.store(true, Ordering::Release);
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
@@ -3478,6 +3489,10 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new((vec![0; pages as usize], [(0, 0, 0); 2])),
+            ranged_seq: AtomicU64::new(0),
+            ranged_from: AtomicUsize::new(0),
+            ranged_to: AtomicUsize::new(0),
+            ranged_at: AtomicU64::new(0),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             pending_count: AtomicUsize::new(0),
@@ -3495,10 +3510,17 @@ impl Shadow {
             },
             card: None,
             window: false,
+            dead: std::sync::atomic::AtomicBool::new(false),
             changes_only: Default::default(),
             mapped: false,
             place: None,
         }
+    }
+
+    /// Whether this buffer/window was unregistered or replaced in-place.
+    #[inline]
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -4308,6 +4330,29 @@ impl Shadow {
         {
             return false;
         }
+        // Lock-free seqlock fast path against the longest range taken whole.
+        let s1 = self.ranged_seq.load(Ordering::Acquire);
+        if s1 != 0 && s1 & 1 == 0 {
+            let rf = self.ranged_from.load(Ordering::Relaxed);
+            let rt = self.ranged_to.load(Ordering::Relaxed);
+            let ra = self.ranged_at.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
+            if self.ranged_seq.load(Ordering::Relaxed) == s1 && rf <= from && to <= rt && ra != 0 {
+                let same = match j {
+                    Some(j) => crate::watch::nothing_new_ranged_in(j, from, to, ra),
+                    None => crate::watch::nothing_new_ranged(from, to, ra),
+                };
+                if same {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (to - from) as u64);
+                        add(C::Unchanged, (to - from) as u64);
+                    }
+                    return true;
+                }
+            }
+        }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let ranged = Self::ranged_in(&copied.1, from, to);
         let same = match j {
@@ -4491,6 +4536,12 @@ impl Shadow {
             ranged[0] = (from, to, now);
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
+                let seq = self.ranged_seq.load(Ordering::Relaxed);
+                self.ranged_seq.store(seq + 1, Ordering::Release);
+                self.ranged_from.store(from, Ordering::Relaxed);
+                self.ranged_to.store(to, Ordering::Relaxed);
+                self.ranged_at.store(now, Ordering::Relaxed);
+                self.ranged_seq.store(seq + 2, Ordering::Release);
             }
         }
         bytes
@@ -5407,15 +5458,19 @@ static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::Rw
 fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
-    BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    BUFFERS_CHANGED.fetch_add(1, Ordering::Release);
     map
 }
 
-/// How often [`BUFFERS`] was taken to be changed.
+fn buffers_mut() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How often [`BUFFERS`] underwent an overlapping registration or in-place eviction.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
-/// Answers a thread remembers.
-const FOUND_MOST: usize = 1024;
+/// Answers a thread remembers (covers ~6k live buffers without conflict thrashing).
+const FOUND_MOST: usize = 8192;
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -5436,21 +5491,21 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    (h >> 51) as usize & (FOUND_MOST - 1)
 }
 
-/// What this thread remembers of an ask, if nothing changed since.
+/// What this thread remembers of an ask, if nothing overlapping changed since.
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    let changed = BUFFERS_CHANGED.load(Ordering::Acquire);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
         let (a, n, at, shadow) = f.get(found_at(address, len))?;
         ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
     })?;
-    // Whoever takes the map to let a copy go that nobody holds finds it held
-    // now, or had counted before: then it is not handed out.
-    std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    if shadow.is_dead() {
+        return None;
+    }
+    (BUFFERS_CHANGED.load(Ordering::Acquire) == changed).then_some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.
@@ -5470,25 +5525,39 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let end = start + len;
+    let mut map = buffers_mut();
+    // Only invalidate thread-local `FOUND` caches if the new buffer overlaps an
+    // existing registered buffer (could become the new innermost match for an
+    // already-cached address).
+    let overlaps = map.range(..=(start, usize::MAX)).rev().take(64).any(|(_, e)| e.end > start)
+        || map.range((start, 0)..(end, 0)).next().is_some();
+    map.insert(
         (start, resource),
         Entry {
-            end: start + len,
+            end,
             shadow: None,
         },
     );
+    if overlaps {
+        BUFFERS_CHANGED.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if let Some(entry) = buffers_mut().remove(&(start, resource))
+        && let Some(shadow) = entry.shadow
+    {
+        shadow.dead.store(true, Ordering::Release);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -5523,6 +5592,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     }
     let n = gone.len() as u64;
     for shadow in gone {
+        shadow.dead.store(true, Ordering::Release);
         crate::host::retire(shadow);
     }
     n
@@ -5649,7 +5719,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
                     // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, BUFFERS_CHANGED.load(Ordering::Acquire), shadow);
                 }
                 return Some(shadow.clone());
             }
@@ -5660,7 +5730,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
         }
     }
-    let mut map = buffers();
+    let mut map = buffers_mut();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()

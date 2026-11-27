@@ -1363,6 +1363,27 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     nothing_new_in(&journal_read(), start, end, base, copied, ranged)
 }
 
+/// Fast path for [`nothing_new_in`] when the caller already proved lock-free
+/// that `[start, end)` lies inside a range copied whole at asking `ranged > 0`.
+pub(crate) fn nothing_new_ranged_in(j: &JournalRead, start: usize, end: usize, ranged: u64) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let known = published(start, end);
+    #[cfg(feature = "diagnostics")]
+    if known {
+        crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
+    }
+    if !known && !ahead_covers(&j.0.ahead, first, last) {
+        return false;
+    }
+    j.0.notes.all_below(first, last, ranged, |_, write| write <= ranged)
+}
+
+/// Same as [`nothing_new_ranged_in`], acquiring `JOURNAL.read()` once.
+pub(crate) fn nothing_new_ranged(start: usize, end: usize, ranged: u64) -> bool {
+    let j = journal_read();
+    nothing_new_ranged_in(&j, start, end, ranged)
+}
+
 /// Same as [`nothing_new`], reusing an already-held [`JournalRead`] guard so a
 /// batch of spans pays only one `JOURNAL.read()` lock acquisition.
 pub(crate) fn nothing_new_in(

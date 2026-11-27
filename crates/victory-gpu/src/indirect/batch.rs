@@ -14,49 +14,141 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::{Clamp, ClampBarrierPlan, PreInputUav, uav_barrier, uav_barrier_for};
+use super::{
+    Clamp, ClampBarrierPlan, PreInputUav, enhanced_buffer_barrier, uav_barrier, uav_barrier_for,
+    uav_capable,
+};
 use crate::host::transition;
 
 /// The jobs of one pass.
-pub(crate) const JOBS: u32 = 256;
+pub(crate) const JOBS: u32 = 512;
 /// The bytes of its table in upload memory: the count, then the jobs.
 pub(crate) const TABLE: u64 = 16 + 16 * JOBS as u64;
 /// The bytes of a clamped record's place in the scratch buffer.
 pub(crate) const SLOT: u32 = 32;
 /// The source buffers a pass can read.
-pub(crate) const SOURCES: usize = 4;
+pub(crate) const SOURCES: usize = 8;
 /// The most executions charged by one job: the most a record costs (2^26)
 /// as often still fits 32 bits.
 pub(crate) const TIMES: u32 = 31;
 
 pub(crate) const SOURCE: &str = r#"
-#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), UAV(u0), UAV(u1)"
+#if BUDGET_TRACK
+#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), SRV(t6), SRV(t7), SRV(t8), UAV(u0), UAV(u1)"
+#else
+#define RS "SRV(t0), SRV(t1), SRV(t2), SRV(t3), SRV(t4), SRV(t5), SRV(t6), SRV(t7), SRV(t8), UAV(u0)"
+#endif
 ByteAddressBuffer src0 : register(t0);
 ByteAddressBuffer src1 : register(t1);
 ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
-// The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
+ByteAddressBuffer src4 : register(t4);
+ByteAddressBuffer src5 : register(t5);
+ByteAddressBuffer src6 : register(t6);
+ByteAddressBuffer src7 : register(t7);
+// The count, 12 bytes of nothing, then per job: source (bits 0-2), kind
 // (4-7), words (8-11) and the executions that read it (16-31); the
 // record's offset in the source; its place in the scratch buffer; nothing.
-ByteAddressBuffer jobs : register(t4);
+ByteAddressBuffer jobs : register(t8);
 RWByteAddressBuffer dst_args : register(u0);
+#if BUDGET_TRACK
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+#endif
 static const uint GROUPS = 1u << 20;
+#if BUDGET_TRACK
 groupshared uint costs[64];
 groupshared uint fits[64];
 groupshared uint largest_asked;
 groupshared uint all_asked;
+#endif
 uint load(uint source, uint at) {
     if (source == 0) return src0.Load(at);
     if (source == 1) return src1.Load(at);
     if (source == 2) return src2.Load(at);
-    return src3.Load(at);
+    if (source == 3) return src3.Load(at);
+    if (source == 4) return src4.Load(at);
+    if (source == 5) return src5.Load(at);
+    if (source == 6) return src6.Load(at);
+    return src7.Load(at);
 }
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_GroupIndex) {
     uint count = jobs.Load(0);
+#if !BUDGET_TRACK
+    if (id.x >= count) {
+        return;
+    }
+    uint4 job = jobs.Load4(16 + id.x * 16);
+    uint kind = (job.x >> 4) & 15;
+    uint words = min((job.x >> 8) & 15, 5);
+    uint record[5] = {0, 0, 0, 0, 0};
+    for (uint w = 0; w < words; w++) {
+        record[w] = load(job.x & 7, job.y + w * 4);
+    }
+    if (kind <= 1) {
+        if (record[0] >= 1u << 23) {
+            record[0] = 0;
+            record[1] = 0;
+        }
+        record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
+    } else if (kind == 2) {
+        uint3 raw = uint3(record[0], record[1], record[2]);
+        uint3 g = min(raw, uint3(raw.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+            g = uint3(0, 0, 0);
+        }
+        record[0] = g.x;
+        record[1] = g.y;
+        record[2] = g.z;
+    } else if (kind == 11) {
+        // 1D indirect mesh dispatch (`DispatchMeshX`): 1 word in, 3 words (x, 1, 1) out.
+        uint x = record[0];
+        if (x == 0u || x > 65535u) {
+            record[0] = 0;
+            record[1] = 0;
+            record[2] = 0;
+        } else {
+            record[0] = x;
+            record[1] = 1;
+            record[2] = 1;
+        }
+    } else if (kind == 12) {
+        // Spread indirect compute dispatch: 3 words in, 5 words [row, asked_x, gx, gy, gz] out.
+        uint3 raw = uint3(record[0], record[1], record[2]);
+        uint row = 0;
+        uint asked_x = raw.x;
+        uint3 g;
+        if (raw.x > 65535u && raw.y >= 1u && raw.y <= 65535u && raw.z == 1u) {
+            uint rows = (raw.x + 65534u) / 65535u;
+            row = (raw.x + rows - 1u) / rows;
+            g = uint3(row, raw.y, rows);
+        } else {
+            g = min(raw, uint3(65535u, 65535u, 65535u));
+        }
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+            g = uint3(0, 0, 0);
+        }
+        record[0] = row;
+        record[1] = asked_x;
+        record[2] = g.x;
+        record[3] = g.y;
+        record[4] = g.z;
+    } else {
+        if (record[0] > 65535u) {
+            record[0] = 0;
+            record[1] = 0;
+            record[2] = 0;
+        }
+        record[1] = min(record[1], 1u);
+        record[2] = min(record[2], 1u);
+    }
+    uint out_words = (kind == 11) ? 3u : (kind == 12) ? 5u : words;
+    for (uint s = 0; s < out_words; s++) {
+        dst_args.Store(job.z + s * 4, record[s]);
+    }
+#else
     uint first = gid.x * 64u;
     if (first >= count) {
         return;
@@ -78,7 +170,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
         kind = (job.x >> 4) & 15;
         words = min((job.x >> 8) & 15, 5);
         for (uint w = 0; w < words; w++) {
-            record[w] = load(job.x & 3, job.y + w * 4);
+            record[w] = load(job.x & 7, job.y + w * 4);
         }
         if (kind <= 1) {
             if (record[0] >= 1u << 23) {
@@ -112,6 +204,29 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
                 record[2] = 1;
             }
             cost = record[0] * 128u;
+        } else if (kind == 12) {
+            // Spread indirect compute dispatch: 3 words in, 5 words [row, asked_x, gx, gy, gz] out.
+            uint3 raw = uint3(record[0], record[1], record[2]);
+            asked = max(raw.x, max(raw.y, raw.z));
+            uint row = 0;
+            uint asked_x = raw.x;
+            uint3 g;
+            if (raw.x > 65535u && raw.y >= 1u && raw.y <= 65535u && raw.z == 1u) {
+                uint rows = (raw.x + 65534u) / 65535u;
+                row = (raw.x + rows - 1u) / rows;
+                g = uint3(row, raw.y, rows);
+            } else {
+                g = min(raw, uint3(65535u, 65535u, 65535u));
+            }
+            if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
+                g = uint3(0, 0, 0);
+            }
+            cost = g.x * g.y * g.z * 64u;
+            record[0] = row;
+            record[1] = asked_x;
+            record[2] = g.x;
+            record[3] = g.y;
+            record[4] = g.z;
         } else {
             if (record[0] > 65535u) {
                 record[0] = 0;
@@ -195,16 +310,23 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint gi : SV_G
         return;
     }
     if (fits[gi] == 0) {
-        record[0] = 0;
-        record[1] = 0;
-        if (kind > 1) {
+        if (kind == 12) {
             record[2] = 0;
+            record[3] = 0;
+            record[4] = 0;
+        } else {
+            record[0] = 0;
+            record[1] = 0;
+            if (kind > 1) {
+                record[2] = 0;
+            }
         }
     }
-    uint out_words = (kind == 11) ? 3u : words;
+    uint out_words = (kind == 11) ? 3u : (kind == 12) ? 5u : words;
     for (uint s = 0; s < out_words; s++) {
         dst_args.Store(job.z + s * 4, record[s]);
     }
+#endif
 }
 "#;
 
@@ -318,20 +440,152 @@ impl Table {
 }
 
 /// Records the pass over the table at `jobs` (a host address) into `dst`,
-/// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
-/// earlier shader write (the title's argument passes), before what reads
-/// the clamped records.
+/// which is in state `before` and left readable as indirect arguments: after
+/// earlier shader writes (the title's argument passes), before what reads the
+/// clamped records. When `enhanced` is `Some`, uses Enhanced Barriers keeping
+/// `dst` in `COMMON` and scoping pre-clamp sync to `COMPUTE_SHADING` (or
+/// `ALL_SHADING` when `graphics_uav_dirty` is true).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    enhanced: Option<&ID3D12GraphicsCommandList7>,
+    graphics_uav_dirty: bool,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
-    (budget_res, budget): (Option<&ID3D12Resource>, u64),
+    budget: Option<(Option<&ID3D12Resource>, u64)>,
     sources: [u64; SOURCES],
     source_resources: &[&ID3D12Resource],
     jobs: u64,
     barrier_plan: ClampBarrierPlan,
 ) {
+    if let Some(list7) = enhanced {
+        let sync_before = if graphics_uav_dirty {
+            D3D12_BARRIER_SYNC_ALL_SHADING
+        } else {
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING
+        };
+        let mut buf_barriers: [D3D12_BUFFER_BARRIER; SOURCES + 2] =
+            std::array::from_fn(|_| D3D12_BUFFER_BARRIER::default());
+        let mut buf_len = 0usize;
+        let mut global_barrier = [D3D12_GLOBAL_BARRIER::default()];
+        let mut has_global = false;
+        match barrier_plan.pre_inputs {
+            PreInputUav::None => {}
+            PreInputUav::Global => {
+                global_barrier[0] = D3D12_GLOBAL_BARRIER {
+                    SyncBefore: sync_before,
+                    SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    AccessAfter: D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                };
+                has_global = true;
+            }
+            PreInputUav::Scoped => {
+                for &res in source_resources {
+                    if uav_capable(res) {
+                        buf_barriers[buf_len] = enhanced_buffer_barrier(
+                            res,
+                            sync_before,
+                            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                            D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+                        );
+                        buf_len += 1;
+                    }
+                }
+            }
+        }
+        if barrier_plan.pre_budget
+            && let Some((budget_res, _)) = budget
+        {
+            if let Some(res) = budget_res {
+                buf_barriers[buf_len] = enhanced_buffer_barrier(
+                    res,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                );
+                buf_len += 1;
+            } else if !has_global {
+                global_barrier[0] = D3D12_GLOBAL_BARRIER {
+                    SyncBefore: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    SyncAfter: D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                    AccessBefore: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    AccessAfter: D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                };
+                has_global = true;
+            }
+        }
+        if before == D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT {
+            buf_barriers[buf_len] = enhanced_buffer_barrier(
+                dst,
+                D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            );
+            buf_len += 1;
+        }
+        let mut pre_groups: [D3D12_BARRIER_GROUP; 2] =
+            std::array::from_fn(|_| D3D12_BARRIER_GROUP::default());
+        let mut pre_len = 0usize;
+        if has_global {
+            pre_groups[pre_len] = D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_GLOBAL,
+                NumBarriers: 1,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pGlobalBarriers: global_barrier.as_ptr(),
+                },
+            };
+            pre_len += 1;
+        }
+        if buf_len > 0 {
+            pre_groups[pre_len] = D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: buf_len as u32,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pBufferBarriers: buf_barriers.as_ptr(),
+                },
+            };
+            pre_len += 1;
+        }
+        let post_buf = [enhanced_buffer_barrier(
+            dst,
+            D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+            D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+        )];
+        let post_group = [D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_BUFFER,
+            NumBarriers: 1,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pBufferBarriers: post_buf.as_ptr(),
+            },
+        }];
+        // SAFETY: an open list; our root signature and pipeline; live buffers
+        // kept in COMMON for Enhanced Barriers.
+        unsafe {
+            if pre_len > 0 {
+                list7.Barrier(&pre_groups[..pre_len]);
+            }
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            for (i, source) in sources.into_iter().enumerate() {
+                l.SetComputeRootShaderResourceView(i as u32, source);
+            }
+            l.SetComputeRootShaderResourceView(SOURCES as u32, jobs);
+            l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 1, dst.GetGPUVirtualAddress());
+            if let Some((_, budget_gpu)) = budget {
+                l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 2, budget_gpu);
+            }
+            l.Dispatch(JOBS.div_ceil(64), 1, 1);
+            list7.Barrier(&post_group);
+        }
+        return;
+    }
+
     let mut first: [D3D12_RESOURCE_BARRIER; SOURCES + 2] =
         std::array::from_fn(|_| D3D12_RESOURCE_BARRIER::default());
     let mut first_len = 0usize;
@@ -348,7 +602,9 @@ pub(super) fn record(
             }
         }
     }
-    if barrier_plan.pre_budget {
+    if barrier_plan.pre_budget
+        && let Some((budget_res, _)) = budget
+    {
         first[first_len] = match budget_res {
             Some(res) => uav_barrier_for(res),
             None => uav_barrier(),
@@ -373,7 +629,9 @@ pub(super) fn record(
         }
         l.SetComputeRootShaderResourceView(SOURCES as u32, jobs);
         l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 1, dst.GetGPUVirtualAddress());
-        l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 2, budget);
+        if let Some((_, budget_gpu)) = budget {
+            l.SetComputeRootUnorderedAccessView(SOURCES as u32 + 2, budget_gpu);
+        }
         l.Dispatch(JOBS.div_ceil(64), 1, 1);
         // Only the clamped records have to transition to INDIRECT_ARGUMENT;
         // the next clamp in this list orders `budget` via a scoped UAV barrier.

@@ -82,9 +82,11 @@ pub(crate) struct Shadow {
     used: AtomicU64,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
+    #[cfg(feature = "diagnostics")]
     asked: [AtomicU64; 2],
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
+    #[cfg(feature = "diagnostics")]
     unsized_asks: AtomicU64,
     /// Whether shaders were ever declared to write it.
     written: std::sync::atomic::AtomicBool,
@@ -3997,7 +3999,14 @@ pub(crate) fn let_go_idle() {
                 .collect();
             window_victims(&entries, keep.saturating_sub(active_bytes))
         };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+        let gone: Vec<Arc<Shadow>> = victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect();
+        if !gone.is_empty() {
+            for shadow in &gone {
+                shadow.dead.store(true, Ordering::Release);
+            }
+            bump_shadow_epoch();
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -4006,7 +4015,6 @@ pub(crate) fn let_go_idle() {
         });
     }
     for shadow in gone {
-        shadow.dead.store(true, Ordering::Release);
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
@@ -4182,7 +4190,9 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            #[cfg(feature = "diagnostics")]
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
+            #[cfg(feature = "diagnostics")]
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
             id: {
@@ -6615,38 +6625,178 @@ struct Entry {
 /// written when a buffer comes, goes or gets its copy: readers share it.
 static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> = std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
-    // What threads remember of it ([`FOUND`]) is of before.
-    BUFFERS_CHANGED.fetch_add(1, Ordering::Release);
-    map
-}
-
 fn buffers_mut() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How often [`BUFFERS`] underwent an overlapping registration or in-place eviction.
-static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
+/// Monotonic generation bumped (with `Release` while holding the mutating table's
+/// write lock) on every insert, remove, eviction, or shadow replacement in
+/// [`BUFFERS`] or [`LOOSE`], invalidating thread-local lookup caches.
+static SHADOW_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn bump_shadow_epoch() {
+    SHADOW_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// Number of MRU spans kept per thread in [`SPANS`].
+const SPAN_CACHE_CAP: usize = 32;
+
+enum SpanRef {
+    /// Persistent buffer shadow from [`BUFFERS`] (cleared when [`SHADOW_EPOCH`] advances).
+    Buffer(Arc<Shadow>),
+    /// Loose window shadow from [`LOOSE`] (`Weak` so [`let_go_idle`]'s `strong_count == 1` stays exact).
+    Loose(std::sync::Weak<Shadow>),
+}
+
+struct SpanEntry {
+    start: u64,
+    end: u64,
+    shadow: SpanRef,
+}
+
+struct SpanCache {
+    epoch: u64,
+    entries: Vec<SpanEntry>,
+}
+
+impl SpanCache {
+    const fn new() -> Self {
+        Self {
+            epoch: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn sync(&mut self, epoch: u64) {
+        if self.epoch != epoch {
+            self.entries.clear();
+            self.epoch = epoch;
+        }
+    }
+
+    fn insert(&mut self, epoch: u64, start: u64, end: u64, shadow: SpanRef) {
+        self.sync(epoch);
+        if let Some(pos) = self.entries.iter().position(|e| e.start == start && e.end == end) {
+            self.entries[pos].shadow = shadow;
+            if pos > 0 {
+                self.entries[..=pos].rotate_right(1);
+            }
+            return;
+        }
+        if self.entries.len() >= SPAN_CACHE_CAP {
+            self.entries.pop();
+        }
+        self.entries.insert(0, SpanEntry { start, end, shadow });
+    }
+}
 
 /// Answers a thread remembers (covers ~6k live buffers without conflict thrashing).
 const FOUND_MOST: usize = 8192;
 
-/// An ask (address, bytes), the count of changes it was answered at, and the
-/// answer.
+/// An ask (address, bytes), the epoch it was answered at, and the answer.
 type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
 
 thread_local! {
+    /// Per-thread MRU span cache over non-overlapping sub-spans of [`BUFFERS`]
+    /// and buffer-free single-cell [`LOOSE`] windows: ring-buffer CBV, VB/IB,
+    /// and indirect-arg offsets inside the same persistent buffer all hit here
+    /// with zero global `RwLock` contention.
+    static SPANS: std::cell::RefCell<SpanCache> = const { std::cell::RefCell::new(SpanCache::new()) };
+
     /// The last answers of [`lookup`] out of [`BUFFERS`], by a hash of the
-    /// ask: the same buffers are asked about draw after draw, from five
-    /// threads, each time through the map's lock and a dozen of its nodes
-    /// (7 % of the recording threads' time, profile waits-1).
+    /// exact ask `(address, len)` for working sets wider than [`SPAN_CACHE_CAP`].
     static FOUND: std::cell::RefCell<Vec<Found>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Whether [`FOUND`] is kept (`VICTORY_QUICK_FIND=0`: not).
+/// Whether [`SPANS`] and [`FOUND`] are kept (`VICTORY_QUICK_FIND=0`: not).
 fn quick_find() -> bool {
     crate::toggled!("VICTORY_QUICK_FIND")
+}
+
+#[inline]
+fn note_loose_hit(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    // (Read first: the cache line is shared by all recording threads.)
+    let now = crate::host::moment();
+    if shadow.used.load(Ordering::Relaxed) != now {
+        shadow.used.store(now, Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        if shadow.asked[0].load(Ordering::Relaxed) > address {
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        }
+        if shadow.asked[1].load(Ordering::Relaxed) < end {
+            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        }
+        if unsized_ask {
+            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (address, end, unsized_ask);
+}
+
+fn span_find(address: u64, end: u64, unsized_ask: bool) -> Option<Arc<Shadow>> {
+    let epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+    SPANS.with(|cell| {
+        if let Ok(mut cache) = cell.try_borrow_mut() {
+            cache.sync(epoch);
+            if let Some(idx) = cache.entries.iter().position(|e| address >= e.start && end <= e.end) {
+                if idx > 0 {
+                    cache.entries[..=idx].rotate_right(1);
+                }
+                match &cache.entries[0].shadow {
+                    SpanRef::Buffer(shadow) => {
+                        if !shadow.is_dead() {
+                            return Some(shadow.clone());
+                        }
+                        cache.entries.remove(0);
+                    }
+                    SpanRef::Loose(weak) => {
+                        if let Some(shadow) = weak.upgrade()
+                            && !shadow.is_dead()
+                        {
+                            note_loose_hit(&shadow, address, end, unsized_ask);
+                            return Some(shadow);
+                        }
+                        cache.entries.remove(0);
+                    }
+                }
+            }
+            return None;
+        }
+        // Re-entrant fallback: read-only scan while an outer `with_in_place` borrows `SPANS`.
+        let cache = cell.try_borrow().ok()?;
+        if cache.epoch != epoch {
+            return None;
+        }
+        let entry = cache.entries.iter().find(|e| address >= e.start && end <= e.end)?;
+        match &entry.shadow {
+            SpanRef::Buffer(shadow) if !shadow.is_dead() => Some(shadow.clone()),
+            SpanRef::Loose(weak) => {
+                let shadow = weak.upgrade()?;
+                if shadow.is_dead() {
+                    return None;
+                }
+                note_loose_hit(&shadow, address, end, unsized_ask);
+                Some(shadow)
+            }
+            _ => None,
+        }
+    })
+}
+
+fn span_remember(epoch: u64, start: u64, end: u64, shadow: SpanRef) {
+    if SHADOW_EPOCH.load(Ordering::Acquire) != epoch {
+        return;
+    }
+    SPANS.with(|cell| {
+        if let Ok(mut cache) = cell.try_borrow_mut() {
+            cache.insert(epoch, start, end, shadow);
+        }
+    });
 }
 
 fn found_at(address: u64, len: u64) -> usize {
@@ -6654,28 +6804,31 @@ fn found_at(address: u64, len: u64) -> usize {
     (h >> 51) as usize & (FOUND_MOST - 1)
 }
 
-/// What this thread remembers of an ask, if nothing overlapping changed since.
+/// What this thread remembers of an exact ask, if [`SHADOW_EPOCH`] did not advance.
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::Acquire);
+    let epoch = SHADOW_EPOCH.load(Ordering::Acquire);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
         let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        ((*a, *n, *at) == (address, len, epoch)).then(|| shadow.upgrade()).flatten()
     })?;
     if shadow.is_dead() {
         return None;
     }
-    (BUFFERS_CHANGED.load(Ordering::Acquire) == changed).then_some(shadow)
+    (SHADOW_EPOCH.load(Ordering::Acquire) == epoch).then_some(shadow)
 }
 
-/// Remembers an answer given while `changed` was the count.
-fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
+/// Remembers an answer given while `epoch` was active.
+fn remember(address: u64, len: u64, epoch: u64, shadow: &Arc<Shadow>) {
+    if SHADOW_EPOCH.load(Ordering::Acquire) != epoch {
+        return;
+    }
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
             f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
         }
-        f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
+        f[found_at(address, len)] = (address, len, epoch, Arc::downgrade(shadow));
     });
 }
 
@@ -6687,11 +6840,6 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let end = start + len;
     let mut map = buffers_mut();
-    // Only invalidate thread-local `FOUND` caches if the new buffer overlaps an
-    // existing registered buffer (could become the new innermost match for an
-    // already-cached address).
-    let overlaps = map.range(..=(start, usize::MAX)).rev().take(64).any(|(_, e)| e.end > start)
-        || map.range((start, 0)..(end, 0)).next().is_some();
     map.insert(
         (start, resource),
         Entry {
@@ -6699,17 +6847,17 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
-    if overlaps {
-        BUFFERS_CHANGED.fetch_add(1, Ordering::Release);
-    }
+    bump_shadow_epoch();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if let Some(entry) = buffers_mut().remove(&(start, resource))
-        && let Some(shadow) = entry.shadow
-    {
-        shadow.dead.store(true, Ordering::Release);
+    let mut map = buffers_mut();
+    if let Some(entry) = map.remove(&(start, resource)) {
+        if let Some(shadow) = entry.shadow {
+            shadow.dead.store(true, Ordering::Release);
+        }
+        bump_shadow_epoch();
     }
 }
 
@@ -6757,7 +6905,14 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        let before = gone.len();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if gone.len() > before {
+            for shadow in &gone[before..] {
+                shadow.dead.store(true, Ordering::Release);
+            }
+            bump_shadow_epoch();
+        }
     }
     let has_buf = {
         let map = buffers_read();
@@ -6768,16 +6923,22 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     };
     if has_buf {
         // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers();
+        let mut map = buffers_mut();
+        let before = gone.len();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
         }
+        if gone.len() > before {
+            for shadow in &gone[before..] {
+                shadow.dead.store(true, Ordering::Release);
+            }
+            bump_shadow_epoch();
+        }
     }
     let n = gone.len() as u64;
     for shadow in gone {
-        shadow.dead.store(true, Ordering::Release);
         crate::host::retire(shadow);
     }
     n
@@ -6798,6 +6959,77 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
+}
+
+/// Calls `f` with the [`Shadow`] holding `[address, address + len)` if it is
+/// in-place, borrowing directly from the thread-local span cache on a hit to
+/// avoid both global `RwLock` acquisition and `Arc::clone`/`drop` traffic.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn with_in_place<R>(address: u64, len: u64, f: impl FnOnce(&Arc<Shadow>) -> R) -> Option<R> {
+    let end = address.checked_add(len.max(1))?;
+    if quick_find() {
+        let epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+        enum Probe {
+            BufferAtZero,
+            Loose(Arc<Shadow>),
+            Miss,
+        }
+        let probe = SPANS.with(|cell| {
+            let Ok(mut cache) = cell.try_borrow_mut() else {
+                return Probe::Miss;
+            };
+            cache.sync(epoch);
+            let Some(idx) = cache.entries.iter().position(|e| address >= e.start && end <= e.end) else {
+                return Probe::Miss;
+            };
+            if idx > 0 {
+                cache.entries[..=idx].rotate_right(1);
+            }
+            match &cache.entries[0].shadow {
+                SpanRef::Buffer(shadow) => {
+                    if !shadow.is_dead() {
+                        Probe::BufferAtZero
+                    } else {
+                        cache.entries.remove(0);
+                        Probe::Miss
+                    }
+                }
+                SpanRef::Loose(weak) => {
+                    if let Some(shadow) = weak.upgrade()
+                        && !shadow.is_dead()
+                    {
+                        note_loose_hit(&shadow, address, end, len <= 1);
+                        Probe::Loose(shadow)
+                    } else {
+                        cache.entries.remove(0);
+                        Probe::Miss
+                    }
+                }
+            }
+        });
+        match probe {
+            Probe::BufferAtZero => {
+                return SPANS.with(|cell| {
+                    let cache = cell.borrow();
+                    if let Some(SpanEntry {
+                        shadow: SpanRef::Buffer(shadow),
+                        ..
+                    }) = cache.entries.first()
+                    {
+                        shadow.in_place().then(|| f(shadow))
+                    } else {
+                        None
+                    }
+                });
+            }
+            Probe::Loose(shadow) => {
+                return shadow.in_place().then(|| f(&shadow));
+            }
+            Probe::Miss => {}
+        }
+    }
+    let shadow = lookup(address, len, false)?;
+    shadow.in_place().then(|| f(&shadow))
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -6892,26 +7124,67 @@ pub(crate) fn scoped_barrier_shadow(address: u64, len: u64) -> Option<Arc<Shadow
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
-    let quick = quick_find();
-    if quick && let Some(shadow) = found(address, len) {
-        return Some(shadow);
-    }
     let end = address.checked_add(len.max(1))?;
+    let quick = quick_find();
+    if quick {
+        if let Some(shadow) = span_find(address, end, len <= 1) {
+            return Some(shadow);
+        }
+        if let Some(shadow) = found(address, len) {
+            return Some(shadow);
+        }
+    }
     {
         let map = buffers_read();
-        match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+        let epoch = SHADOW_EPOCH.load(Ordering::Acquire);
+        let mut skipped_max_end = 0u64;
+        let mut matched: Option<((u64, usize), &Entry)> = None;
+        for (k, e) in map.range(..=(address, usize::MAX)).rev().take(64) {
+            if e.end >= end {
+                matched = Some((*k, e));
+                break;
+            }
+            skipped_max_end = skipped_max_end.max(e.end);
+        }
+        match matched {
             // The copy is made already (nearly always).
-            Some((_, Entry { shadow: Some(shadow), .. })) => {
+            Some((key, Entry { end: entry_end, shadow: Some(shadow) })) => {
+                let out = shadow.clone();
                 if quick {
-                    // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::Acquire), shadow);
+                    let safe_start = key.0.max(skipped_max_end);
+                    let next_after = map
+                        .range((std::ops::Bound::Excluded((address, usize::MAX)), std::ops::Bound::Unbounded))
+                        .next()
+                        .map(|(k, _)| k.0);
+                    let safe_end = (*entry_end).min(next_after.unwrap_or(u64::MAX));
+                    drop(map);
+                    if safe_start <= address && end <= safe_end {
+                        span_remember(epoch, safe_start, safe_end, SpanRef::Buffer(out.clone()));
+                    }
+                    remember(address, len, epoch, &out);
                 }
-                return Some(shadow.clone());
+                return Some(out);
             }
             Some(_) => {}
             None => {
+                let loose_span = if quick && !fine() {
+                    let (cell_start, cell_len) = window_of(address, end, WINDOW);
+                    let cell_end = cell_start.saturating_add(WINDOW);
+                    let free = cell_len == WINDOW
+                        && map.range(..=(cell_start, usize::MAX)).rev().take(64).all(|(_, e)| e.end <= cell_start)
+                        && map.range((cell_start, 0)..(cell_end, 0)).next().is_none();
+                    free.then_some((cell_start, cell_end))
+                } else {
+                    None
+                };
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                let shadow = loose(address, end, len <= 1, any)?;
+                if let Some((cell_start, cell_end)) = loose_span
+                    && shadow.span() == (cell_start, WINDOW)
+                {
+                    span_remember(epoch, cell_start, cell_end, SpanRef::Loose(Arc::downgrade(&shadow)));
+                }
+                return Some(shadow);
             }
         }
     }
@@ -6939,10 +7212,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         let big = cards() && (size >= card_limits().0 || card_all());
         if let Some(placed) = crate::port::place_for_buffer(key.0, len, big) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            bump_shadow_epoch();
             return entry.shadow.clone();
         }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            bump_shadow_epoch();
             return entry.shadow.clone();
         }
         let host = host()?;
@@ -6969,6 +7244,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 // VRAM copy refused or ineligible: prefer in-place over a L0 `shared_buffer` copy.
                 if big && let Some(placed) = crate::port::place_for_buffer(key.0, len, false) {
                     entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+                    bump_shadow_epoch();
                     return entry.shadow.clone();
                 }
                 let (buffer, data) = host.shared_buffer(size)?;
@@ -7000,6 +7276,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             gpu_only_register(&shadow);
         }
         entry.shadow = Some(shadow.clone());
+        bump_shadow_epoch();
         drop(map);
         demote_overlapping_gpu_only(key.0, len, new_id, "overlapping buffer shadow");
         return Some(shadow);
@@ -7210,22 +7487,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
+    let note = |shadow: &Shadow| note_loose_hit(shadow, address, end, unsized_ask);
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
@@ -7258,6 +7520,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(&shadow);
         LOOSE_MAX_LEN.fetch_max(len, Ordering::Relaxed);
         map.insert((start, len), shadow.clone());
+        bump_shadow_epoch();
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -7272,6 +7535,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(&shadow);
         LOOSE_MAX_LEN.fetch_max(len, Ordering::Relaxed);
         map.insert((start, len), shadow.clone());
+        bump_shadow_epoch();
         return Some(shadow);
     }
     let host = host()?;
@@ -7296,6 +7560,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 note(&shadow);
                 LOOSE_MAX_LEN.fetch_max(len, Ordering::Relaxed);
                 map.insert((start, len), shadow.clone());
+                bump_shadow_epoch();
                 return Some(shadow);
             }
             let (buffer, data) = host.shared_buffer(len)?;
@@ -7321,6 +7586,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     LOOSE_MAX_LEN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());
+    bump_shadow_epoch();
     drop(map);
     demote_overlapping_gpu_only(start, len, new_id, "overlapping loose window");
     Some(shadow)
@@ -7801,12 +8067,138 @@ mod window_tests {
         assert_eq!(super::card_room_kept_for(2048 * MIB, 738 * MIB, 0), 62 * MIB);
         assert_eq!(super::card_room_kept_for(2048 * MIB, 738 * MIB, 100 * MIB), 0);
     }
+
+    /// Helper that creates an unbacked `Shadow` (with optional fake `InPlace`)
+    /// leaked once via `mem::forget` so fake COM pointers are never released.
+    fn dummy_shadow(start: u64, len: u64, in_place: bool) -> std::sync::Arc<super::Shadow> {
+        use windows::Win32::Graphics::Direct3D12::{ID3D12Heap, ID3D12Resource};
+        // SAFETY: dummy interface pointers never dereferenced by unit tests;
+        // `mem::forget` prevents `Drop` from ever invoking `Release`.
+        let buffer: ID3D12Resource = unsafe { std::mem::transmute(8usize) };
+        let mut shadow = super::Shadow::new(buffer, std::ptr::null_mut(), start, start, len);
+        if in_place {
+            let heap: ID3D12Heap = unsafe { std::mem::transmute(16usize) };
+            shadow.place = Some(super::InPlace {
+                heap,
+                bias: 0,
+                _view: None,
+                pinned: 0,
+            });
+            super::IN_PLACE_BOUNDS[0].fetch_min(start, std::sync::atomic::Ordering::Relaxed);
+            super::IN_PLACE_BOUNDS[1].fetch_max(start + len, std::sync::atomic::Ordering::Relaxed);
+        }
+        let shadow = std::sync::Arc::new(shadow);
+        std::mem::forget(shadow.clone());
+        shadow
+    }
+
+    fn insert_dummy_buffer(res: usize, start: u64, len: u64, shadow: std::sync::Arc<super::Shadow>) {
+        let mut map = super::buffers_mut();
+        map.insert(
+            (start, res),
+            super::Entry {
+                end: start + len,
+                shadow: Some(shadow),
+            },
+        );
+        super::bump_shadow_epoch();
+    }
+
+    static SPAN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn tls_span_cache_hits_ring_offsets_and_respects_boundaries() {
+        let _guard = SPAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = 0x7_F100_0000_0000u64;
+        let len = 0x10_0000u64;
+        let res = 0xDEAD_0001usize;
+        let shadow = dummy_shadow(base, len, true);
+        insert_dummy_buffer(res, base, len, shadow.clone());
+
+        // First lookup populates the TLS span cache.
+        let got = super::find(base + 0x100, 256).expect("hit");
+        assert!(std::sync::Arc::ptr_eq(&got, &shadow));
+        drop(got);
+
+        // Distinct offsets/lengths inside the same span hit TLS directly (verified via `span_find`).
+        for off in [0u64, 0x200, 0x4_1234, len - 64] {
+            let hit = super::span_find(base + off, base + off + 64, false).expect("TLS span hit");
+            assert!(std::sync::Arc::ptr_eq(&hit, &shadow));
+        }
+
+        // `with_in_place` borrows directly from TLS without incrementing `Arc::strong_count`.
+        let count_before = std::sync::Arc::strong_count(&shadow);
+        let id = super::with_in_place(base + 0x8000, 256, |s| {
+            assert_eq!(std::sync::Arc::strong_count(s), count_before);
+            s.id()
+        });
+        assert_eq!(id, Some(shadow.id()));
+
+        // Boundary misses: before start, past end, and straddling end must miss the TLS span cache.
+        assert!(super::span_find(base - 16, base + 16, false).is_none());
+        assert!(super::span_find(base + len - 16, base + len + 16, false).is_none());
+        assert!(super::span_find(base + len, base + len + 1, true).is_none());
+
+        // Clean up and verify `unregister` bumps `SHADOW_EPOCH` and invalidates TLS.
+        let epoch_before = super::SHADOW_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        super::unregister(res, base);
+        assert!(super::SHADOW_EPOCH.load(std::sync::atomic::Ordering::Acquire) > epoch_before);
+        assert!(shadow.is_dead());
+        assert!(super::span_find(base + 0x100, base + 0x200, false).is_none());
+    }
+
+    #[test]
+    fn tls_span_cache_handles_nested_buffers_and_epoch_invalidation() {
+        let _guard = SPAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = 0x7_F200_0000_0000u64;
+        let outer_len = 0x10_0000u64;
+        let inner_off = 0x4_0000u64;
+        let inner_len = 0x1_0000u64;
+        let outer_res = 0xDEAD_0010usize;
+        let inner_res = 0xDEAD_0011usize;
+
+        let outer = dummy_shadow(base, outer_len, false);
+        insert_dummy_buffer(outer_res, base, outer_len, outer.clone());
+
+        // Non-in-place shadow returns None from `with_in_place` while populating TLS.
+        assert!(super::with_in_place(base + 0x1000, 256, |_| ()).is_none());
+        assert!(super::span_find(base + inner_off + 0x100, base + inner_off + 0x200, false).is_some());
+
+        // Registering an inner buffer bumps `SHADOW_EPOCH`, invalidating the full outer span.
+        let inner = dummy_shadow(base + inner_off, inner_len, true);
+        insert_dummy_buffer(inner_res, base + inner_off, inner_len, inner.clone());
+        assert!(super::span_find(base + 0x1000, base + 0x1100, false).is_none());
+
+        // Lookup below inner caches only `[base, base + inner_off)`, never shadowing inner.
+        let below = super::find(base + 0x1000, 256).expect("outer below");
+        assert!(std::sync::Arc::ptr_eq(&below, &outer));
+        assert!(super::span_find(base + inner_off + 0x100, base + inner_off + 0x200, false).is_none());
+
+        // Lookup inside inner resolves to `inner` and caches `[inner_start, inner_end)`.
+        let inside = super::find(base + inner_off + 0x100, 256).expect("inner");
+        assert!(std::sync::Arc::ptr_eq(&inside, &inner));
+
+        // Lookup above inner caches `[inner_end, outer_end)` and resolves to `outer`.
+        let above = super::find(base + inner_off + inner_len + 0x100, 256).expect("outer above");
+        assert!(std::sync::Arc::ptr_eq(&above, &outer));
+        assert!(super::span_find(base + outer_len - 256, base + outer_len, false).is_some());
+
+        // `in_place_let_go` evicts `inner`, marks it dead, and invalidates TLS.
+        let evicted = super::in_place_let_go(base + inner_off, inner_len);
+        assert_eq!(evicted, 1);
+        assert!(inner.is_dead());
+        assert!(super::span_find(base + inner_off + 0x100, base + inner_off + 0x200, false).is_none());
+
+        // Clean up.
+        super::unregister(inner_res, base + inner_off);
+        super::unregister(outer_res, base);
+    }
 }
 
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();

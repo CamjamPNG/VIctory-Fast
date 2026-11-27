@@ -1734,20 +1734,16 @@ mod tests {
     }
 }
 
-/// The batches of clamped records in one scratch buffer
-/// ([`HostList::batch_place`]).
-const BATCHES: u32 = 32;
-
 /// Pooled indirect-batch UAV buffer in `D3D12_RESOURCE_STATE_COMMON`, shared
 /// across all `HostList`s so idle lists never retain duplicate VRAM buffers.
 struct BatchBuf(ID3D12Resource);
 // SAFETY: D3D12 resources are free-threaded; buffers enter the pool only after
 // their owning list's last GPU submission has completed and transitioned them
-// back to COMMON.
+// back to COMMON (or kept them in COMMON under Enhanced Barriers).
 unsafe impl Send for BatchBuf {}
 
 static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
-const SPARE_BATCH_MAX: usize = 64;
+const SPARE_BATCH_MAX: usize = 256;
 
 fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
     if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
@@ -1787,6 +1783,8 @@ pub(crate) struct HostList {
     list1: OnceLock<Option<ID3D12GraphicsCommandList1>>,
     /// Cached `ID3D12GraphicsCommandList6` interface (avoids COM `QueryInterface` per `DispatchMesh`).
     list6: OnceLock<Option<ID3D12GraphicsCommandList6>>,
+    /// Cached `ID3D12GraphicsCommandList7` interface (for Enhanced Barriers).
+    list7: OnceLock<Option<ID3D12GraphicsCommandList7>>,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -3410,6 +3408,10 @@ struct Deferred {
     /// because an earlier list in the same `ExecuteCommandLists` may have
     /// unflushed UAV writes.
     uav_clean: bool,
+    /// Whether a graphics draw that can store to buffers ran since the last
+    /// global UAV sync on this recording (determines whether Enhanced pre-clamp
+    /// barriers need `ALL_SHADING` instead of `COMPUTE_SHADING`).
+    graphics_uav_dirty: bool,
     /// The indirect scratch buffer (`HostList::indirect_args`, by its
     /// interface pointer) that a clamp in this recording left readable as
     /// indirect arguments; 0 if none. It stays readable until the next
@@ -3474,6 +3476,7 @@ impl Deferred {
         self.has_placed = false;
         self.budget_used = false;
         self.uav_clean = false;
+        self.graphics_uav_dirty = false;
         self.indirect_readable = 0;
     }
 
@@ -5505,6 +5508,7 @@ impl Host {
                 list,
                 list1: OnceLock::new(),
                 list6: OnceLock::new(),
+                list7: OnceLock::new(),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
@@ -8067,6 +8071,33 @@ impl HostList {
         self.list6.get_or_init(|| self.list.cast().ok()).as_ref()
     }
 
+    #[inline]
+    pub(crate) fn list7(&self) -> Option<&ID3D12GraphicsCommandList7> {
+        self.list7.get_or_init(|| self.list.cast().ok()).as_ref()
+    }
+
+    /// Returns `ID3D12GraphicsCommandList7` when the host device supports
+    /// Enhanced Barriers (`D3D12_FEATURE_D3D12_OPTIONS12::EnhancedBarriersSupported`).
+    pub(crate) fn enhanced_barriers(&self) -> Option<&ID3D12GraphicsCommandList7> {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        let supported = *SUPPORTED.get_or_init(|| {
+            let Some(host) = host() else {
+                return false;
+            };
+            let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            // SAFETY: a feature structure of its size.
+            let known = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS12,
+                    (&raw mut o).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+                )
+            };
+            known.is_ok() && o.EnhancedBarriersSupported.as_bool()
+        });
+        supported.then(|| self.list7()).flatten()
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -9289,13 +9320,29 @@ impl HostList {
     /// Marks that a global UAV barrier has flushed all prior UAV writes on this
     /// recording.
     pub(crate) fn mark_uav_clean(&self) {
-        self.deferred().uav_clean = true;
+        let mut deferred = self.deferred();
+        deferred.uav_clean = true;
+        deferred.graphics_uav_dirty = false;
     }
 
     /// Marks that a shader dispatch, UAV-capable draw, or GPU buffer copy may
     /// have written a UAV since the last global UAV barrier on this recording.
     pub(crate) fn mark_uav_dirty(&self) {
         self.deferred().uav_clean = false;
+    }
+
+    /// Whether a graphics draw that can store to buffers ran since the last
+    /// global UAV sync on this recording.
+    pub(crate) fn is_graphics_uav_dirty(&self) -> bool {
+        self.deferred().graphics_uav_dirty
+    }
+
+    /// Marks that a graphics draw capable of storing to buffers ran on this
+    /// recording.
+    pub(crate) fn mark_graphics_uav_dirty(&self) {
+        let mut deferred = self.deferred();
+        deferred.uav_clean = false;
+        deferred.graphics_uav_dirty = true;
     }
 
     /// Records a global `NULL` UAV barrier on this list unless redundant
@@ -9309,8 +9356,11 @@ impl HostList {
                 return false;
             }
             deferred.uav_clean = true;
+            deferred.graphics_uav_dirty = false;
         } else {
-            self.deferred().uav_clean = true;
+            let mut deferred = self.deferred();
+            deferred.uav_clean = true;
+            deferred.graphics_uav_dirty = false;
         }
         // SAFETY: an open list; a null-resource UAV barrier is always valid.
         unsafe { self.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
@@ -9320,7 +9370,7 @@ impl HostList {
     /// The budget's words in the card's own memory ([`card_budget`]), if
     /// the list can zero them itself (`WriteBufferImmediate`).
     fn make_card_budget(&self) -> Option<ID3D12Resource> {
-        if !card_budget() {
+        if !crate::indirect::budget_enabled() || !card_budget() {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
@@ -9333,6 +9383,9 @@ impl HostList {
     /// copy of the budget: common, written as a copy, then left for
     /// unordered access until the list closes ([`HostList::card_budget_out`]).
     fn zero_card_budget(&self, card: &ID3D12Resource) {
+        if !crate::indirect::budget_enabled() {
+            return;
+        }
         let Ok(list2) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
             return;
         };
@@ -9342,6 +9395,27 @@ impl HostList {
             Dest: at + offset,
             Value: 0,
         });
+        if let Some(list7) = crate::indirect::enhanced_clamp_list(self) {
+            let post = [crate::indirect::enhanced_buffer_barrier(
+                card,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_ACCESS_COPY_DEST,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            )];
+            // SAFETY: an open list; `card` stays in COMMON under Enhanced Barriers.
+            unsafe {
+                list2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+                list7.Barrier(&[D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_BUFFER,
+                    NumBarriers: 1,
+                    Anonymous: D3D12_BARRIER_GROUP_0 {
+                        pBufferBarriers: post.as_ptr(),
+                    },
+                }]);
+            }
+            return;
+        }
         // SAFETY: an open list; the buffer is the list's own and in the
         // common state at the start of every recording.
         unsafe {
@@ -9363,7 +9437,7 @@ impl HostList {
     /// of the budget: its notes on mesh records go to the mapped words
     /// (read at the next submission), and it goes back to common.
     fn card_budget_out(&self) {
-        if !self.deferred().budget_zeroed {
+        if !crate::indirect::budget_enabled() || !self.deferred().budget_zeroed {
             return;
         }
         let (Some(Some(card)), Some(Some((mapped, _)))) =
@@ -9371,6 +9445,27 @@ impl HostList {
         else {
             return;
         };
+        if let Some(list7) = crate::indirect::enhanced_clamp_list(self) {
+            let pre = [crate::indirect::enhanced_buffer_barrier(
+                card,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                D3D12_BARRIER_SYNC_COPY,
+                D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                D3D12_BARRIER_ACCESS_COPY_SOURCE,
+            )];
+            // SAFETY: an open list; both buffers stay in COMMON under Enhanced Barriers.
+            unsafe {
+                list7.Barrier(&[D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_BUFFER,
+                    NumBarriers: 1,
+                    Anonymous: D3D12_BARRIER_GROUP_0 {
+                        pBufferBarriers: pre.as_ptr(),
+                    },
+                }]);
+                self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            }
+            return;
+        }
         // SAFETY: an open list; both buffers are the list's own. The
         // mapped one is promoted from common to the copy destination.
         unsafe {
@@ -9417,40 +9512,39 @@ impl HostList {
         Some(buffer)
     }
 
-    /// Where the next batch of clamped records goes: a device-local buffer
-    /// the list keeps from recording to recording, the batch's place in it
-    /// and the state the buffer is in. Every batch of a recording has a place
-    /// of its own: the executions before it may still read theirs.
+    /// Where the next batch of clamped records goes: a dedicated device-local
+    /// buffer per batch (starting in `COMMON` at offset 0) so consecutive
+    /// batches never drain prior `ExecuteIndirect` reads via
+    /// `INDIRECT_ARGUMENT -> UNORDERED_ACCESS` transitions.
     pub(crate) fn batch_place(&self) -> Option<(ID3D12Resource, u32, D3D12_RESOURCE_STATES)> {
         use crate::indirect::batch::{JOBS, SLOT};
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
-        if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
+        let index = args.1 as usize;
+        if index == args.0.len() {
+            let size = u64::from(JOBS * SLOT).next_multiple_of(64 << 10);
             let made = take_batch_buffer(size)?;
             args.0.push(made);
         }
         args.1 += 1;
-        // (Its first batch finds it as the recording before left it:
-        // `batches_common`.)
-        let state = if i == 0 { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT };
-        Some((args.0[buffer].clone(), i * JOBS * SLOT, state))
+        Some((args.0[index].clone(), 0, D3D12_RESOURCE_STATE_COMMON))
     }
 
-    /// Before the list closes: the scratch buffers of the batched clamps go
-    /// back to the common state, where the next recording expects them.
+    /// Before the list closes: returns batch scratch buffers to `COMMON` when
+    /// legacy barriers were used. Under Enhanced Barriers the buffers never
+    /// leave `COMMON`, so no closing barriers are needed.
     fn batches_common(&self) {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
+        let used = std::mem::take(&mut args.1) as usize;
+        if used == 0 || crate::indirect::enhanced_clamp_list(self).is_some() {
+            return;
+        }
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
             .iter()
             .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
             .collect();
-        if !barriers.is_empty() {
-            // SAFETY: an open list and live buffers this recording left in
-            // `INDIRECT_ARGUMENT`.
-            unsafe { self.list.ResourceBarrier(&barriers) };
-        }
+        // SAFETY: an open list and live buffers this recording left in
+        // `INDIRECT_ARGUMENT`.
+        unsafe { self.list.ResourceBarrier(&barriers) };
     }
 
     /// Moves `scratch` back to the common state if a clamp left it readable
@@ -9458,7 +9552,8 @@ impl HostList {
     /// list's first clamp expects it. Done before the list closes and before
     /// a bigger scratch buffer replaces it: one barrier per list (where
     /// there was one per indirect execution), and the list ends as it
-    /// begins however it is submitted.
+    /// begins however it is submitted. Under Enhanced Barriers `scratch`
+    /// stays in `COMMON`, so no closing legacy transition is needed.
     fn indirect_common(&self, scratch: &ID3D12Resource) {
         {
             let mut deferred = self.deferred();
@@ -9466,6 +9561,9 @@ impl HostList {
                 return;
             }
             deferred.indirect_readable = 0;
+        }
+        if crate::indirect::enhanced_clamp_list(self).is_some() {
+            return;
         }
         let barrier = transition(
             scratch,

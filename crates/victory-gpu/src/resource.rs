@@ -1198,6 +1198,10 @@ pub(crate) struct HostTexture {
     /// only when the source actually changed. Starts at 1 so the first alias
     /// read always syncs.
     pub(crate) write_gen: std::sync::atomic::AtomicU64,
+    /// Non-empty when created via `ID3D12Device10::CreateCommittedResource3`
+    /// with D3D12 Relaxed Format Casting: every view format in this list can
+    /// be bound directly on `texture` without an alias copy.
+    castable: &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -1518,17 +1522,182 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
-    use std::sync::atomic::Ordering::Relaxed;
+fn alias_copy_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if this.is_null()
-        || !*ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "0"))
+}
+
+#[cfg(windows)]
+fn alias_copy_whole() -> bool {
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"))
+}
+
+#[cfg(windows)]
+fn relaxed_cast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAXED_CAST").is_none_or(|v| v != "0"))
+}
+
+/// Whether `device` supports `D3D12_FEATURE_DATA_D3D12_OPTIONS12::RelaxedFormatCastingSupported`
+/// and exposes `ID3D12Device10` (`CreateCommittedResource3`).
+#[cfg(windows)]
+fn device_supports_relaxed_casting(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::core::Interface;
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: plain feature query into our own structure.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok();
+    ok && options.RelaxedFormatCastingSupported.as_bool() && device.cast::<ID3D12Device10>().is_ok()
+}
+
+/// Whether D3D12 Relaxed Format Casting is enabled (`VICTORY_RELAXED_CAST`,
+/// default `1`; `0` disables for A/B testing) and supported by `device`.
+#[cfg(windows)]
+pub(crate) fn relaxed_casting_supported(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+) -> bool {
+    if !relaxed_cast_enabled() {
+        return false;
+    }
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let supported = device_supports_relaxed_casting(device);
+        tracing::info!(supported, "D3D12 relaxed format casting (VICTORY_RELAXED_CAST)");
+        supported
+    })
+}
+
+/// Castable view formats for a normalized host texture description `desc`.
+/// Non-empty for non-depth, non-MSAA, SRV-readable UAV 32-bit `R32_*` textures
+/// so `R9G9B9E5_SHAREDEXP` SRVs can bind directly on the `R32_UINT` resource.
+#[cfg(windows)]
+fn castable_formats_for(
+    desc: &ResourceDesc,
+) -> &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT] {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    const R32_CASTABLE: &[DXGI_FORMAT] = &[
+        DXGI_FORMAT_R32_UINT,
+        DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R32_SINT,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+    ];
+    if desc.dimension == BUFFER
+        || desc.sample_count > 1
+        || desc.flags & UNORDERED == 0
+        || desc.flags & (DEPTH | DENY_SHADER_RESOURCE) != 0
     {
+        return &[];
+    }
+    match desc.format {
+        // R32_TYPELESS (39), R32_FLOAT (41), R32_UINT (42), R32_SINT (43)
+        39 | 41 | 42 | 43 => R32_CASTABLE,
+        _ => &[],
+    }
+}
+
+/// For a placed texture SRV at `address` with title resource description `desc`
+/// and view format `view_format` (0 = placed resource's own format), returns
+/// the live host-written target resource at `address` if its geometry matches
+/// and its host copy supports relaxed format casting to that SRV format.
+#[cfg(windows)]
+pub(crate) fn relaxed_alias_target(
+    address: u64,
+    desc: &[u32; 14],
+    view_format: u32,
+) -> Option<This> {
+    if address == 0 || !alias_copy_on() || !relaxed_cast_enabled() {
         return None;
     }
-    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let whole =
-        *WHOLE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_none_or(|v| v != "1"));
+    let host = crate::host::host()?;
+    if !relaxed_casting_supported(&host.device) {
+        return None;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let whole = alias_copy_whole();
+    let one = |d: &ResourceDesc| {
+        d.dimension != BUFFER
+            && d.mip_levels >= 1
+            && d.depth_or_array_size >= 1
+            && (whole || (d.mip_levels == 1 && d.depth_or_array_size == 1))
+            && d.sample_count <= 1
+    };
+    if !fills(&d) || !one(&d) {
+        return None;
+    }
+    let fmt = pc_format(if view_format != 0 { view_format } else { d.format });
+    // Under `TARGETS_AT`'s lock, verify the target matches and bump its refcount
+    // so it stays alive while we inspect/create its host copy outside the lock.
+    let (other, o_fmt) = {
+        const DEPTH: u32 = 0x2;
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        let other = *targets.get(&address)? as This;
+        let o = resource(other);
+        let same = one(&o.desc)
+            && o.desc.dimension == d.dimension
+            && o.desc.width == d.width
+            && o.desc.height == d.height
+            && o.desc.mip_levels == d.mip_levels
+            && o.desc.depth_or_array_size == d.depth_or_array_size
+            && o.desc.flags & DEPTH == 0
+            && target_format(o.desc.format) == o.desc.format
+            && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(d.format));
+        if !same || !crate::object::add_ref_alive(other) {
+            return None;
+        }
+        (other, o.desc.format)
+    };
+    let _held = Held(other);
+    let copy = host_copy(other)?;
+    if !copy.can_cast(fmt) {
+        return None;
+    }
+    static LOGGED: std::sync::Mutex<std::collections::BTreeSet<[u32; 6]>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let key = [
+        d.width as u32,
+        d.height,
+        u32::from(d.depth_or_array_size),
+        u32::from(d.mip_levels),
+        o_fmt,
+        fmt,
+    ];
+    let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if logged.len() < 64 && logged.insert(key) {
+        tracing::info!(
+            texture = ?other,
+            width = d.width,
+            height = d.height,
+            layers = d.depth_or_array_size,
+            mips = d.mip_levels,
+            written_as = o_fmt,
+            read_as = fmt,
+            "format-aliased view bound directly via D3D12 relaxed format casting (no alias copy)"
+        );
+    }
+    Some(other)
+}
+
+#[cfg(windows)]
+pub(crate) fn alias_of(this: This) -> Option<This> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || !alias_copy_on() {
+        return None;
+    }
+    let whole = alias_copy_whole();
     let r = resource(this);
     // A level count of 0 asks for a full chain: not counted here.
     let one = |d: &ResourceDesc| {
@@ -1672,7 +1841,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
-            let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true).ok() } else { None };
+            let reserved = if partly {
+                host_texture_as(&r.desc, r.host.state, clear, true)
+                    .ok()
+                    .map(|(t, _, _)| t)
+            } else {
+                None
+            };
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
@@ -1693,12 +1868,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let first = wanted.min(viewed);
             base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
         }
-        let texture = match texture {
-            Some(texture) => Ok(texture),
+        let made_texture = match texture {
+            Some(texture) => Ok((texture, &[][..], false)),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
-        let texture = match texture {
-            Ok(texture) => texture,
+        let (texture, castable, initial_common) = match made_texture {
+            Ok(made) => made,
             Err(NoTexture::Refused) => {
                 r.host.refused.store(true, Relaxed);
                 return None;
@@ -1729,11 +1904,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 "depth texture with unordered access"
             );
         }
-        let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+        // `CreateCommittedResource3` starts in `D3D12_BARRIER_LAYOUT_COMMON`
+        // (legacy state `COMMON = 0`); `plan_prelude` transitions on first use.
+        let state = if initial_common {
+            0
+        } else {
+            crate::host::legal_state(&texture, crate::host::texture_state(r.host.state))
+        };
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.castable = castable;
         host.base = base;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
@@ -2438,6 +2620,16 @@ impl HostTexture {
         self.flags
     }
 
+    pub(crate) fn castable_formats(
+        &self,
+    ) -> &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT] {
+        self.castable
+    }
+
+    pub(crate) fn can_cast(&self, format: u32) -> bool {
+        self.castable.iter().any(|f| f.0 as u32 == format)
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
@@ -2458,6 +2650,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             flags,
             write_gen: std::sync::atomic::AtomicU64::new(1),
+            castable: &[],
         }
     }
 
@@ -2484,6 +2677,7 @@ impl HostTexture {
             ahead: crate::texture::ahead::fresh(),
             flags,
             write_gen: std::sync::atomic::AtomicU64::new(1),
+            castable: &[],
         }
     }
 }
@@ -2595,14 +2789,76 @@ fn no_texture(code: HRESULT) -> NoTexture {
     if code == E_OUTOFMEMORY { NoTexture::ForNow } else { NoTexture::Refused }
 }
 
+/// Creates a committed texture with D3D12 Relaxed Format Casting via
+/// `ID3D12Device10::CreateCommittedResource3`, starting in
+/// `D3D12_BARRIER_LAYOUT_COMMON` (compatible with legacy `ResourceBarrier`
+/// transitions from `D3D12_RESOURCE_STATE_COMMON`).
+#[cfg(windows)]
+fn create_committed_castable(
+    device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    heap: &windows::Win32::Graphics::Direct3D12::D3D12_HEAP_PROPERTIES,
+    heap_flags: windows::Win32::Graphics::Direct3D12::D3D12_HEAP_FLAGS,
+    d: &ResourceDesc,
+    clear_value: Option<&[u32; 5]>,
+    castable: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+) -> windows::core::Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::Interface;
+    const TARGET_OR_DEPTH: u32 = 1 | 2;
+    let device10: ID3D12Device10 = device.cast()?;
+    let desc1 = D3D12_RESOURCE_DESC1 {
+        Dimension: D3D12_RESOURCE_DIMENSION(d.dimension as i32),
+        Alignment: d.alignment,
+        Width: d.width,
+        Height: d.height,
+        DepthOrArraySize: d.depth_or_array_size,
+        MipLevels: d.mip_levels,
+        Format: DXGI_FORMAT(d.format as i32),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: d.sample_count,
+            Quality: d.sample_quality,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT(d.layout as i32),
+        Flags: D3D12_RESOURCE_FLAGS(d.flags as i32),
+        SamplerFeedbackMipRegion: D3D12_MIP_REGION::default(),
+    };
+    let clear = (d.flags & TARGET_OR_DEPTH != 0)
+        .then_some(clear_value)
+        .flatten()
+        .map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: `heap`, `desc1`, `clear`, and `castable` point to valid initialized data.
+    unsafe {
+        device10.CreateCommittedResource3(
+            heap,
+            heap_flags,
+            &desc1,
+            D3D12_BARRIER_LAYOUT_COMMON,
+            clear,
+            None,
+            Some(castable),
+            &mut texture,
+        )?;
+    }
+    texture.ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+}
+
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags. Returns `(texture, castable_formats, initial_common)`.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+        bool,
+    ),
+    NoTexture,
+> {
     host_texture_as(desc, state, clear, false)
 }
 
@@ -2614,7 +2870,14 @@ fn host_texture_as(
     state: u32,
     clear: *const c_void,
     reserved: bool,
-) -> Result<windows::Win32::Graphics::Direct3D12::ID3D12Resource, NoTexture> {
+) -> Result<
+    (
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT],
+        bool,
+    ),
+    NoTexture,
+> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -2687,9 +2950,11 @@ fn host_texture_as(
         crate::host::name(&t, || {
             format!("texture {}x{} f{} flags {:#x} (in a block)", d.width, d.height, d.format, d.flags)
         });
-        return Ok(t);
+        return Ok((t, &[], false));
     }
     let mut texture: Option<ID3D12Resource> = None;
+    let mut castable: &'static [windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT] = &[];
+    let mut initial_common = false;
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
@@ -2706,20 +2971,54 @@ fn host_texture_as(
             )
         }
     } else {
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                crate::host::not_resident(),
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(
-                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-                ),
-                // The same layout: format, then color or depth and stencil.
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-                &mut texture,
-            )
+        let wanted_castable = castable_formats_for(&d);
+        let relaxed = (!wanted_castable.is_empty() && relaxed_casting_supported(&host.device))
+            .then(|| {
+                create_committed_castable(
+                    &host.device,
+                    &heap,
+                    crate::host::not_resident(),
+                    &d,
+                    clear_value.as_ref(),
+                    wanted_castable,
+                )
+            });
+        match relaxed {
+            Some(Ok(t)) => {
+                texture = Some(t);
+                castable = wanted_castable;
+                initial_common = true;
+                Ok(())
+            }
+            other => {
+                if let Some(Err(e)) = other {
+                    static FALLBACK: std::sync::Mutex<std::collections::BTreeSet<[u32; 4]>> =
+                        std::sync::Mutex::new(std::collections::BTreeSet::new());
+                    let key = [d.dimension, d.format, d.flags, e.code().0 as u32];
+                    if FALLBACK.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
+                        tracing::debug!(
+                            error = %e,
+                            desc = ?d,
+                            "CreateCommittedResource3 relaxed casting failed; falling back to legacy CreateCommittedResource"
+                        );
+                    }
+                }
+                // SAFETY: the description has the host layout (checked size, same
+                // fields); the out pointer is ours.
+                unsafe {
+                    host.device.CreateCommittedResource(
+                        &heap,
+                        crate::host::not_resident(),
+                        (&raw const d).cast(),
+                        D3D12_RESOURCE_STATES(
+                            crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                        ),
+                        // The same layout: format, then color or depth and stencil.
+                        clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                        &mut texture,
+                    )
+                }
+            }
         }
     };
     if let Err(e) = made {
@@ -2744,9 +3043,10 @@ fn host_texture_as(
         return Err(no_texture(e.code().0));
     }
     crate::host::name(&texture, || {
-        format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+        let suffix = if castable.is_empty() { "" } else { " (castable)" };
+        format!("texture {}x{} f{} flags {:#x}{suffix}", d.width, d.height, d.format, d.flags)
     });
-    Ok(texture)
+    Ok((texture, castable, initial_common))
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -4906,5 +5206,297 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// End-to-end verification on the real host D3D12 device:
+    /// `CreateCommittedResource3` with `ALLOW_UNORDERED_ACCESS` and
+    /// `pCastableFormats = [R32_UINT, R32_FLOAT, R32_SINT, R9G9B9E5_SHAREDEXP]`
+    /// accepts `R32_UINT` UAV + `R9G9B9E5_SHAREDEXP` / `R32_UINT` / `R32_FLOAT` SRVs,
+    /// works with legacy `ResourceBarrier` transitions from `COMMON`, and decodes
+    /// packed `R9G9B9E5` bits written through the `R32_UINT` UAV without an alias copy.
+    #[cfg(windows)]
+    #[test]
+    fn relaxed_format_casting_supports_r32_uav_and_r9g9b9e5_srv_on_host_device() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !device_supports_relaxed_casting(&host.device) {
+            return;
+        }
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        // Verify CreateCommittedResource3 across the shapes the title aliases:
+        // 2D R32_UINT, 2D R32_TYPELESS, 2D cube/array with mips, 3D volume, and RT+UAV.
+        let shapes = [
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 1, mip_levels: 1, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 1, mip_levels: 1, format: 39,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 128, height: 128,
+                depth_or_array_size: 6, mip_levels: 4, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 4, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 8, mip_levels: 1, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+            },
+            ResourceDesc {
+                dimension: 3, alignment: 0, width: 16, height: 16,
+                depth_or_array_size: 1, mip_levels: 1, format: 42,
+                sample_count: 1, sample_quality: 0, layout: 0, flags: 5,
+            },
+        ];
+        let mut created = Vec::new();
+        let clear_r32: [u32; 5] = [42, 0, 0, 0, 0];
+        for (i, shape) in shapes.iter().enumerate() {
+            let castable = castable_formats_for(shape);
+            assert!(
+                castable.contains(&DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
+                    && castable.contains(&DXGI_FORMAT_R32_UINT),
+                "expected R32+R9G9B9E5 castable list for {shape:?}"
+            );
+            let clear = (i == 4).then_some(&clear_r32);
+            let res = create_committed_castable(
+                &host.device,
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                shape,
+                clear,
+                castable,
+            )
+            .unwrap_or_else(|e| panic!("CreateCommittedResource3 failed for {shape:?}: {e}"));
+            created.push(res);
+        }
+
+        // Verify all 4 required views (R32_UINT UAV, R9G9B9E5 SRV, R32_UINT SRV, R32_FLOAT SRV)
+        // on the 2D R32_UINT texture AND run a real GPU write->barrier->read roundtrip.
+        let tex = &created[0];
+        // SAFETY: plain heap/buffer/view creation on the live test device.
+        let (view_heap, step, uav_buf, readback) = unsafe {
+            let vh: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 5,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let base = vh.GetCPUDescriptorHandleForHeapStart().ptr;
+            let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: base + i * step };
+
+            // Slot 0: R32_UINT UAV
+            let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+                },
+            };
+            host.device
+                .CreateUnorderedAccessView(tex, None::<&ID3D12Resource>, Some(&uav_desc), at(0));
+
+            // Slot 1: R9G9B9E5_SHAREDEXP SRV
+            let srv_for = |fmt| D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: fmt,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            host.device.CreateShaderResourceView(
+                tex,
+                Some(&srv_for(DXGI_FORMAT_R9G9B9E5_SHAREDEXP)),
+                at(1),
+            );
+            // Slot 2: R32_UINT SRV
+            host.device
+                .CreateShaderResourceView(tex, Some(&srv_for(DXGI_FORMAT_R32_UINT)), at(2));
+            // Slot 3: R32_FLOAT SRV
+            host.device
+                .CreateShaderResourceView(tex, Some(&srv_for(DXGI_FORMAT_R32_FLOAT)), at(3));
+
+            let uav_buf = host.uav_buffer(256).unwrap();
+            let mut rb: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut rb,
+                )
+                .unwrap();
+            (vh, step, uav_buf, rb.unwrap())
+        };
+
+        // Packed R9G9B9E5 for (1.0, 0.5, 2.0): E=17 (scale 2^-7 = 1/128), R=128, G=64, B=256.
+        const WRITE_SRC: &str = r#"
+#define RS "DescriptorTable(UAV(u0))"
+RWTexture2D<uint> dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst[uint2(0, 0)] = (17u << 27) | (256u << 18) | (64u << 9) | 128u;
+}
+"#;
+        const READ_SRC: &str = r#"
+#define RS "DescriptorTable(SRV(t0)), UAV(u0)"
+Texture2D<float3> src : register(t0);
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    float3 c = src.Load(int3(0, 0, 0));
+    out_buf.Store4(0, asuint(float4(c, 1.0)));
+}
+"#;
+        let write_bc = crate::host::compile(WRITE_SRC, s!("main"), s!("cs_5_1")).unwrap();
+        let read_bc = crate::host::compile(READ_SRC, s!("main"), s!("cs_5_1")).unwrap();
+        let make_pso = |bc: &[u8]| -> (ID3D12RootSignature, ID3D12PipelineState) {
+            // SAFETY: compiled shader bytecode with embedded root signature.
+            unsafe {
+                let rs: ID3D12RootSignature = host.device.CreateRootSignature(0, bc).unwrap();
+                let pso: ID3D12PipelineState = host
+                    .device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&rs),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: bc.as_ptr().cast(),
+                            BytecodeLength: bc.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (rs, pso)
+            }
+        };
+        let (write_rs, write_pso) = make_pso(&write_bc);
+        let (read_rs, read_pso) = make_pso(&read_bc);
+
+        let list = host.new_list().unwrap();
+        // SAFETY: live resources, descriptors, and pipelines on an open list.
+        unsafe {
+            let l = &list.list;
+            let gpu_base = view_heap.GetGPUDescriptorHandleForHeapStart().ptr;
+            l.SetDescriptorHeaps(&[Some(view_heap.clone())]);
+            // Legacy transition from initial COMMON -> UNORDERED_ACCESS.
+            l.ResourceBarrier(&[crate::host::transition(
+                tex,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            l.SetComputeRootSignature(&write_rs);
+            l.SetPipelineState(&write_pso);
+            l.SetComputeRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_base });
+            l.Dispatch(1, 1, 1);
+
+            // Legacy transition UNORDERED_ACCESS -> NON_PIXEL_SHADER_RESOURCE.
+            l.ResourceBarrier(&[crate::host::transition(
+                tex,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+            l.SetComputeRootSignature(&read_rs);
+            l.SetPipelineState(&read_pso);
+            l.SetComputeRootDescriptorTable(
+                0,
+                D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu_base + step as u64 },
+            );
+            l.SetComputeRootUnorderedAccessView(1, uav_buf.GetGPUVirtualAddress());
+            l.Dispatch(1, 1, 1);
+
+            l.ResourceBarrier(&[crate::host::transition(
+                &uav_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyBufferRegion(&readback, 0, &uav_buf, 0, 16);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: `host.execute` waited for completion; 16 bytes mapped.
+        let floats = unsafe {
+            readback
+                .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut mapped))
+                .unwrap();
+            let out = std::slice::from_raw_parts(mapped.cast::<f32>(), 4).to_vec();
+            readback.Unmap(0, None);
+            out
+        };
+        assert_eq!(floats, [1.0, 0.5, 2.0, 1.0]);
+
+        // Verify Victory's `Resource` + `relaxed_alias_target` path end-to-end.
+        let null = std::ptr::null();
+        let mut src_res = null;
+        let mut src_desc = texture(64, 64, 42, 2);
+        src_desc.flags = 4; // ALLOW_UNORDERED_ACCESS
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &src_desc,
+                0x8, // UNORDERED_ACCESS
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut src_res,
+            ),
+            S_OK
+        );
+        let copy = host_copy(src_res).unwrap();
+        if relaxed_cast_enabled() {
+            assert!(copy.can_cast(67));
+            assert!(copy.can_cast(42));
+            assert_eq!(copy.state.load(std::sync::atomic::Ordering::Relaxed), 0);
+            let addr = resource(src_res).data() as u64;
+            let placed_desc = ResourceDesc { format: 67, flags: 0, ..src_desc };
+            // SAFETY: `ResourceDesc` is 56 bytes (14 u32 words).
+            let placed_words: [u32; 14] = unsafe { std::mem::transmute(placed_desc) };
+            assert_eq!(relaxed_alias_target(addr, &placed_words, 67), Some(src_res));
+            assert_eq!(relaxed_alias_target(addr, &placed_words, 0), Some(src_res));
+            assert_eq!(relaxed_alias_target(addr, &placed_words, 28), None);
+        }
+        assert_eq!(slot::<Release>(src_res, 0x10)(src_res), 0);
     }
 }

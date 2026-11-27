@@ -5392,7 +5392,12 @@ fn buffer_uav(
 /// family takes the texture's format.
 /// shortcut: such a view (sRGB of UNORM, say) reads without its
 /// conversion; cast with castable formats if colors come out wrong.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+fn fits(
+    texture: &ID3D12Resource,
+    castable: &[DXGI_FORMAT],
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
@@ -5434,6 +5439,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
+        return true;
+    }
+    // A texture created with D3D12 relaxed format casting allows views in any
+    // format in its castable list, keeping the requested view format intact
+    // (PC forbids R9G9B9E5_SHAREDEXP UAVs, so keep it SRV-only).
+    if (!unordered || view != DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32)
+        && castable.iter().any(|f| f.0 as u32 == view)
+    {
         return true;
     }
     if family(view) != family(own) {
@@ -5674,7 +5687,12 @@ fn make_twinned_with_copy(
                     }
                 }
                 let mut desc = desc.as_ref().map(srv_desc);
-                if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
+                if !fits(
+                    texture,
+                    copy.castable_formats(),
+                    desc.as_mut().map(|d| &mut d.Format),
+                    false,
+                ) {
                     return None;
                 }
                 if let Some(first) = crate::resource::first_shown(resource)
@@ -5723,7 +5741,7 @@ fn make_twinned_with_copy(
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
+            let Some(copy) = crate::resource::host_copy(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at, twin)
@@ -5731,6 +5749,7 @@ fn make_twinned_with_copy(
                     _ => None,
                 };
             };
+            let texture = &copy.texture;
             if crate::resource::depth_and_unordered(resource) {
                 static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 512 {
@@ -5748,14 +5767,14 @@ fn make_twinned_with_copy(
                     let twin = crate::resource::twin_plane_resource(resource)?;
                     Some((twin, twin_uav(twin, desc.as_ref())?))
                 });
-            let texture = match twin {
+            let (texture, castable) = match twin {
                 Some((twin, view)) => {
                     desc = Some(view);
-                    twin
+                    (twin, &[][..])
                 }
-                None => texture,
+                None => (texture, copy.castable_formats()),
             };
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            if !fits(texture, castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
@@ -6250,7 +6269,10 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
 }
 
 /// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// of the resource made for that memory (on first use). When a live
+/// host-written texture at `address` supports D3D12 relaxed format casting to
+/// the requested SRV format, redirects directly to that source resource so no
+/// alias twin texture or copy is needed.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
@@ -6260,6 +6282,15 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    if let Some(source) = crate::resource::relaxed_alias_target(address, resource, desc[0]) {
+        let mut srv: [u32; 10] = desc[..10].try_into().ok()?;
+        // Format=0 (DXGI_FORMAT_UNKNOWN) meant the placed texture's own format;
+        // set it explicitly when redirecting to `source` (which has another format).
+        if srv[0] == 0 {
+            srv[0] = resource[8];
+        }
+        return Some(View::Shader(source as usize, Some(srv)));
+    }
     let texture = crate::resource::texture_at(address, resource)?;
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
@@ -8056,5 +8087,116 @@ mod dynamic_pool_tests {
         assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(5)))), Some(15));
         assert_eq!(cached_null_kind(&View::Unordered(0, 0, Some(srv_desc(8)))), Some(16));
         assert_eq!(cached_null_kind(&View::Unordered(0, 0, None)), Some(14));
+    }
+
+    #[test]
+    fn relaxed_cast_fits_and_placed_texture_redirects_without_alias_copy() {
+        use super::{View, fits, host, make, placed_texture};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+
+        let Some(h) = host() else {
+            return;
+        };
+        if !crate::resource::relaxed_casting_supported(&h.device) {
+            return;
+        }
+        let (heap_props, src_desc_template) = crate::resource::readback_test_descriptions();
+        // Build a 64x64 R32_UINT UAV texture through `create_committed`.
+        let mut src_words: [u32; 14] = [3, 0, 0, 0, 64, 0, 64, 0x0001_0001, 42, 1, 0, 0, 4, 0];
+        let _ = src_desc_template;
+        // SAFETY: 14 words = 56-byte `ResourceDesc`.
+        let src_desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(src_words) };
+        let mut src = std::ptr::null();
+        // `IID_ID3D12Resource` = {696442be-a72e-4059-bc79-5b5c98040fad}
+        let iid = crate::object::guid(
+            0x6964_42be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                &heap_props,
+                0,
+                &src_desc,
+                0x8,
+                std::ptr::null(),
+                &iid,
+                &mut src,
+            ),
+            0
+        );
+        let copy = crate::resource::host_copy(src).unwrap();
+        let castable = copy.castable_formats();
+        assert!(!castable.is_empty());
+
+        // `fits()` permits R9G9B9E5_SHAREDEXP SRV without overwriting format,
+        // permits R32_UINT UAV, forbids R9G9B9E5_SHAREDEXP UAV, and rejects when non-castable.
+        let mut fmt = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        assert!(fits(&copy.texture, castable, Some(&mut fmt), false));
+        assert_eq!(fmt, DXGI_FORMAT_R9G9B9E5_SHAREDEXP);
+
+        let mut uav_ok = DXGI_FORMAT_R32_UINT;
+        assert!(fits(&copy.texture, castable, Some(&mut uav_ok), true));
+        assert_eq!(uav_ok, DXGI_FORMAT_R32_UINT);
+
+        let mut uav_bad = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        assert!(!fits(&copy.texture, castable, Some(&mut uav_bad), true));
+
+        let mut no_cast = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        assert!(!fits(&copy.texture, &[], Some(&mut no_cast), false));
+
+        // Placed R9G9B9E5 SRV at `src`'s title address redirects directly to `src`,
+        // preserving format 67 even when the placed SRV descriptor leaves Format=0.
+        let (addr_ptr, _) = crate::resource::texture_memory(src).unwrap();
+        let addr = addr_ptr as u64;
+        src_words[8] = 67; // R9G9B9E5_SHAREDEXP
+        src_words[12] = 0; // flags = 0 (fills)
+        let mut view_desc = [0u32; 16];
+        view_desc[0] = 0; // UNKNOWN -> must become 67 on redirect
+        view_desc[1] = 4; // TEXTURE2D
+        view_desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view_desc[5] = 1; // MipLevels
+        view_desc[10] = addr as u32;
+        view_desc[11] = (addr >> 32) as u32;
+        let placed_view = View::Placed(false, src_words, view_desc);
+        let redirected = placed_texture(&placed_view).unwrap();
+        match redirected {
+            View::Shader(res, Some(srv)) => {
+                assert_eq!(res, src as usize);
+                assert_eq!(srv[0], 67);
+            }
+            other => panic!("expected redirected View::Shader, got {other:?}"),
+        }
+
+        // Making the placed view directly into a descriptor heap binds `src`'s host texture.
+        // SAFETY: plain heap creation on live test device.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            h.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })
+                .unwrap()
+        };
+        // SAFETY: live heap.
+        let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+        let kept = make(&placed_view, at).unwrap().unwrap();
+        assert_eq!(
+            windows::core::Interface::as_raw(&kept),
+            windows::core::Interface::as_raw(&copy.texture)
+        );
+        // Release `src` via COM `IUnknown::Release` (vtable slot 2).
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        // SAFETY: `src` is a live COM resource whose first word is its vtable pointer.
+        let release: Release = unsafe {
+            let vtbl = *src.cast::<*const *const ()>();
+            std::mem::transmute(*vtbl.add(2))
+        };
+        assert_eq!(release(src), 0);
     }
 }

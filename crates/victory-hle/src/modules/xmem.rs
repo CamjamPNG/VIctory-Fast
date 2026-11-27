@@ -497,7 +497,10 @@ pub extern "system" fn XMemVirtualAlloc(
             HIGH_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
         }
     }
+    #[cfg(feature = "diagnostics")]
     note_protection(asked, kind, flags, at as usize, size);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = asked;
     at
 }
 
@@ -506,6 +509,7 @@ pub extern "system" fn XMemVirtualAlloc(
 /// write-combined, 0x800 and on the GPU's): said for the 1st, 2nd, 4th.. time of
 /// each, with how much so far. (For placing it: memory the CPU reaches
 /// uncached or write-combined is memory it does not read.)
+#[cfg(feature = "diagnostics")]
 fn note_protection(protect: u32, kind: u32, flags: u64, at: usize, size: usize) {
     type Seen = std::collections::HashMap<(u32, u32, u64), (u64, usize)>;
     static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
@@ -705,8 +709,6 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     pages: usize,
-    /// First page number assigned to this section in [`PAGES`].
-    first_page: usize,
     /// Whether the section was created with `SEC_COMMIT` (all pages committed).
     sec_committed: bool,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
@@ -715,6 +717,11 @@ struct Section {
     /// A bit per page: committed, as far as [`Section::window`] asked (also
     /// marks pages touched for [`arrange`]).
     committed: Box<[std::sync::atomic::AtomicU64]>,
+    /// Monotonic word cursor skipping leading `u64::MAX` words in [`find_fresh_run`].
+    fresh_word: std::sync::atomic::AtomicUsize,
+    /// Reverse map `slice_index -> page_number` (`0` when freed), maintained
+    /// under [`PAGES`] write lock so `arrange`/`arrange_fresh_run` swap in O(1).
+    owners: Box<[std::sync::atomic::AtomicUsize]>,
 }
 
 impl Section {
@@ -722,11 +729,20 @@ impl Section {
         Section {
             handle,
             pages,
-            first_page,
             sec_committed,
             window: std::sync::OnceLock::new(),
             committed: (0..pages.div_ceil(64))
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+            fresh_word: std::sync::atomic::AtomicUsize::new(0),
+            owners: (0..pages)
+                .map(|k| {
+                    std::sync::atomic::AtomicUsize::new(if first_page == 0 {
+                        0
+                    } else {
+                        first_page + k * FRAMES
+                    })
+                })
                 .collect(),
         }
     }
@@ -1279,7 +1295,14 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let numbers = unsafe { std::slice::from_raw_parts(pages, n) }.to_vec();
     let mut table = page_table_mut();
     // Dropped without the lock: the last page of a section unmaps its window.
-    let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
+    let gone: Vec<Slice> = numbers
+        .iter()
+        .filter_map(|number| {
+            let slice = table.pages.remove(number)?;
+            slice.section.owners[slice.index].store(0, Ordering::Relaxed);
+            Some(slice)
+        })
+        .collect();
     drop(table);
     drop(gone);
     1
@@ -1627,6 +1650,7 @@ fn lean() -> bool {
 /// thread that is below normal to above it (`VICTORY_STREAM_PRIORITY=0`:
 /// left as the title set it).
 pub(crate) fn lift_thread() {
+    use std::cell::Cell;
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
     };
@@ -1635,6 +1659,13 @@ pub(crate) fn lift_thread() {
     if !*ON {
         return;
     }
+    thread_local! {
+        static CHECKED: Cell<bool> = const { Cell::new(false) };
+    }
+    if CHECKED.with(Cell::get) {
+        return;
+    }
+    CHECKED.with(|c| c.set(true));
     // SAFETY: plain calls on this thread.
     unsafe {
         let thread = GetCurrentThread();
@@ -1667,7 +1698,7 @@ fn port_on() -> bool {
 }
 
 /// The title's reservations of 64 KiB pages for 32-bit graphics memory:
-/// base and bytes (one, of 185 MB, in the target title).
+/// base and bytes (one, of 185 MB, in the title).
 static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
 /// The title's 64-bit placeholder reservations (`MEM_RESERVE_PLACEHOLDER`), used
@@ -1679,25 +1710,63 @@ static HIGH_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Finds the first contiguous run of `need` fresh (never mapped, never written)
-/// slice indices in `section`.
+/// slice indices in `section` using word-level skipping.
 fn find_fresh_run(section: &Section, need: usize) -> Option<usize> {
     if need == 0 || need > section.pages {
         return None;
     }
+    let words = section.committed.len();
+    let start_word = section.fresh_word.load(Ordering::Relaxed).min(words);
     let mut run_start = 0usize;
     let mut run_len = 0usize;
-    for idx in 0..section.pages {
-        let fresh = section.committed[idx / 64].load(Ordering::Acquire) >> (idx % 64) & 1 == 0;
-        if fresh {
-            if run_len == 0 {
-                run_start = idx;
+    let mut all_full_so_far = true;
+    for w in start_word..words {
+        let word_start = w * 64;
+        let valid_bits = (section.pages - word_start).min(64);
+        let raw = section.committed[w].load(Ordering::Acquire);
+        let occupied = if valid_bits < 64 {
+            raw | (!0u64 << valid_bits)
+        } else {
+            raw
+        };
+        if occupied == u64::MAX {
+            run_len = 0;
+            if all_full_so_far {
+                section.fresh_word.fetch_max(w + 1, Ordering::Relaxed);
             }
-            run_len += 1;
-            if run_len == need {
+            continue;
+        }
+        all_full_so_far = false;
+        if occupied == 0 {
+            if run_len == 0 {
+                run_start = word_start;
+            }
+            run_len += 64;
+            if run_len >= need {
                 return Some(run_start);
             }
-        } else {
-            run_len = 0;
+            continue;
+        }
+        let mut bits = occupied;
+        let mut bit = 0usize;
+        while bit < valid_bits {
+            if bits & 1 == 0 {
+                let zeros = (bits.trailing_zeros() as usize).min(valid_bits - bit);
+                if run_len == 0 {
+                    run_start = word_start + bit;
+                }
+                run_len += zeros;
+                if run_len >= need {
+                    return Some(run_start);
+                }
+                bit += zeros;
+                bits = if zeros == 64 { 0 } else { bits >> zeros };
+            } else {
+                let ones = (bits.trailing_ones() as usize).min(valid_bits - bit);
+                run_len = 0;
+                bit += ones;
+                bits = if ones == 64 { 0 } else { bits >> ones };
+            }
         }
     }
     None
@@ -1761,15 +1830,6 @@ fn arrange_fresh_run(pages: &[usize]) -> u64 {
     let Some(run_start) = find_fresh_run(&section, pages.len()) else {
         return 0;
     };
-    let mut owner: HashMap<usize, usize> = HashMap::with_capacity(section.pages);
-    for k in 0..section.pages {
-        let number = section.first_page + k * FRAMES;
-        if let Some(s) = table.pages.get(&number)
-            && Arc::ptr_eq(&s.section, &section)
-        {
-            owner.insert(s.index, number);
-        }
-    }
     let mut moved = 0u64;
     for (i, &number) in pages.iter().enumerate() {
         let want = run_start + i;
@@ -1779,18 +1839,19 @@ fn arrange_fresh_run(pages: &[usize]) -> u64 {
         if have == want {
             continue;
         }
-        if let Some(other) = owner.remove(&want) {
+        let other = section.owners[want].load(Ordering::Relaxed);
+        if other != 0 {
             if let Some(slice) = table.pages.get_mut(&other) {
                 slice.index = have;
             }
-            owner.insert(have, other);
+            section.owners[have].store(other, Ordering::Relaxed);
         } else {
-            owner.remove(&have);
+            section.owners[have].store(0, Ordering::Relaxed);
         }
         if let Some(slice) = table.pages.get_mut(&number) {
             slice.index = want;
         }
-        owner.insert(want, number);
+        section.owners[want].store(number, Ordering::Relaxed);
         moved += 1;
     }
     if moved > 0 {
@@ -1883,21 +1944,10 @@ fn arrange(base: usize, pages: &[usize]) {
         return;
     }
     let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
-    // Which number has which slice of the section (only this section's page
-    // numbers, O(section.pages) instead of scanning the entire page table).
-    let mut owner: HashMap<usize, usize> = HashMap::with_capacity(section.pages);
-    for k in 0..section.pages {
-        let number = section.first_page + k * FRAMES;
-        if let Some(s) = table.pages.get(&number)
-            && Arc::ptr_eq(&s.section, &section)
-        {
-            owner.insert(s.index, number);
-        }
-    }
     let mut moved = 0u64;
-    for (i, number) in pages.iter().enumerate() {
+    for (i, &number) in pages.iter().enumerate() {
         let want = start_index + i;
-        let Some(have) = table.pages.get(number).map(|s| s.index) else {
+        let Some(have) = table.pages.get(&number).map(|s| s.index) else {
             continue;
         };
         if have == want {
@@ -1907,16 +1957,19 @@ fn arrange(base: usize, pages: &[usize]) {
             ARRANGED[1].fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if let Some(other) = owner.get(&want).copied()
-            && let Some(slice) = table.pages.get_mut(&other)
-        {
-            slice.index = have;
-            owner.insert(have, other);
+        let other = section.owners[want].load(Ordering::Relaxed);
+        if other != 0 {
+            if let Some(slice) = table.pages.get_mut(&other) {
+                slice.index = have;
+            }
+            section.owners[have].store(other, Ordering::Relaxed);
+        } else {
+            section.owners[have].store(0, Ordering::Relaxed);
         }
-        if let Some(slice) = table.pages.get_mut(number) {
+        if let Some(slice) = table.pages.get_mut(&number) {
             slice.index = want;
         }
-        owner.insert(want, *number);
+        section.owners[want].store(number, Ordering::Relaxed);
         moved += 1;
     }
     if moved > 0 {
@@ -2243,7 +2296,7 @@ fn asked_threads() -> Option<usize> {
     static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
         match std::env::var("VICTORY_MAP_THREADS") {
             Ok(v) if v.trim() == "auto" => None,
-            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 32)),
+            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4).clamp(1, 32)),
         }
     });
     *ASKED
@@ -2258,11 +2311,14 @@ static BUSY: (Mutex<Option<std::time::Instant>>, AtomicU64, std::sync::atomic::A
 /// More than a quarter of a window, and the calls are what loading waits for
 /// (one thread of the title's makes them); less than a twentieth, they are
 /// not any more.
-struct Busy(std::time::Instant);
+struct Busy(Option<std::time::Instant>);
 
 impl Busy {
     fn begin() -> Busy {
-        Busy(std::time::Instant::now())
+        if asked_threads().is_some() {
+            return Busy(None);
+        }
+        Busy(Some(std::time::Instant::now()))
     }
 }
 
@@ -2273,11 +2329,15 @@ fn busy_after(was: bool, spent: std::time::Duration, window: std::time::Duration
 
 impl Drop for Busy {
     fn drop(&mut self) {
+        let Some(started) = self.0 else {
+            return;
+        };
         const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
-        let all = BUSY.1.fetch_add((now - self.0).as_nanos() as u64, Ordering::Relaxed) + (now - self.0).as_nanos() as u64;
+        let elapsed = (now - started).as_nanos() as u64;
+        let all = BUSY.1.fetch_add(elapsed, Ordering::Relaxed) + elapsed;
         let mut began = BUSY.0.lock().unwrap_or_else(|e| e.into_inner());
-        let window = now - *began.get_or_insert(self.0);
+        let window = now - *began.get_or_insert(started);
         if window < WINDOW {
             return;
         }
@@ -2502,11 +2562,6 @@ mod pool {
     }
 
     fn serve(pool: &Pool) {
-        use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-        };
-        // SAFETY: a plain call on our own thread.
-        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
         let mut batches = pool.batches.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let Some(batch) = batches.front().cloned() else {
@@ -3154,6 +3209,29 @@ mod tests {
         // SAFETY: unmapped reservation owned by this test.
         unsafe { VirtualFree(base, 0, MEM_RELEASE) };
         assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn find_fresh_run_word_skips_across_word_boundaries_and_partial_tail() {
+        let section = allocate_section(135, false).expect("section");
+        // Mark word 0 completely full, word 1 full except bits 61..64, word 2 bit 0..3 fresh then bit 3 full.
+        section.committed[0].store(u64::MAX, Ordering::Release);
+        section.committed[1].store(!(0b111u64 << 61), Ordering::Release);
+        section.committed[2].store(1u64 << 3, Ordering::Release);
+
+        // Run of 6 spans word 1 (61..64) into word 2 (128..131).
+        assert_eq!(find_fresh_run(&section, 6), Some(125));
+        // Cursor advanced past full word 0, stopped before partially-free word 1.
+        assert_eq!(section.fresh_word.load(Ordering::Relaxed), 1);
+        // Run of 7 does not fit in 125..131 (len 6) or tail 132..135 (len 3).
+        assert_eq!(find_fresh_run(&section, 7), None);
+        // Run of 3 fits in 125..128 first, and if 125..131 are filled, fits at 132..135 (partial tail).
+        section.committed[1].store(u64::MAX, Ordering::Release);
+        section.committed[2].store(0b1111u64, Ordering::Release);
+        assert_eq!(find_fresh_run(&section, 3), Some(132));
+        assert_eq!(section.fresh_word.load(Ordering::Relaxed), 2);
+        // Partial tail only has 3 valid bits (132, 133, 134); requesting 4 must not read past section.pages.
+        assert_eq!(find_fresh_run(&section, 4), None);
     }
 
     #[test]

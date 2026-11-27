@@ -453,20 +453,19 @@ struct Batch {
     wrote: bool,
 }
 
-/// The host copies arguments were read from last: what a batch opens with,
-/// as the executions after the first may read theirs from another one.
-static ARGUMENT_COPIES: std::sync::Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> = std::sync::Mutex::new(Vec::new());
-
-/// [`ARGUMENT_COPIES`] that live, and `first` put in front of them.
-fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource, bool)> {
-    let mut copies = ARGUMENT_COPIES.lock().unwrap_or_else(|e| e.into_inner());
-    let live: Vec<_> = copies.iter().filter_map(std::sync::Weak::upgrade).filter(|s| s.id() != first.id()).collect();
-    *copies = std::iter::once(first)
-        .chain(&live)
-        .take(crate::indirect::batch::SOURCES)
-        .map(std::sync::Arc::downgrade)
-        .collect();
-    live.iter().map(|s| (s.id(), s.buffer.clone(), s.in_place())).collect()
+/// Whether any stage of graphics pipeline `p` can write to a buffer (excluding
+/// texture-only UAV stores so they do not invalidate an open clamp batch).
+fn pipeline_stores_buffers(p: &HostPipeline) -> bool {
+    p.stages.iter().any(|stage| {
+        let t = stage.translated();
+        if !t.stores {
+            return false;
+        }
+        t.stores_by_address
+            || !stage.root_uavs.is_empty()
+            || t.used.iter().any(|u| u.kind == ResourceType::Uav && u.dwords != 8)
+            || crate::picked::picks(&stage.shader, &t.picks)
+    })
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -516,6 +515,9 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// Per-list MRU of host copies indirect arguments were read from last,
+    /// avoiding global mutex contention and cross-list pollution.
+    argument_copies: Vec<std::sync::Weak<crate::shadow::Shadow>>,
     /// A direct dispatch spread across z, for [`State::host_word`] at its
     /// bind: `[row, asked x]` (`[0, 0]`: not spread; an indirect one gets
     /// its words from the clamp through its command signature).
@@ -5046,10 +5048,29 @@ impl State {
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
     fn drew(&mut self, list: &HostList, p: Option<&HostPipeline>) {
-        if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
-            list.mark_uav_dirty();
+        if p.is_none_or(pipeline_stores_buffers) {
+            list.mark_graphics_uav_dirty();
             self.batch = None;
         }
+    }
+
+    /// Updates and returns this list's MRU of recent indirect argument copies
+    /// (excluding `first`, which is moved to the front).
+    fn argument_copies(&mut self, first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, ID3D12Resource, bool)> {
+        let live: Vec<_> = self
+            .argument_copies
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .filter(|s| s.id() != first.id())
+            .collect();
+        self.argument_copies.clear();
+        self.argument_copies.push(std::sync::Arc::downgrade(first));
+        self.argument_copies.extend(
+            live.iter()
+                .take(crate::indirect::batch::SOURCES - 1)
+                .map(std::sync::Arc::downgrade),
+        );
+        live.into_iter().map(|s| (s.id(), s.buffer.clone(), s.in_place())).collect()
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
@@ -5082,7 +5103,7 @@ impl State {
             self.batch = None;
         }
         // A draw after dispatches waits for them.
-        if kind != DISPATCH {
+        if !matches!(kind, DISPATCH | crate::indirect::KIND_DISPATCH_SPREAD) {
             self.synced();
         }
         let (id, offset) = (args.id(), args.offset(arguments));
@@ -5092,10 +5113,11 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
+        let recent = self.argument_copies(args);
         let (mut table, scratch) = crate::indirect::open_batch(
             list,
             (id, &args.buffer, args.in_place()),
-            &argument_copies(args),
+            &recent,
         )?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -5239,16 +5261,26 @@ impl State {
                 s.refresh(list, *at, 4);
             }
             self.window = None;
-            // Ensure earlier compute UAV / copy writes to argument or count buffers are visible.
-            list.emit_global_uav_barrier();
+            // Ensure earlier compute/graphics UAV writes to argument or count
+            // buffers are visible to ExecuteIndirect (scoped Enhanced Barrier
+            // with PFP sync when supported, else scoped UAV barrier).
+            crate::indirect::sync_bypass_indirect(
+                list,
+                &args.buffer,
+                counter.as_ref().map(|(s, _)| &s.buffer),
+            );
             (args.buffer.clone(), offset)
         } else {
-            // One record without a count: clamped in a batch (`batches`).
-            // Spread dispatches use 20-byte [row, asked x, x, y, z] records and
-            // bypass the unspread 12-byte batch path.
-            let batch = if !alone && batches() > 0 && max == 1 && count.is_none() && !is_spread {
+            // One record without a count: clamped in a batch (`batches`),
+            // including 20-byte spread dispatches (fits inside 32-byte slot).
+            let batch_kind = if is_spread {
+                crate::indirect::KIND_DISPATCH_SPREAD
+            } else {
+                kind
+            };
+            let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
                 args.refresh(list, arguments, len);
-                self.batched(list, &args, arguments, kind)
+                self.batched(list, &args, arguments, batch_kind)
             } else {
                 None
             };
@@ -5266,7 +5298,7 @@ impl State {
                 && kind != MESH_1D
                 && max == 1
                 && count.is_none()
-                && !p.stages.iter().any(|stage| stage.translated().stores);
+                && !pipeline_stores_buffers(p);
             // Another host list (a new one after a cut, or this one after its
             // reset) has another scratch buffer, or this one's with old bytes.
             if !windowed || list.first_use(WINDOW_USE) {

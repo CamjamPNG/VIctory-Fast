@@ -3,9 +3,9 @@
 //! every changed heap page goes (`VICTORY_PORT_DESCRIPTORS=1`, off by
 //! default; read in [`on`]).
 //!
-//! What the title does (see `victory-loader`'s
-//! `descriptor_sites`): its placed shader-visible view heap is
-//! the memory of its frame allocator (image +0x4d9f400), which hands out the
+//! What the title does (`victory-loader`'s
+//! `descriptor_sites` has the code): its placed shader-visible view heap is
+//! the memory of its frame allocator, which hands out the
 //! draws' and dispatches' descriptor tables and much else (constants, list
 //! nodes). The tables are filled one 32-byte record at a time by six stores
 //! in two functions (+0x4d9efd0, +0x4eec8e0); views made by our calls
@@ -334,21 +334,32 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
     CHECKED[1].fetch_add(1, Relaxed);
     let n = MISSED_ALL.fetch_add(1, Relaxed);
-    let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
-    let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
-    let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
+    #[cfg(feature = "diagnostics")]
     {
-        let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
-        *by.entry(writer.clone()).or_default() += 1;
+        let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
+        let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
+        let writer = if rip >= base && rip < base + size {
+            format!("title+{:#x}", rip - base)
+        } else if rip != 0 {
+            format!("{rip:#x} (not the title's)")
+        } else {
+            "not known (no fault on its block)".into()
+        };
+        {
+            let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+            *by.entry(writer.clone()).or_default() += 1;
+        }
+        if n < 20 || n.is_power_of_two() {
+            tracing::warn!(
+                slot = index,
+                handle = format_args!("{handle:#x}"),
+                %writer,
+                "renderer port 2: a view record in the title's heap that no store told of (found by the fallback; made now)"
+            );
+        }
     }
-    if n < 20 || n.is_power_of_two() {
-        tracing::warn!(
-            slot = index,
-            handle = format_args!("{handle:#x}"),
-            %writer,
-            "renderer port 2: a view record in the title's heap that no store told of (found by the fallback; made now)"
-        );
-    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (handle, n);
 }
 
 /// The runtime's own `memcpy` and `memmove` ([`import`]).
@@ -357,18 +368,26 @@ static REAL: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 /// Since the last line: the title's copies into the marked heap, records they marked.
 static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Whether `memcpy`/`memmove` imports are globally hooked to mark copied view
+/// records (`VICTORY_PORT_DESCRIPTORS_MEMCPY=1`, default OFF: the fallback
+/// page-check catches missed views without intercepting every process copy).
+fn hook_memcpy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_PORT_DESCRIPTORS_MEMCPY").is_ok_and(|v| v.trim() == "1")
+    })
+}
+
 /// What the title's import of `name` (bound to `address`) is bound to: with
-/// the switch, its `memcpy` and `memmove` mark the view records they copy
-/// into the heap (the fallback of run port2-2 found ~250 view records a
-/// frame on 16 pages that the six stores had not told of, the last writers
-/// of their blocks the runtime's `memcpy` among them).
+/// both `VICTORY_PORT_DESCRIPTORS=1` and `VICTORY_PORT_DESCRIPTORS_MEMCPY=1`,
+/// its `memcpy` and `memmove` mark the view records they copy into the heap.
 pub fn import(name: &str, address: usize) -> usize {
     let (which, ours) = match name {
         "memcpy" => (0, copy as *const () as usize),
         "memmove" => (1, shift as *const () as usize),
         _ => return address,
     };
-    if !on() {
+    if !on() || !hook_memcpy() {
         return address;
     }
     REAL[which].store(address, Relaxed);
@@ -441,6 +460,7 @@ pub(crate) static CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Since the start: view records the fallback found that no mark told of.
 static MISSED_ALL: AtomicU64 = AtomicU64::new(0);
 /// Since the start: the missed records by the place that last faulted on their block.
+#[cfg(feature = "diagnostics")]
 static WRITERS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 /// Since the start: slots taken, of them marked by our calls; pages checked.
 static ALL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -461,12 +481,15 @@ pub(crate) fn line(frames: f64) {
         tracing::info!("renderer port 2 (VICTORY_PORT_DESCRIPTORS=1): not working, no store of the title's was patched");
         return;
     }
+    #[cfg(feature = "diagnostics")]
     let writers = {
         let by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut v: Vec<(&String, &u64)> = by.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
         v.iter().take(6).map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
     };
+    #[cfg(not(feature = "diagnostics"))]
+    let writers = String::new();
     tracing::info!(
         "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
          of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \

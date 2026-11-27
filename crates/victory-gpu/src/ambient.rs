@@ -310,11 +310,16 @@ Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
 RWStructuredBuffer<float4> cells : register(u1);
-// Three a point: red, green and blue, each a mean and a direction.
+// Four a point (64B-aligned): R/G/B directional harmonics + mean, then (mean RGB, linear Z).
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
+float3 seen_at(int2 p, int2 max_p, float2 proj_scale, float2 proj_bias) {
+    float d = depth.Load(int3(clamp(p, int2(0, 0), max_p), 0));
+    float z = min(near / max(d, 1e-7), 1000.0);
+    return float3((float2(p) * proj_scale + proj_bias) * z, z);
+}
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
     float z = min(near / max(d, 1e-7), 1000.0);
@@ -435,10 +440,11 @@ void gather(uint3 at : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     float inv_whole = 1.0 / whole;
     light *= inv_whole;
     toward *= inv_whole;
-    uint at0 = (at.y * PX + at.x) * 3;
+    uint at0 = (at.y * PX + at.x) * 4;
     points[at0] = float4(red * inv_whole - light.r * toward, light.r);
     points[at0 + 1] = float4(green * inv_whole - light.g * toward, light.g);
     points[at0 + 2] = float4(blue * inv_whole - light.b * toward, light.b);
+    points[at0 + 3] = float4(light, p.z);
 }
 #endif
 
@@ -454,8 +460,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     scattered.GetDimensions(w, h, d);
     if (at.x >= w || at.y >= h || at.z >= d) return;
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
-    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float3 seen_there = points[(q.y * PX + q.x) * 4 + 3].rgb;
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
@@ -486,17 +491,18 @@ uint pack(float3 c) {
 void hold_reflect(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
-    float3 c = unpack(light[p]);
+    uint raw = light[p];
+    if ((raw & 0x07FFFFFFu) == 0) return;
+    float3 c = unpack(raw);
     if (any(isnan(c)) || any(isinf(c))) { light[p] = 0; return; }
     if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) { light[p] = 0; return; }
-    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
-    uint at0 = (q.y * PX + q.x) * 3;
-    float3 local = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
-    float3 room = cells[CELLS].rgb;
     float3 around;
     if (constant > 0.0) {
         around = float3(1.0, 0.98, 0.94) * constant;
     } else {
+        uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+        float3 local = points[(q.y * PX + q.x) * 4 + 3].rgb;
+        float3 room = cells[CELLS].rgb;
         float3 base = dot(local, LUMA) > 1e-5 ? lerp(room, local, 0.35) : room;
         around = base * level;
     }
@@ -506,43 +512,71 @@ void hold_reflect(uint3 at : SV_DispatchThreadID) {
     if (has > cap) {
         float3 clamped = c * (cap / has);
         // Strong spikes indoors are unoccluded outdoor sky-miss rays: shift toward the room's tint.
-        float excess = saturate((has / cap - 1.0) / 3.0);
-        float3 room_tint = around * (cap / around_luma);
+        float excess = saturate((has / cap - 1.0) * (1.0 / 3.0));
+        float3 room_tint = around * reflect_cap;
         light[p] = pack(lerp(clamped, room_tint, 0.65 * excess));
     }
 }
 #endif
 
 #ifdef RAISE
+static const float2 VOGEL[12] = {
+    float2( 0.204124145,  0.000000000),
+    float2(-0.260699212,  0.238821944),
+    float2( 0.039903992, -0.454687810),
+    float2( 0.328594836,  0.428593164),
+    float2(-0.603011493, -0.106663671),
+    float2( 0.571224618, -0.363367265),
+    float2(-0.191062615,  0.710747314),
+    float2(-0.364380125, -0.701589000),
+    float2( 0.790557203,  0.288708576),
+    float2(-0.822441784,  0.339494003),
+    float2( 0.396469678, -0.847237744),
+    float2( 0.292984806,  0.934073464),
+};
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void raise(uint3 at : SV_DispatchThreadID) {
     float2 size = float2(width, height);
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
-    float3 c = seen(p, size);
-    float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
-    float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+    int2 max_p = int2(width, height) - 1;
+    float step = 2.0 * tan_y / size.y;
+    float tan_x = 0.5 * size.x * step;
+    float2 proj_scale = float2(step, -step);
+    float2 proj_bias = float2(0.5 * step - tan_x, tan_y - 0.5 * step);
+    float3 c = seen_at(p, max_p, proj_scale, proj_bias);
+    float3 l = seen_at(p + int2(-1, 0), max_p, proj_scale, proj_bias);
+    float3 r = seen_at(p + int2(1, 0), max_p, proj_scale, proj_bias);
+    float3 u = seen_at(p + int2(0, -1), max_p, proj_scale, proj_bias);
+    float3 d = seen_at(p + int2(0, 1), max_p, proj_scale, proj_bias);
     float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
     float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
     float3 n = normalize(cross(dy, dx) + float3(0, 0, -1e-9));
     if (dot(n, c) > 0.0) n = -n;
     // How open it is (as in beloooo's cd9f78ce).
     float open = 1.0;
-    float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+    float inv_cz = 1.0 / c.z;
+    float px = min((radius / step) * inv_cz, 128.0);
     float noise = frac(52.9829189 * frac(dot(float2(p), float2(0.06711056, 0.00583715))));
     if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
         float sum = 0.0;
-        const int N = 12;
-        for (int i = 0; i < N; i++) {
-            float a = i * 2.399963 + noise * 6.2831853;
-            float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
-            float3 v = seen(p + int2(round(o)), size) - c;
+        float s, co;
+        sincos(noise * 6.2831853, s, co);
+        float2 rx = float2(co, -s) * px;
+        float2 ry = float2(s, co) * px;
+        float bias = 0.004 * c.z + 0.005;
+        float inv_r2 = 1.0 / (radius * radius);
+        [unroll]
+        for (int i = 0; i < 12; i++) {
+            float2 tap = VOGEL[i];
+            float2 o = float2(dot(tap, rx), dot(tap, ry));
+            float3 v = seen_at(p + int2(round(o)), max_p, proj_scale, proj_bias) - c;
             float vv = dot(v, v);
-            float over = dot(v, n) - 0.004 * c.z - 0.005;
-            sum += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+            float over = dot(v, n) - bias;
+            sum += max(over, 0.0) * rsqrt(vv + 1e-6) * saturate(1.0 - vv * inv_r2);
         }
-        open = saturate(1.0 - strength * 2.0 * sum / N);
+        open = saturate(1.0 - strength * (2.0 / 12.0) * sum);
     }
     float3 found;
     if (constant > 0.0) {
@@ -552,26 +586,29 @@ void raise(uint3 at : SV_DispatchThreadID) {
     }
     // Between the four points around, those at its own depth first; which
     // four is dithered a little.
-    float2 g = (float2(p) + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+    float2 g = (float2(p) + 0.5) * (float2(PX, PY) / size) - 0.5 + (noise - 0.5) * 0.5;
     int2 g0 = int2(floor(g));
     float2 f = g - float2(g0);
     float4 sr = 0, sg = 0, sb = 0;
     float sum = 0;
+    [unroll]
     for (int k = 0; k < 4; k++) {
         int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
-        float z = seen(int2((float2(q) + 0.5) * size / float2(PX, PY)), size).z;
+        uint at0 = (q.y * PX + q.x) * 4;
+        float z = points[at0 + 3].w;
         float2 b = float2(k & 1 ? f.x : 1 - f.x, k >> 1 ? f.y : 1 - f.y);
-        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) / c.z);
-        uint at0 = (q.y * PX + q.x) * 3;
+        float w = (b.x * b.y + 1e-3) / (0.02 + abs(z - c.z) * inv_cz);
         sr += w * points[at0];
         sg += w * points[at0 + 1];
         sb += w * points[at0 + 2];
         sum += w;
     }
-    float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    float inv_sum = 1.0 / sum;
+    float3 all = float3(sr.w, sg.w, sb.w) * inv_sum;
+    found = all + (1.2 * inv_sum) * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n));
     found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    float4 room = cells[CELLS];
+    found = lerp(found, room.rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
     // Filter magenta garbage probes left by uninitialized/corrupted memory on AMD.
     if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
@@ -580,7 +617,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     // For `fresh` seconds after the light around jumped (a new room) the
     // title's leftover counts for no more than the estimate, then up to
     // `most` times it again: its history holds the place before.
-    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(cells[CELLS].a / fresh)) : most;
+    float bound = fresh > 0.0 ? lerp(1.0, most, saturate(room.a / fresh)) : most;
     float top = max(dot(found, LUMA) * bound, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
@@ -594,7 +631,7 @@ const CELLS: u64 = 64 * 36;
 const PX: u32 = 160;
 const PY: u32 = 90;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
-const POINT_BYTES: u64 = PX as u64 * PY as u64 * 48;
+const POINT_BYTES: u64 = PX as u64 * PY as u64 * 64;
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -777,7 +814,6 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 dispatch("keep", &pass.keep, 8, 9, 1);
                 uav_barrier(l, Some(&pass.cells));
                 dispatch("mean", &pass.mean, 1, 1, 1);
-                uav_barrier(l, Some(&pass.cells));
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => {
@@ -876,5 +912,54 @@ mod tests {
             return;
         };
         make(&host.device, |bytes| host.uav_buffer(bytes)).expect("the passes");
+    }
+
+    /// Precomputed Vogel taps and linearized projection match the original `raise` math.
+    #[test]
+    fn raise_math_equivalence() {
+        const VOGEL: [[f32; 2]; 12] = [
+            [0.204124145, 0.000000000],
+            [-0.260699212, 0.238821944],
+            [0.039903992, -0.454687810],
+            [0.328594836, 0.428593164],
+            [-0.603011493, -0.106663671],
+            [0.571224618, -0.363367265],
+            [-0.191062615, 0.710747314],
+            [-0.364380125, -0.701589000],
+            [0.790557203, 0.288708576],
+            [-0.822441784, 0.339494003],
+            [0.396469678, -0.847237744],
+            [0.292984806, 0.934073464],
+        ];
+        for noise in [0.0f32, 0.13, 0.37, 0.5, 0.73, 0.999] {
+            let px = 64.0f32;
+            let (s, co) = (noise * 6.2831853).sin_cos();
+            let rx = [co * px, -s * px];
+            let ry = [s * px, co * px];
+            for (i, tap) in VOGEL.iter().enumerate() {
+                let a = (i as f32) * 2.399963 + noise * 6.2831853;
+                let r = (((i as f32) + 0.5) / 12.0).sqrt() * px;
+                let old = [a.cos() * r, a.sin() * r];
+                let new = [tap[0] * rx[0] + tap[1] * rx[1], tap[0] * ry[0] + tap[1] * ry[1]];
+                assert!((old[0] - new[0]).abs() < 5e-4, "x mismatch at i={i} noise={noise}: {old:?} vs {new:?}");
+                assert!((old[1] - new[1]).abs() < 5e-4, "y mismatch at i={i} noise={noise}: {old:?} vs {new:?}");
+            }
+        }
+
+        let (w, h, tan_y, z) = (1920.0f32, 1080.0f32, 0.45f32, 12.5f32);
+        let step = 2.0 * tan_y / h;
+        let tan_x = 0.5 * w * step;
+        let proj_scale = [step, -step];
+        let proj_bias = [0.5 * step - tan_x, tan_y - 0.5 * step];
+        for (px, py) in [(-1, -1), (0, 0), (959, 539), (1919, 1079), (1920, 1080)] {
+            let ndc_x = (px as f32 + 0.5) / w * 2.0 - 1.0;
+            let ndc_y = (py as f32 + 0.5) / h * 2.0 - 1.0;
+            let old_x = ndc_x * tan_y * w / h * z;
+            let old_y = -ndc_y * tan_y * z;
+            let new_x = (px as f32 * proj_scale[0] + proj_bias[0]) * z;
+            let new_y = (py as f32 * proj_scale[1] + proj_bias[1]) * z;
+            assert!((old_x - new_x).abs() < 1e-5, "proj x mismatch at ({px},{py}): {old_x} vs {new_x}");
+            assert!((old_y - new_y).abs() < 1e-5, "proj y mismatch at ({px},{py}): {old_y} vs {new_y}");
+        }
     }
 }

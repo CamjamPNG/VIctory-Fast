@@ -2963,11 +2963,20 @@ fn record_dropped_indirect(
     address: Option<u64>,
     counted: bool,
 ) {
-    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    INDIRECT.fetch_add(1, Ordering::Relaxed);
+    let sig = signature as usize;
+    static FAST_SEEN: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+    if sig != 0 && FAST_SEEN.iter().any(|slot| slot.load(Ordering::Relaxed) == sig) {
+        return;
+    }
     static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&(signature as usize)) {
-        seen.push(signature as usize);
+    if !seen.contains(&sig) {
+        if sig != 0 && seen.len() < FAST_SEEN.len() {
+            FAST_SEEN[seen.len()].store(sig, Ordering::Relaxed);
+        }
+        seen.push(sig);
         tracing::info!(
             stride,
             ?args,

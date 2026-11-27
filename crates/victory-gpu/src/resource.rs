@@ -1229,6 +1229,8 @@ struct Hosted {
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
+    /// Lock-free mirror of `made.is_some()` for [`host_waits`] and sweep scans.
+    has_made: std::sync::atomic::AtomicBool,
     /// The state and clear value the title created the texture with.
     state: u32,
     clear: Option<[u32; 5]>,
@@ -1450,6 +1452,7 @@ pub(crate) fn want_level(this: This, first: u32) {
     r.host.grown.store(true, Relaxed);
     HELD[2].fetch_add(1, Relaxed);
     if let Some(old) = made.take() {
+        r.host.has_made.store(false, std::sync::atomic::Ordering::Release);
         REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
     }
 }
@@ -1781,12 +1784,14 @@ pub(crate) fn title_fills(this: This) -> bool {
 /// (`crate::descriptor::make_waiting`).
 #[cfg(windows)]
 pub(crate) fn host_waits(this: This) -> bool {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
     if this.is_null() || !lazy() {
         return false;
     }
     let r = resource(this);
     r.desc.dimension != BUFFER
-        && !r.host.refused.load(std::sync::atomic::Ordering::Relaxed)
+        && !r.host.has_made.load(Acquire)
+        && !r.host.refused.load(Relaxed)
         && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_none()
 }
 
@@ -1934,6 +1939,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        r.host.has_made.store(true, std::sync::atomic::Ordering::Release);
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -2099,7 +2105,7 @@ pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
     map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
 }
 
@@ -2383,25 +2389,8 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
-    // With a limit, evict never-remade textures before already-remade ones,
-    // longest idle first within each group.
-    let mut by_age: Vec<(u8, u64, usize)> = Vec::new();
-    if most != u64::MAX {
-        for &at in all.iter() {
-            // SAFETY: as below.
-            let r = unsafe { &*(at as *const Resource) };
-            let used = r.host.used.load(Relaxed);
-            let remade = r.host.gone.load(Relaxed);
-            let need_ms = remade_idle_ms(idle_ms, remade);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, need_ms, IDLE_FRAMES) {
-                by_age.push((u8::from(remade), used & 0xffff_ffff, at));
-            }
-        }
-        by_age.sort_unstable();
-    }
-    // Without one, while textures are kept for minutes, a part of them at
-    // each look, the next one at the next: a play has over 100,000
+    // Without a byte limit, while textures are kept for minutes, a part of
+    // them at each look, the next one at the next: a play has over 100,000
     // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
     const PART: usize = 8192;
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2415,19 +2404,76 @@ pub(crate) fn let_go_idle() {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
-    let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, _, at)| at)) {
+    // Snapshot idle candidates under `TEXTURES`, bump their refcounts, then
+    // release `TEXTURES` before sorting, locking per-resource mutexes, or
+    // retiring host copies.
+    let candidates: Vec<Held> = {
+        let mut by_age: Vec<(u8, u64, usize)> = Vec::new();
+        let mut plain: Vec<usize> = Vec::new();
+        {
+            let all = textures();
+            if most != u64::MAX {
+                // With a limit, evict never-remade textures before already-remade
+                // ones, longest idle first within each group.
+                for &at in all.iter() {
+                    // SAFETY: a texture leaves the table before it is freed,
+                    // under the lock held here (`Drop for Resource`).
+                    let r = unsafe { &*(at as *const Resource) };
+                    if !r.host.has_made.load(Relaxed) {
+                        continue;
+                    }
+                    let used = r.host.used.load(Relaxed);
+                    let remade = r.host.gone.load(Relaxed);
+                    let need_ms = remade_idle_ms(idle_ms, remade);
+                    if used != 0
+                        && fills(&r.desc)
+                        && crate::host::long_ago(used, need_ms, IDLE_FRAMES)
+                        && crate::object::add_ref_alive(at as This)
+                    {
+                        by_age.push((u8::from(remade), used & 0xffff_ffff, at));
+                    }
+                }
+            } else {
+                let mut looked = 0;
+                let mut last_at = 0;
+                for &at in all.range(from..).take(part) {
+                    looked += 1;
+                    last_at = at;
+                    // SAFETY: a texture leaves the table before it is freed,
+                    // under the lock held here (`Drop for Resource`).
+                    let r = unsafe { &*(at as *const Resource) };
+                    if !r.host.has_made.load(Relaxed) {
+                        continue;
+                    }
+                    let used = r.host.used.load(Relaxed);
+                    let need_ms = remade_idle_ms(idle_ms, r.host.gone.load(Relaxed));
+                    if used != 0
+                        && fills(&r.desc)
+                        && crate::host::long_ago(used, need_ms, IDLE_FRAMES)
+                        && crate::object::add_ref_alive(at as This)
+                    {
+                        plain.push(at);
+                    }
+                }
+                if part == PART {
+                    FROM.store(if looked == PART { last_at.saturating_add(1) } else { 0 }, Relaxed);
+                }
+            }
+        }
+        if most != u64::MAX {
+            by_age.sort_unstable();
+            by_age.into_iter().map(|(_, _, at)| Held(at as This)).collect()
+        } else {
+            plain.into_iter().map(|at| Held(at as This)).collect()
+        }
+    };
+    for held in candidates {
         if bytes >= most {
             break;
         }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
+        let at = held.0 as usize;
+        let r = resource(held.0);
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
         let need_ms = remade_idle_ms(idle_ms, r.host.gone.load(Relaxed));
@@ -2446,6 +2492,7 @@ pub(crate) fn let_go_idle() {
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
                 r.host.wanted.store(u32::MAX, Relaxed);
+                r.host.has_made.store(false, std::sync::atomic::Ordering::Release);
                 made.take()
             } else {
                 None
@@ -2699,7 +2746,7 @@ impl Drop for HostTexture {
 /// (never released), for the memory line.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_textures() -> u64 {
-    PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+    PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner()).len() as u64
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -3180,6 +3227,7 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: Hosted {
             made: std::sync::Mutex::new(None),
+            has_made: std::sync::atomic::AtomicBool::new(false),
             state,
             // SAFETY: the title passes a whole clear value (the format,
             // then color or depth and stencil: 5 words) or null.
@@ -3436,23 +3484,23 @@ pub(crate) extern "system" fn create_at_address(
 /// its host texture is let go when nothing names it any more
 /// ([`let_go_idle`]) and made again on the next use.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PLACED_TEXTURES: std::sync::RwLock<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
 /// filler was left out of the key ([`texture_at`]).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -3510,7 +3558,7 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut key = *desc;
     key[1] = 0;
     key[13] = 0;
-    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = PLACED_TEXTURES.read().unwrap_or_else(|e| e.into_inner());
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
 }
@@ -3533,6 +3581,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3540,9 +3589,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         key[13] = 0;
     }
     let desc = &key;
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
         if seen.insert((address, raw)) {
@@ -3557,6 +3606,14 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
             }
         }
     }
+    if let Some(&r) = PLACED_TEXTURES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(address, *desc))
+    {
+        return Some(r as This);
+    }
+    let mut map = PLACED_TEXTURES.write().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
         return Some(r as This);
     }
@@ -4078,6 +4135,7 @@ mod tests {
         // As `hosted` leaves a texture the card had no room for just now:
         // not asked again yet, but still waited for (not refused).
         *r.host.made.lock().unwrap() = None;
+        r.host.has_made.store(false, Relaxed);
         r.host.no_room.store(crate::host::moment().max(1), Relaxed);
         assert!(hosted(image, true).is_none(), "asked again only after NO_ROOM_AGAIN_MS");
         assert!(host_waits(image), "a texture without room still waits for its host copy");
@@ -4087,6 +4145,7 @@ mod tests {
         assert_eq!(r.host.no_room.load(Relaxed), 0);
         // Refused: never again.
         *r.host.made.lock().unwrap() = None;
+        r.host.has_made.store(false, Relaxed);
         r.host.no_room.store(0, Relaxed);
         r.host.refused.store(true, Relaxed);
         assert!(hosted(image, true).is_none());

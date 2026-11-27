@@ -154,6 +154,69 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether RDNA/DXIL optimizations are enabled: Wave32 `wave_base` LDS/barrier/atomic
+/// elision on AMD RDNA, barrier-separated multi-wave `lds_safe` Wave32 relaxation,
+/// bindless `SLOT_STRIDES` diamond skip under `VICTORY_PORT_CBV=1` + vector raw loads,
+/// and native `dx.op.binaryWithTwoOuts.i32` (`IMul`/`UMul`) for `mul_hi`
+/// (`VICTORY_RDNA_OPT=0` disables all four; on by default). Part of the translation:
+/// the shader cache keys on it.
+pub fn rdna_opt_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_rdna_opt() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_RDNA_OPT").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether `v_rcp_f32`/`v_rcp_iflag_f32` emits `arcp`, IEEE `v_div_scale..v_div_fixup`
+/// sequences collapse into strict IEEE `fdiv`, and `v_mac_legacy_f32`/`v_mad_legacy_f32`
+/// use the `rdna::LEGACY` fast path (`VICTORY_FAST_RCP=0` disables all three; on by
+/// default). Part of the translation: the shader cache keys on it.
+pub fn fast_rcp_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_fast_rcp() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_FAST_RCP").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether mesh shaders forward console `s_sendmsg(MSG_GS_ALLOC_REQ)` (`m0`)
+/// vertex/primitive counts to `dx.op.setMeshOutputCounts` and bound primitive
+/// zero-initialization by the dynamic primitive count (`VICTORY_MESH_ALLOC_COUNTS=0`
+/// preserves static `(max_vertices, max_primitives)`; on by default). Part of the
+/// translation: the shader cache keys on it.
+pub fn mesh_alloc_counts_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_mesh_alloc_counts() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_MESH_ALLOC_COUNTS").is_none_or(|v| v != "0")
+    })
+}
+
+/// Whether compute `s_barrier` instructions narrow their DXIL memory fence mode
+/// using CFG UAV-write reachability and console `s_waitcnt` flags
+/// (`VICTORY_NARROW_BARRIER=0` preserves legacy `mode=11` whenever the shader writes
+/// any UAV; on by default). Part of the translation: the shader cache keys on it.
+pub fn narrow_barrier_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::test_narrow_barrier() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NARROW_BARRIER").is_none_or(|v| v != "0")
+    })
+}
+
 /// Whether translated loops keep their stage-capped safety iteration counter
 /// (`LOOP_LIMIT`) on dynamic loops (`VICTORY_LOOP_LIMIT=0` disables all loop
 /// counters for profiling; on by default). Part of the translation: the shader
@@ -484,6 +547,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out.push(rdna_wave32());
     out.push(u8::from(loop_limit_enabled()));
+    out.push(u8::from(narrow_barrier_on()));
+    out.push(u8::from(mesh_alloc_counts_on()));
+    out.push(u8::from(fast_rcp_on()));
+    out.push(u8::from(rdna_opt_on()));
     out
 }
 
@@ -865,7 +932,10 @@ pub fn emit(
             let lds_safe = matches!(
                 native.io,
                 crate::native::StageIo::Cs(cs)
-                    if cs.lds_bytes() == 0 || cs.threads.iter().product::<u32>() <= 32
+                    if cs.lds_bytes() == 0
+                        || cs.threads.iter().product::<u32>() <= 32
+                        || (rdna_opt_on()
+                            && lower::lds_barrier_safe(p, st, cs.threads.iter().product::<u32>()))
             );
             has_anyhit || (rdna_wave32() >= 2 && lds_safe)
         }

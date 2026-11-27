@@ -237,6 +237,79 @@ struct Aside {
 // thread at a time (the lock).
 unsafe impl Send for Aside {}
 
+#[derive(Default)]
+struct MappedCoalescerState {
+    requested: u64,
+    completed: u64,
+    running: bool,
+}
+
+struct MappedCoalescer {
+    state: Mutex<MappedCoalescerState>,
+    done: std::sync::Condvar,
+}
+
+impl MappedCoalescer {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(MappedCoalescerState {
+                requested: 0,
+                completed: 0,
+                running: false,
+            }),
+            done: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Waits until a flush started strictly after this caller arrived has
+    /// finished. Callers arriving while a flush is already running coalesce
+    /// into one follow-up flush. Returns `Ok(true)` if this caller ran `flush`.
+    fn wait<E>(&self, idle: impl Fn() -> bool, flush: impl FnOnce() -> Result<(), E>) -> Result<bool, E> {
+        if idle() {
+            return Ok(false);
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.requested += 1;
+        let target = state.requested;
+        loop {
+            if state.completed >= target {
+                return Ok(false);
+            }
+            if state.running {
+                state = self.done.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            if idle() {
+                state.completed = state.requested;
+                drop(state);
+                self.done.notify_all();
+                return Ok(false);
+            }
+            state.running = true;
+            let batch_end = state.requested;
+            drop(state);
+
+            struct ResetOnDrop<'a>(&'a MappedCoalescer, u64, bool);
+            impl Drop for ResetOnDrop<'_> {
+                fn drop(&mut self) {
+                    let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if self.2 {
+                        s.completed = s.completed.max(self.1);
+                    }
+                    s.running = false;
+                    drop(s);
+                    self.0.done.notify_all();
+                }
+            }
+            let mut guard = ResetOnDrop(self, batch_end, false);
+            flush()?;
+            guard.2 = true;
+            drop(guard);
+            return Ok(true);
+        }
+    }
+}
+
 /// New memory of the card is mapped into its address space when this
 /// returns: a copy of a few bytes is sent to a queue of ours after the
 /// memory was made, which the system starts only when all mappings asked
@@ -244,63 +317,74 @@ unsafe impl Send for Aside {}
 /// that: run n11 was lost as n08 was with it alone.) Best done off a hot
 /// path: a tenth of a millisecond to some.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
+    static COALESCER: MappedCoalescer = MappedCoalescer::new();
     static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
         return Ok(());
     }
+    let no_flights = || STARTED.load(Ordering::Acquire) == FINISHED.load(Ordering::Acquire);
+    if no_flights() {
+        return Ok(());
+    }
     let started = std::time::Instant::now();
-    let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: plain object creation; the objects the list names are kept.
-    unsafe {
-        if aside.is_none() {
-            let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> windows::core::Result<ID3D12Resource> {
-                let mut made: Option<ID3D12Resource> = None;
-                device.CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
-                    D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC {
-                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                        Width: 256,
-                        Height: 1,
-                        DepthOrArraySize: 1,
-                        MipLevels: 1,
-                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                        ..Default::default()
-                    },
-                    state,
-                    None,
-                    &mut made,
-                )?;
-                made.ok_or_else(windows::core::Error::empty)
-            };
-            let from = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
-            let to = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
-            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_COPY,
-                ..Default::default()
-            })?;
-            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
-            let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
-            list.CopyBufferRegion(&to, 0, &from, 0, 16);
-            list.Close()?;
-            *aside = Some(Aside {
-                queue,
-                list: list.cast()?,
-                fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
-                event: CreateEventW(None, false, false, None)?,
-                value: 0,
-                _keep: (allocator, [from, to]),
-            });
+    let ran = COALESCER.wait(no_flights, || -> windows::core::Result<()> {
+        let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: plain object creation; the objects the list names are kept.
+        unsafe {
+            if aside.is_none() {
+                let buffer = |kind: D3D12_HEAP_TYPE, state: D3D12_RESOURCE_STATES| -> windows::core::Result<ID3D12Resource> {
+                    let mut made: Option<ID3D12Resource> = None;
+                    device.CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: 256,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut made,
+                    )?;
+                    made.ok_or_else(windows::core::Error::empty)
+                };
+                let from = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+                let to = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
+                let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    ..Default::default()
+                })?;
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                list.CopyBufferRegion(&to, 0, &from, 0, 16);
+                list.Close()?;
+                *aside = Some(Aside {
+                    queue,
+                    list: list.cast()?,
+                    fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+                    event: CreateEventW(None, false, false, None)?,
+                    value: 0,
+                    _keep: (allocator, [from, to]),
+                });
+            }
+            let Some(a) = aside.as_mut() else { return Ok(()) };
+            a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
+            a.value += 1;
+            a.queue.Signal(&a.fence, a.value)?;
+            if a.fence.GetCompletedValue() < a.value {
+                a.fence.SetEventOnCompletion(a.value, a.event)?;
+                WaitForSingleObject(a.event, INFINITE);
+            }
         }
-        let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
-        a.value += 1;
-        a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
-        }
+        Ok(())
+    })?;
+    if !ran {
+        return Ok(());
     }
     let us = started.elapsed().as_micros() as u64;
     MAPPED[0].fetch_add(1, Ordering::Relaxed);
@@ -819,14 +903,27 @@ static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// the pass that happens to notice first names only the view it was at:
 /// the three such losses of runs 72, 73 and 82 each came within 5 ms of a
 /// pipeline library call that no line of the log tied to them.
-/// `VICTORY_TRAIL=0`: nothing is kept and nothing is said.
+/// Defaults on in `diagnostics` builds and off in release builds
+/// (`VICTORY_TRAIL=1` enables it in release; `VICTORY_TRAIL=0` disables it).
 static TRAIL: Mutex<std::collections::VecDeque<(u64, u32, String)>> = Mutex::new(std::collections::VecDeque::new());
 /// The entries kept.
 const TRAIL_MOST: usize = 96;
 
+fn trail_on_for(value: Option<&std::ffi::OsStr>, diagnostics: bool) -> bool {
+    match value {
+        Some(v) => v != "0",
+        None => diagnostics,
+    }
+}
+
 fn trail_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TRAIL").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        trail_on_for(
+            std::env::var_os("VICTORY_TRAIL").as_deref(),
+            cfg!(any(test, feature = "diagnostics")),
+        )
+    })
 }
 
 /// Microseconds since the first call.
@@ -1247,9 +1344,31 @@ pub(crate) fn page_fault_delta(prev: u32, now: u32) -> u64 {
     u64::from(now.wrapping_sub(prev))
 }
 
-/// The process's private committed bytes (`PagefileUsage`).
+/// Refresh interval for cached [`process_private_bytes`] queries so
+/// per-reset allocator cap checks don't storm `K32GetProcessMemoryInfo`.
+const PRIVATE_BYTES_REFRESH_MS: u64 = 500;
+static CACHED_PRIVATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `coarse_ms() + 1` of the last `K32GetProcessMemoryInfo` refresh; `0` = uninitialized.
+static CACHED_PRIVATE_BYTES_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The process's private committed bytes (`PagefileUsage`), cached for
+/// [`PRIVATE_BYTES_REFRESH_MS`] to avoid repeated kernel VM counter syscalls.
 pub(crate) fn process_private_bytes() -> u64 {
-    process_memory_counters().map_or(0, |(_, private, _)| private)
+    let now = coarse_ms().saturating_add(1);
+    let at = CACHED_PRIVATE_BYTES_AT.load(Ordering::Relaxed);
+    if at != 0 && now.saturating_sub(at) < PRIVATE_BYTES_REFRESH_MS {
+        return CACHED_PRIVATE_BYTES.load(Ordering::Relaxed);
+    }
+    if CACHED_PRIVATE_BYTES_AT
+        .compare_exchange(at, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+        && at != 0
+    {
+        return CACHED_PRIVATE_BYTES.load(Ordering::Relaxed);
+    }
+    let private = process_memory_counters().map_or(0, |(_, private, _)| private);
+    CACHED_PRIVATE_BYTES.store(private, Ordering::Relaxed);
+    private
 }
 
 /// Periodic RAM, DXGI local/shared VRAM, allocator pool, and OS page-fault
@@ -1312,10 +1431,10 @@ fn memory_summary_line(frames: f64) {
     }
 }
 
-/// The process's private bytes (diagnostics: around the making of lists).
+/// The process's exact private bytes (diagnostics: around the making of lists).
 #[cfg(feature = "diagnostics")]
 fn private_bytes() -> u64 {
-    process_private_bytes()
+    process_memory_counters().map_or(0, |(_, private, _)| private)
 }
 
 /// What the runtime does when the host GPU fails for good: report it like a
@@ -1732,6 +1851,99 @@ mod tests {
         drop(_outer);
         RETIRE_BATCH.with(|b| assert_eq!(b.borrow().depth, 0));
     }
+
+    #[test]
+    fn mapped_coalescer_skips_when_idle_and_coalesces_waiters() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let coalescer = Arc::new(MappedCoalescer::new());
+        let flushes = Arc::new(AtomicUsize::new(0));
+        // Idle fast-skip: flush never runs.
+        assert!(!coalescer.wait(|| true, || -> Result<(), ()> {
+            flushes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }).unwrap());
+        assert_eq!(flushes.load(Ordering::Relaxed), 0);
+
+        // Concurrent waiters arriving during flush #1 coalesce into one flush #2.
+        let entered_first = Arc::new(std::sync::Barrier::new(2));
+        let release_first = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let all_waiting = Arc::new(AtomicBool::new(false));
+
+        let c1 = coalescer.clone();
+        let f1 = flushes.clone();
+        let e1 = entered_first.clone();
+        let r1 = release_first.clone();
+        let t1 = std::thread::spawn(move || {
+            c1.wait(|| false, || -> Result<(), ()> {
+                f1.fetch_add(1, Ordering::SeqCst);
+                e1.wait();
+                let mut go = r1.0.lock().unwrap();
+                while !*go {
+                    go = r1.1.wait(go).unwrap();
+                }
+                Ok(())
+            })
+            .unwrap()
+        });
+
+        // Wait until t1 is inside flush #1.
+        entered_first.wait();
+
+        // Spawn 4 waiters while flush #1 is in flight.
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let cw = coalescer.clone();
+            let fw = flushes.clone();
+            let aw = arrived.clone();
+            let flag = all_waiting.clone();
+            waiters.push(std::thread::spawn(move || {
+                aw.fetch_add(1, Ordering::SeqCst);
+                cw.wait(|| false, || -> Result<(), ()> {
+                    assert!(flag.load(Ordering::SeqCst));
+                    fw.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap()
+            }));
+        }
+
+        // Wait until all 4 waiters have registered in `requested`.
+        loop {
+            if coalescer.state.lock().unwrap().requested >= 5 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        all_waiting.store(true, Ordering::SeqCst);
+        *release_first.0.lock().unwrap() = true;
+        release_first.1.notify_all();
+
+        assert!(t1.join().unwrap());
+        let leaders: usize = waiters.into_iter().map(|h| usize::from(h.join().unwrap())).sum();
+        assert_eq!(leaders, 1, "4 concurrent waiters should coalesce into 1 follow-up flush");
+        assert_eq!(flushes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn trail_defaults_to_diagnostics_and_honors_override() {
+        use std::ffi::OsStr;
+        assert!(!trail_on_for(None, false));
+        assert!(trail_on_for(None, true));
+        assert!(trail_on_for(Some(OsStr::new("1")), false));
+        assert!(!trail_on_for(Some(OsStr::new("0")), true));
+        assert!(!trail_on_for(Some(OsStr::new("0")), false));
+    }
+
+    #[test]
+    fn process_private_bytes_returns_cached_nonzero_value() {
+        let first = process_private_bytes();
+        let second = process_private_bytes();
+        assert!(first > 0);
+        assert_eq!(first, second);
+    }
 }
 
 /// Pooled indirect-batch UAV buffer in `D3D12_RESOURCE_STATE_COMMON`, shared
@@ -1742,14 +1954,37 @@ struct BatchBuf(ID3D12Resource);
 // back to COMMON (or kept them in COMMON under Enhanced Barriers).
 unsafe impl Send for BatchBuf {}
 
+/// Pooled mapped 256-byte indirect budget buffer in `D3D12_RESOURCE_STATE_COMMON`.
+struct BudgetBuf(ID3D12Resource, usize);
+// SAFETY: D3D12 resources are free-threaded and the persistent mapping pointer
+// stays valid while the resource is alive.
+unsafe impl Send for BudgetBuf {}
+
 static SPARE_BATCH: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
 const SPARE_BATCH_MAX: usize = 256;
+
+static SPARE_BUDGET: Mutex<Vec<BudgetBuf>> = Mutex::new(Vec::new());
+const SPARE_BUDGET_MAX: usize = 256;
+
+static SPARE_CARD_BUDGET: Mutex<Vec<BatchBuf>> = Mutex::new(Vec::new());
+const SPARE_CARD_BUDGET_MAX: usize = 256;
+
+struct IndirectPool {
+    kept: Vec<(BatchBuf, u64)>,
+    bytes: u64,
+}
+
+static SPARE_INDIRECT: Mutex<IndirectPool> = Mutex::new(IndirectPool {
+    kept: Vec::new(),
+    bytes: 0,
+});
+const SPARE_INDIRECT_MAX_BYTES: u64 = 64 << 20;
 
 fn take_batch_buffer(size: u64) -> Option<ID3D12Resource> {
     if let Some(BatchBuf(buf)) = SPARE_BATCH.lock().unwrap_or_else(|e| e.into_inner()).pop() {
         return Some(buf);
     }
-    let made = host()?.uav_buffer(size)?;
+    let made = host()?.internal_uav_buffer(size)?;
     name(&made, || format!("indirect batches {size:#x}"));
     Some(made)
 }
@@ -1759,7 +1994,7 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
         return;
     }
     // BatchBuf lives in local VRAM (~128 KiB each, < 8 MiB at cap), not host RAM;
-    // keep the full pool so recording threads don't churn uav_buffer + mapped().
+    // keep the full pool so recording threads don't churn internal allocations.
     let limit = SPARE_BATCH_MAX;
     let mut overflow = Vec::new();
     {
@@ -1772,6 +2007,84 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
             }
         }
     }
+    drop(overflow);
+}
+
+fn take_budget_buffer() -> Option<(ID3D12Resource, usize)> {
+    if let Some(BudgetBuf(buf, ptr)) = SPARE_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Some((buf, ptr));
+    }
+    let (b, d) = host()?.internal_shared_buffer(256)?;
+    Some((b, d as usize))
+}
+
+fn give_budget_buffer(buf: (ID3D12Resource, usize)) {
+    let overflow = {
+        let mut spare = SPARE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < SPARE_BUDGET_MAX {
+            spare.push(BudgetBuf(buf.0, buf.1));
+            None
+        } else {
+            Some(buf.0)
+        }
+    };
+    drop(overflow);
+}
+
+fn take_card_budget_buffer() -> Option<ID3D12Resource> {
+    if let Some(BatchBuf(buf)) = SPARE_CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+        return Some(buf);
+    }
+    let buffer = host()?.internal_uav_buffer(256)?;
+    name(&buffer, || "indirect budget".to_owned());
+    Some(buffer)
+}
+
+fn give_card_budget_buffer(buf: ID3D12Resource) {
+    let overflow = {
+        let mut spare = SPARE_CARD_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < SPARE_CARD_BUDGET_MAX {
+            spare.push(BatchBuf(buf));
+            None
+        } else {
+            Some(buf)
+        }
+    };
+    drop(overflow);
+}
+
+fn take_indirect_buffer(needed: u64) -> Option<(ID3D12Resource, u64)> {
+    let max_fit = needed.saturating_mul(4);
+    {
+        let mut pool = SPARE_INDIRECT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((idx, _)) = pool
+            .kept
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, cap))| *cap >= needed && *cap <= max_fit)
+            .min_by_key(|(_, (_, cap))| *cap)
+        {
+            let (BatchBuf(buf), cap) = pool.kept.swap_remove(idx);
+            pool.bytes -= cap;
+            return Some((buf, cap));
+        }
+    }
+    let buffer = host()?.internal_uav_buffer(needed)?;
+    name(&buffer, || format!("indirect arguments {needed:#x}"));
+    Some((buffer, needed))
+}
+
+fn give_indirect_buffer(buf: ID3D12Resource, cap: u64) {
+    let overflow = {
+        let mut pool = SPARE_INDIRECT.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.bytes.saturating_add(cap) <= SPARE_INDIRECT_MAX_BYTES {
+            pool.bytes += cap;
+            pool.kept.push((BatchBuf(buf), cap));
+            None
+        } else {
+            Some(buf)
+        }
+    };
     drop(overflow);
 }
 
@@ -1817,14 +2130,17 @@ pub(crate) struct HostList {
     indirects: indirects::Shared,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
-    /// it what the clamp notes about mesh records. In memory the CPU maps.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// it what the clamp notes about mesh records. In memory the CPU maps,
+    /// pooled globally in [`SPARE_BUDGET`] across list resets/drops.
+    budget: Mutex<Option<(ID3D12Resource, usize)>>,
     /// The same words in the card's own memory ([`card_budget`]), which the
     /// clamp uses instead when there is one: zeroed in the list before its
-    /// first clamp, its notes copied to `budget` when the list closes.
-    card_budget: OnceLock<Option<ID3D12Resource>>,
+    /// first clamp, its notes copied to `budget` when the list closes, and
+    /// pooled globally in [`SPARE_CARD_BUDGET`].
+    card_budget: Mutex<Option<ID3D12Resource>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
+    /// grown to the largest indirect execution recorded on the list and
+    /// pooled globally in [`SPARE_INDIRECT`] across list resets/drops.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
@@ -1846,6 +2162,34 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+}
+
+impl Drop for HostList {
+    fn drop(&mut self) {
+        let indirect_clean = self
+            .deferred
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .indirect_readable
+            == 0;
+        if let Some(budget) = self.budget.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            give_budget_buffer(budget);
+        }
+        if let Some(card_budget) = self.card_budget.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            give_card_budget_buffer(card_budget);
+        }
+        if let Some((buf, cap)) = self.indirect_args.get_mut().unwrap_or_else(|e| e.into_inner()).take()
+            && indirect_clean
+        {
+            give_indirect_buffer(buf, cap);
+        }
+        let args = self.batch_args.get_mut().unwrap_or_else(|e| e.into_inner());
+        let left = std::mem::take(&mut args.1);
+        let buffers = std::mem::take(&mut args.0);
+        if left == 0 {
+            give_batch_buffers(buffers);
+        }
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -2771,7 +3115,11 @@ fn take_list_upload(host: &Host, size: u64) -> Option<(Chunk, u64)> {
         return Some((chunk, class));
     }
     let alloc = if class <= LIST_UPLOAD_ITEM_MAX { class } else { size.max(1) };
-    let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(alloc)? } else { host.upload_buffer(alloc)? };
+    let (buffer, data) = if card_steps::stage() > 1 {
+        host.internal_shared_buffer(alloc)?
+    } else {
+        host.upload_buffer(alloc)?
+    };
     name(&buffer, || format!("list upload {alloc:#x}"));
     Some((
         Chunk {
@@ -5519,8 +5867,8 @@ impl Host {
                 pipelines,
                 #[cfg(feature = "diagnostics")]
                 indirects,
-                budget: OnceLock::new(),
-                card_budget: OnceLock::new(),
+                budget: Mutex::default(),
+                card_budget: Mutex::default(),
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
@@ -5621,9 +5969,9 @@ impl Host {
         // submissions, avoiding mid-frame `WHY_MOST` settles.
         const RESULTS: u64 = 4 << 20;
         const PIECE_INDICES: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.internal_shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        let (piece_indices, idx_data) = self.shared_buffer(PIECE_INDICES).ok_or_else(windows::core::Error::empty)?;
+        let (piece_indices, idx_data) = self.internal_shared_buffer(PIECE_INDICES).ok_or_else(windows::core::Error::empty)?;
         name(&piece_indices, || "card compare rehash piece indices".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -5774,7 +6122,7 @@ impl Host {
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if !shadow.card_has_before() {
                 shadow.card_make_before(|size| {
-                    let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                    let before = self.internal_uav_buffer(crate::shadow::card_hash_bytes(size))?;
                     name(&before, || "title buffer on the card, hashes of its pieces".into());
                     Some(before)
                 });
@@ -6347,7 +6695,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.internal_shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -6670,7 +7018,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.internal_shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -7145,9 +7493,9 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     ///
-    /// `parts`: the lists of `runs` at which another part begins
-    /// ([`joins`]): those go to the queue in calls of their own, one after the
-    /// other, as they would have.
+    /// `parts`: the lists of `runs` at which another joined part begins
+    /// ([`joins`]); used for per-part front-refresh planning while the closed
+    /// lists go to the queue in one `ExecuteCommandLists` call.
     fn submit<'a>(
         &'a self,
         runs: &[&HostList],
@@ -7568,17 +7916,17 @@ impl Host {
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
+            // SAFETY: closed lists; the fence is ours. All joined parts share
+            // one signal with no intervening fence wait/signal, and preludes
+            // handle all cross-list texture transitions, so one batched
+            // `ExecuteCommandLists` is semantically identical.
             let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    // Release `QUEUE_ORDER` as soon as the first batch (holding
-                    // `sync`) is on the queue.
-                    drop(card_order.take());
-                    from = to;
+                if !lists.is_empty() {
+                    self.queue.ExecuteCommandLists(&lists);
                 }
+                // Release `QUEUE_ORDER` as soon as the batch (holding `sync`)
+                // is on the queue.
+                drop(card_order.take());
                 self.queue.Signal(&self.fence, *submitted)
             };
             #[cfg(feature = "diagnostics")]
@@ -8260,12 +8608,20 @@ impl HostList {
         self._alive.used();
         self.release_prelude();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.deferred().clear();
+        let indirect_clean = {
+            let mut deferred = self.deferred();
+            let clean = deferred.indirect_readable == 0;
+            deferred.clear();
+            clean
+        };
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins_writing.store(false, Ordering::Relaxed);
         self.aliases.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if dred_any() {
+            self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -8278,6 +8634,17 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        if let Some(budget) = self.budget.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            give_budget_buffer(budget);
+        }
+        if let Some(card_budget) = self.card_budget.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            give_card_budget_buffer(card_budget);
+        }
+        if let Some((buf, cap)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && indirect_clean
+        {
+            give_indirect_buffer(buf, cap);
         }
         {
             let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
@@ -8314,15 +8681,23 @@ impl HostList {
             recycle_prelude(prelude);
         }
         *self.coming.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
-        self.deferred.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        let indirect_clean = {
+            let deferred = self.deferred.get_mut().unwrap_or_else(|e| e.into_inner());
+            let clean = deferred.indirect_readable == 0;
+            deferred.clear();
+            clean
+        };
         self.states.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         *self.twins_writing.get_mut() = false;
         self.aliases.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
-        if let Some(pipelines) = std::sync::Arc::get_mut(&mut self.pipelines) {
-            pipelines.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
-        } else {
-            self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if dred_any() {
+            if let Some(pipelines) = std::sync::Arc::get_mut(&mut self.pipelines) {
+                pipelines.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+            } else {
+                self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
         }
         #[cfg(feature = "diagnostics")]
         if let Some(indirects) = std::sync::Arc::get_mut(&mut self.indirects) {
@@ -8342,6 +8717,17 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        if let Some(budget) = self.budget.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            give_budget_buffer(budget);
+        }
+        if let Some(card_budget) = self.card_budget.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            give_card_budget_buffer(card_budget);
+        }
+        if let Some((buf, cap)) = self.indirect_args.get_mut().unwrap_or_else(|e| e.into_inner()).take()
+            && indirect_clean
+        {
+            give_indirect_buffer(buf, cap);
         }
         {
             let args = self.batch_args.get_mut().unwrap_or_else(|e| e.into_inner());
@@ -9021,11 +9407,22 @@ impl HostList {
         }
     }
 
-    /// Notes a pipeline the list binds.
+    /// Notes a pipeline the list binds (only when DRED diagnostics are active).
     pub(crate) fn used_pipeline(&self, name: &str) {
-        let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        if !pipelines.contains(name) {
-            pipelines.insert(name.to_owned());
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            let _ = name;
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            if !dred_any() {
+                return;
+            }
+            let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if !pipelines.contains(name) {
+                pipelines.insert(name.to_owned());
+            }
         }
     }
 
@@ -9267,20 +9664,28 @@ impl HostList {
     /// second clamp on the same recording onward so callers can emit a
     /// resource-scoped UAV barrier on the budget buffer.
     pub(crate) fn budget_resource(&self) -> Option<(ID3D12Resource, u64, bool)> {
-        let (buffer, data) = self
-            .budget
-            .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
-            })
-            .as_ref()?;
-        let card = self.card_budget.get_or_init(|| self.make_card_budget()).as_ref();
+        let (buffer, data) = {
+            let mut slot = self.budget.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = take_budget_buffer();
+            }
+            slot.clone()?
+        };
+        let card = if crate::indirect::budget_enabled() && card_budget() {
+            let mut slot = self.card_budget.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.is_none() {
+                *slot = self.make_card_budget();
+            }
+            slot.clone()
+        } else {
+            None
+        };
         let mut deferred = self.deferred();
         let was_used = deferred.budget_used;
         deferred.budget_used = true;
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
-            let at = *data;
+            let at = data;
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
@@ -9301,14 +9706,14 @@ impl HostList {
             });
             deferred.push_step(Step::Host(notes, (0, 0)));
             drop(deferred);
-            if let Some(card) = card {
+            if let Some(card) = &card {
                 self.zero_card_budget(card);
             }
         }
         let res = card.unwrap_or(buffer);
         // SAFETY: a live buffer.
         let gpu = unsafe { res.GetGPUVirtualAddress() };
-        Some((res.clone(), gpu, was_used))
+        Some((res, gpu, was_used))
     }
 
     /// Whether a global UAV barrier has already flushed all prior shader/copy
@@ -9374,9 +9779,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
-        name(&buffer, || "indirect budget".to_owned());
-        Some(buffer)
+        take_card_budget_buffer()
     }
 
     /// Records, before the list's first clamp, the zeroing of the card's
@@ -9440,14 +9843,14 @@ impl HostList {
         if !crate::indirect::budget_enabled() || !self.deferred().budget_zeroed {
             return;
         }
-        let (Some(Some(card)), Some(Some((mapped, _)))) =
-            (self.card_budget.get(), self.budget.get())
-        else {
+        let card = self.card_budget.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mapped = self.budget.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(b, _)| b.clone());
+        let (Some(card), Some(mapped)) = (card, mapped) else {
             return;
         };
         if let Some(list7) = crate::indirect::enhanced_clamp_list(self) {
             let pre = [crate::indirect::enhanced_buffer_barrier(
-                card,
+                &card,
                 D3D12_BARRIER_SYNC_COMPUTE_SHADING,
                 D3D12_BARRIER_SYNC_COPY,
                 D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
@@ -9462,7 +9865,7 @@ impl HostList {
                         pBufferBarriers: pre.as_ptr(),
                     },
                 }]);
-                self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+                self.list.CopyBufferRegion(&mapped, 4, &card, 4, 16);
             }
             return;
         }
@@ -9470,13 +9873,13 @@ impl HostList {
         // mapped one is promoted from common to the copy destination.
         unsafe {
             self.list.ResourceBarrier(&[transition(
-                card,
+                &card,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+            self.list.CopyBufferRegion(&mapped, 4, &card, 4, 16);
             self.list.ResourceBarrier(&[transition(
-                card,
+                &card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_COMMON,
             )]);
@@ -9484,9 +9887,9 @@ impl HostList {
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
+    /// clamped indirect arguments, reused across executions and pooled
+    /// globally across resets/drops. Smaller buffers replaced mid-list stay
+    /// alive until [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
@@ -9500,9 +9903,8 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
-        name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let (buffer, actual_cap) = take_indirect_buffer(alloc)?;
+        let old = slot.replace((buffer.clone(), actual_cap));
         drop(slot);
         if let Some((old_buf, _)) = old {
             // It ends the list common, as every scratch buffer does.
@@ -12271,12 +12673,14 @@ impl Host {
         };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
+        // SAFETY: plain creation and mapping of an upload buffer (never
+        // published into a live bindless heap; D3D12 orders mappings before
+        // subsequent ExecuteCommandLists).
         let made = unsafe {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    D3D12_HEAP_FLAG_NONE,
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -12284,7 +12688,6 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -12785,6 +13188,14 @@ impl Host {
             let read_now = take_shot || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = take_shot;
+            // In release builds without a pending screenshot, nothing copies
+            // from/onto `back` after two-plane compositing, so transition
+            // `RENDER_TARGET -> PRESENT` directly. In diagnostics builds,
+            // `Panel::draw` can be toggled at runtime and expects `COPY_DEST`.
+            #[cfg(feature = "diagnostics")]
+            let needs_back_copy = true;
+            #[cfg(not(feature = "diagnostics"))]
+            let needs_back_copy = take_shot;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -12851,7 +13262,11 @@ impl Host {
                     post.push(transition(
                         &back,
                         D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        if needs_back_copy {
+                            D3D12_RESOURCE_STATE_COPY_DEST
+                        } else {
+                            D3D12_RESOURCE_STATE_PRESENT
+                        },
                     ));
                     list.ResourceBarrier(&post);
                     true
@@ -12915,11 +13330,13 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
-                list.ResourceBarrier(&[transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                )]);
+                if needs_back_copy {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
+                }
             } else {
                 let mut post = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -13144,7 +13561,21 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    ///
+    /// Waits for residency + WDDM page-table mapping so buffers published into
+    /// a live shader-visible descriptor heap cannot fault in-flight lists.
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_inner(size, true)
+    }
+
+    /// Internal non-bindless [`Self::shared_buffer`]: skips `not_resident()`,
+    /// `MakeResident()`, and `mapped()` because the resource is never published
+    /// into a live shader-visible descriptor heap while flights run.
+    pub(crate) fn internal_shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_inner(size, false)
+    }
+
+    fn shared_buffer_inner(&self, size: u64, bindless: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -13167,6 +13598,7 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
+        let heap_flags = if bindless { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         let mut buffer: Option<ID3D12Resource> = None;
         let mut data = std::ptr::null_mut();
         // SAFETY: plain creation and mapping of a CPU-visible buffer.
@@ -13174,7 +13606,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    heap_flags,
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -13182,8 +13614,10 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if bindless {
+                        resident(&self.device, b)?;
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -13287,7 +13721,21 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    ///
+    /// Waits for residency + WDDM page-table mapping so buffers published into
+    /// a live shader-visible descriptor heap cannot fault in-flight lists.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, true)
+    }
+
+    /// Internal non-bindless [`Self::uav_buffer`]: skips `not_resident()`,
+    /// `MakeResident()`, and `mapped()` because the resource is never published
+    /// into a live shader-visible descriptor heap while flights run.
+    pub(crate) fn internal_uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, false)
+    }
+
+    fn uav_buffer_inner(&self, size: u64, bindless: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -13308,12 +13756,13 @@ impl Host {
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
         };
+        let heap_flags = if bindless { not_resident() } else { D3D12_HEAP_FLAG_NONE };
         let mut buffer: Option<ID3D12Resource> = None;
         // SAFETY: plain creation of a device-local buffer.
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                heap_flags,
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -13324,7 +13773,12 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = if bindless {
+            made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)))
+                .and_then(|()| mapped(&self.device))
+        } else {
+            made
+        };
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -13349,7 +13803,7 @@ impl Host {
         if let Some((_, buffer)) = all.0.iter().find(|(c, _)| *c == class) {
             return Some(buffer.clone());
         }
-        let buffer = self.uav_buffer(class)?;
+        let buffer = self.internal_uav_buffer(class)?;
         name(&buffer, || format!("depth twin copies {class:#x}"));
         all.0.push((class, buffer.clone()));
         Some(buffer)

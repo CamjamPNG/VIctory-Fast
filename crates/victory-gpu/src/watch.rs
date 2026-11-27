@@ -1267,13 +1267,15 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// a submission's standing asking is active.
 static JOURNAL_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Cached `MEM_PRIVATE` VirtualAlloc reservation `[base, end)` in 64 KiB pages.
-/// Used only to group (never to drop) ranges in `ask_once`/`ask_ahead` and to
-/// clamp `ask_early` slices to valid reservation bounds.
+/// Cached address span `[base, end)` in 64 KiB pages: either a confirmed
+/// `MEM_PRIVATE` VirtualAlloc reservation (`private: true`) or a negative-cached
+/// non-private span such as `MEM_MAPPED`/`MEM_IMAGE` (`private: false`) so
+/// `group_pieces` does not repeat `VirtualQuery` every submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Reservation {
     base: usize,
     end: usize,
+    private: bool,
 }
 
 static RESERVATIONS: RwLock<Vec<Reservation>> = RwLock::new(Vec::new());
@@ -1314,9 +1316,11 @@ thread_local! {
     static WATCH_GAP_IN_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// Queries Windows for the `MEM_PRIVATE` VirtualAlloc reservation containing
-/// `page`. Returns `None` for non-private, free, or sub-64 KiB allocations.
-fn query_private_reservation(page: usize) -> Option<Reservation> {
+/// Queries Windows for the reservation span containing `page`: returns
+/// `private: true` for `MEM_PRIVATE` VirtualAlloc reservations, `private: false`
+/// for non-private mapped/image regions (negative-cached), or `None` for free
+/// or sub-64 KiB regions.
+fn query_reservation(page: usize) -> Option<Reservation> {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1324,8 +1328,17 @@ fn query_private_reservation(page: usize) -> Option<Reservation> {
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: valid out pointer of the right size.
     let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.State == MEM_FREE || info.Type != MEM_PRIVATE {
+    if n == 0 || info.State == MEM_FREE {
         return None;
+    }
+    if info.Type != MEM_PRIVATE {
+        let base_page = (info.BaseAddress as usize).div_ceil(PAGE);
+        let end_page = (info.BaseAddress as usize).saturating_add(info.RegionSize) / PAGE;
+        return (base_page <= page && page < end_page).then_some(Reservation {
+            base: base_page,
+            end: end_page,
+            private: false,
+        });
     }
     let alloc_base = info.AllocationBase as usize;
     if alloc_base == 0 {
@@ -1355,6 +1368,7 @@ fn query_private_reservation(page: usize) -> Option<Reservation> {
     (base_page <= page && page < end_page).then_some(Reservation {
         base: base_page,
         end: end_page,
+        private: true,
     })
 }
 
@@ -1396,7 +1410,7 @@ fn group_pieces(pieces: &[(usize, usize)], allow_singletons: bool) -> Vec<(usize
         let cached = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
         for (i, &(first, last)) in pieces.iter().enumerate() {
             if let Some(r) = find_cached_reservation(&cached, first) {
-                if last <= r.end {
+                if r.private && last <= r.end {
                     res_of[i] = Some(r);
                 }
             } else {
@@ -1414,7 +1428,7 @@ fn group_pieces(pieces: &[(usize, usize)], allow_singletons: bool) -> Vec<(usize
             {
                 Some(r)
             } else {
-                let q = query_private_reservation(first);
+                let q = query_reservation(first);
                 if let Some(r) = q {
                     cache_reservation(r);
                     last_found = Some(r);
@@ -1422,6 +1436,7 @@ fn group_pieces(pieces: &[(usize, usize)], allow_singletons: bool) -> Vec<(usize
                 q
             };
             if let Some(r) = found
+                && r.private
                 && last <= r.end
             {
                 res_of[i] = Some(r);
@@ -1653,6 +1668,10 @@ fn drain_early_pieces(pieces: &mut Vec<usize>) -> u64 {
                 if r.base >= p_hi {
                     break;
                 }
+                if !r.private {
+                    idx += 1;
+                    continue;
+                }
                 let lo = p_lo.max(r.base);
                 let hi = p_hi.min(r.end);
                 if lo < hi
@@ -1800,11 +1819,13 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     pieces.sort_unstable();
     coalesce_overlapping_pieces(&mut pieces);
-    let groups = group_pieces(&pieces, true);
+    let mut groups = group_pieces(&pieces, true);
     let _held = AskingMany::hold(groups.iter().map(|&(_, _, first, last)| (first, last)).collect());
     let (mut asked, mut written) = (Vec::with_capacity(groups.len()), Vec::new());
     let threads = watch_threads();
     if threads >= 2 && groups.len() >= 2 {
+        // Dispatch largest spans first to minimize parallel straggler tail.
+        groups.sort_unstable_by(|a, b| (b.3 - b.2).cmp(&(a.3 - a.2)));
         let slots: Vec<Mutex<(Vec<(usize, usize)>, Vec<(usize, u16)>)>> =
             (0..groups.len()).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
         WatchPool::get(threads).each(groups.len(), &|g| {
@@ -2372,13 +2393,31 @@ thread_local! {
 static BUSY: Bits = Bits::new();
 
 /// Claims of blocks ([`BUSY`]), let go when dropped.
-struct Claims(Vec<usize>);
+/// Stores up to 8 claims inline to avoid per-fault heap allocations.
+struct Claims {
+    inline: [usize; 8],
+    len: usize,
+    overflow: Vec<usize>,
+}
 
 impl Claims {
+    fn push(&mut self, block: usize) {
+        if self.len < self.inline.len() {
+            self.inline[self.len] = block;
+            self.len += 1;
+        } else {
+            self.overflow.push(block);
+        }
+    }
+
     /// The claims of `blocks` (in order, each once), waited for one after
     /// the other: who waits holds only claims of lower blocks.
     fn wait_for(blocks: &[usize]) -> Claims {
         debug_assert!(blocks.windows(2).all(|w| w[0] < w[1]));
+        let mut claims = Claims::none();
+        if blocks.len() > claims.inline.len() {
+            claims.overflow.reserve(blocks.len() - claims.inline.len());
+        }
         let mut spun = 0u64;
         for &block in blocks {
             let mut tries = 0u32;
@@ -2392,18 +2431,19 @@ impl Claims {
                     std::thread::yield_now();
                 }
             }
+            claims.push(block);
         }
         if spun != 0 {
             port6_count(P6_CLAIM_SPINS, spun);
         }
-        Claims(blocks.to_vec())
+        claims
     }
 
     /// The claim of `block` if it is free; nothing waited for.
     fn try_one(&mut self, block: usize) -> bool {
         let got = BUSY.try_set(block);
         if got {
-            self.0.push(block);
+            self.push(block);
         } else {
             port6_count(P6_CLAIMS_MISSED, 1);
         }
@@ -2411,17 +2451,20 @@ impl Claims {
     }
 
     fn none() -> Claims {
-        Claims(Vec::new())
+        Claims { inline: [0; 8], len: 0, overflow: Vec::new() }
     }
 
     fn holds(&self, block: usize) -> bool {
-        self.0.contains(&block)
+        self.inline[..self.len].contains(&block) || self.overflow.contains(&block)
     }
 }
 
 impl Drop for Claims {
     fn drop(&mut self) {
-        for &block in &self.0 {
+        for &block in &self.inline[..self.len] {
+            BUSY.clear(block);
+        }
+        for &block in &self.overflow {
             BUSY.clear(block);
         }
     }
@@ -2581,6 +2624,7 @@ impl Bits {
     }
 
     /// How many are set.
+    #[cfg(test)]
     fn count(&self) -> usize {
         self.0
             .iter()
@@ -2921,13 +2965,17 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
-    if len == 0 || !known_holes() {
+    if len == 0 {
+        return;
+    }
+    invalidate_reservations(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    if !known_holes() {
         return;
     }
     let g = guards();
     let blocks: Vec<usize> = g.held.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
     for block in blocks {
-        g.held.remove(block);
+        g.remove_held(block);
         PUBLISHED.clear(block);
     }
 }
@@ -2935,6 +2983,7 @@ pub fn title_memory_allocated(at: usize, len: usize) {
 /// Once a frame: a hundredth of the known holes are looked at, in case one
 /// was filled with nobody telling ([`title_memory_allocated`],
 /// [`title_memory_remapped`]), which no title we know does.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn look_at_holes() {
     const PARTS: usize = 100;
     if !known_holes() {
@@ -2942,9 +2991,13 @@ pub(crate) fn look_at_holes() {
     }
     static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let blocks: Vec<usize> = {
-        let g = guards();
+        let g = guards_shared();
+        let total = g.held_count.load(std::sync::atomic::Ordering::Relaxed);
+        if total == 0 {
+            return;
+        }
         let from = FROM.load(std::sync::atomic::Ordering::Relaxed);
-        let part: Vec<usize> = g.held.range(from..).take(g.held.len() / PARTS + 1).collect();
+        let part: Vec<usize> = g.held.range(from..).take(total / PARTS + 1).collect();
         FROM.store(part.last().map_or(0, |b| b + 1), std::sync::atomic::Ordering::Relaxed);
         part
     };
@@ -2957,7 +3010,7 @@ pub(crate) fn look_at_holes() {
             // (Or unmapped memory was mapped since the part was taken: told
             // already, and forgotten.)
             let g = guards();
-            if g.held.remove(block) {
+            if g.remove_held(block) {
                 PUBLISHED.clear(block);
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| {
@@ -2970,6 +3023,12 @@ pub(crate) fn look_at_holes() {
         }
     }
 }
+
+/// Once a frame: speculative hole probe disabled outside `diagnostics` builds
+/// (no title fills placeholders without notifying the runtime).
+#[cfg(not(feature = "diagnostics"))]
+#[inline]
+pub(crate) fn look_at_holes() {}
 
 /// Whether a block of `[start, end)` is view memory read-only by our hand:
 /// the kernel keeps no written pages of it and would refuse an asking.
@@ -3057,6 +3116,10 @@ impl Blocks {
         self.0.any(first, last)
     }
 
+    fn all(&self, first: usize, last: usize) -> bool {
+        self.0.all(first, last)
+    }
+
     /// Whether it was not there.
     fn insert(&self, block: usize) -> bool {
         self.0.set_was(block) == Some(false)
@@ -3090,6 +3153,7 @@ impl Blocks {
         self.0.set_in(first, last)
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.0.count()
     }
@@ -3172,6 +3236,8 @@ struct Guards {
     absent: Blocks,
     /// Of those, the ones in placeholders ([`known_holes`]).
     held: Blocks,
+    #[cfg(feature = "diagnostics")]
+    held_count: std::sync::atomic::AtomicUsize,
     /// Blocks that were absent and turned out to be other memory than views
     /// when something was there again: never guarded, copied every time.
     foreign: BTreeSet<usize>,
@@ -3292,6 +3358,24 @@ fn is_changing(block: usize) -> bool {
 }
 
 impl Guards {
+    fn insert_held(&self, block: usize) -> bool {
+        let added = self.held.insert(block);
+        #[cfg(feature = "diagnostics")]
+        if added {
+            self.held_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        added
+    }
+
+    fn remove_held(&self, block: usize) -> bool {
+        let removed = self.held.remove(block);
+        #[cfg(feature = "diagnostics")]
+        if removed {
+            self.held_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        removed
+    }
+
     fn left_alone(&self, block: usize) -> bool {
         self.kernel.iter().any(|&(first, last)| (first..last).contains(&block)) || is_changing(block)
     }
@@ -3389,6 +3473,8 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     clean: Blocks::new(),
     absent: Blocks::new(),
     held: Blocks::new(),
+    #[cfg(feature = "diagnostics")]
+    held_count: std::sync::atomic::AtomicUsize::new(0),
     foreign: BTreeSet::new(),
     kernel: Vec::new(),
     aliased: Blocks::new(),
@@ -3650,37 +3736,60 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && (PROTECTED.any(first, first + 1) || {
-            // (Renderer port #6: shared, a look only.)
-            let of = |g: &Guards| g.protected.contains(first) || g.absent.contains(first);
-            if port_guard() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
-        });
-    if !known && !is_view(start, end) {
-        return None;
-    }
-    install();
-    // The holes that an ordinary commit may have filled, with no word of the
-    // runtime's. Windows is asked with the lock not held (the range is, no
-    // other thread asks about it: `ASKING`); what the runtime tells meanwhile
-    // takes the block out of the set, and it is looked at as any other.
-    let unsure: Vec<usize> = {
-        let of = |g: &Guards| -> Option<Vec<usize>> {
-            if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let check_clean_and_unsure = |g: &Guards| -> Option<Vec<usize>> {
+        if (first >= last || g.clean.all(first, last)) && !BESIDE.any(first, last) {
+            return None;
+        }
+        Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())
+    };
+    let fast_protected = !ask && PROTECTED.any(first, first + 1);
+    let initial: Option<Option<Vec<usize>>> = if !ask {
+        // Merge view-known check and clean/absent scan into a single lock acquisition.
+        let of = |g: &Guards| -> Option<Option<Vec<usize>>> {
+            let known = fast_protected || g.protected.contains(first) || g.absent.contains(first);
+            known.then(|| check_clean_and_unsure(g))
+        };
+        if port_guard() { of(&guards_timed_shared()) } else { of(&guards_timed()) }
+    } else {
+        None
+    };
+    let unsure: Vec<usize> = match initial {
+        Some(Some(unsure)) => {
+            install();
+            unsure
+        }
+        Some(None) => {
+            install();
+            // Nothing written, mapped or new since the range was last taken.
+            #[cfg(feature = "diagnostics")]
+            tally(3, 1);
+            return Some(Vec::new());
+        }
+        None => {
+            if !is_view(start, end) {
                 return None;
             }
-            Some(g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect())
-        };
-        // (Renderer port #6: shared, a look only. A block a fault opens
-        // meanwhile was clean, read-only and unwritten when looked at.)
-        let unsure = if port_guard() { of(&guards_timed_shared()) } else { of(&guards_timed()) };
-        match unsure {
-            Some(unsure) => unsure,
-            None => {
-                // Nothing written, mapped or new since the range was last taken.
-                #[cfg(feature = "diagnostics")]
-                tally(3, 1);
-                return Some(Vec::new());
+            install();
+            // The holes that an ordinary commit may have filled, with no word of the
+            // runtime's. Windows is asked with the lock not held (the range is, no
+            // other thread asks about it: `ASKING`); what the runtime tells meanwhile
+            // takes the block out of the set, and it is looked at as any other.
+            // (Renderer port #6: shared, a look only. A block a fault opens
+            // meanwhile was clean, read-only and unwritten when looked at.)
+            let unsure = if port_guard() {
+                check_clean_and_unsure(&guards_timed_shared())
+            } else {
+                check_clean_and_unsure(&guards_timed())
+            };
+            match unsure {
+                Some(unsure) => unsure,
+                None => {
+                    // Nothing written, mapped or new since the range was last taken.
+                    #[cfg(feature = "diagnostics")]
+                    tally(3, 1);
+                    return Some(Vec::new());
+                }
             }
         }
     };
@@ -4176,10 +4285,10 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
                     g.absent.insert(b);
                     if holes {
                         if b < ph_until {
-                            g.held.insert(b);
+                            g.insert_held(b);
                         } else if let Some(end) = placeholder_end(b) {
                             ph_until = end;
-                            g.held.insert(b);
+                            g.insert_held(b);
                         }
                     }
                 }
@@ -4194,7 +4303,7 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
             if uncommitted_end(block) > block {
                 g.absent.insert(block);
                 if known_holes() && placeholder(block) {
-                    g.held.insert(block);
+                    g.insert_held(block);
                 }
             }
         }
@@ -4397,23 +4506,32 @@ pub struct KernelWrite(usize, usize);
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if len == 0 {
+        return KernelWrite(first, first);
+    }
+    if light()
+        && !PROTECTED.any(first, last)
+        && !PUBLISHED.any(first, last)
+        && !VIEWS.any(first, last)
+    {
+        crate::descriptor::host::remapped(at, len);
+        return KernelWrite(first, first);
+    }
     {
         let mut g = guards_timed();
         open(&g, at, at.saturating_add(len));
-        if len != 0 {
-            // Nothing known of them stands while they are left alone.
-            let absent: Vec<usize> = g.absent.range(first..last).collect();
-            for block in absent {
-                g.absent.remove(block);
-                if g.held.remove(block) {
-                    PUBLISHED.clear(block);
-                }
+        // Nothing known of them stands while they are left alone.
+        let absent: Vec<usize> = g.absent.range(first..last).collect();
+        for block in absent {
+            g.absent.remove(block);
+            if g.remove_held(block) {
+                PUBLISHED.clear(block);
             }
-            g.kernel.push((first, last));
         }
+        g.kernel.push((first, last));
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    KernelWrite(first, last)
 }
 
 impl Drop for KernelWrite {
@@ -4868,7 +4986,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(first..end).collect();
     for block in absent {
         g.absent.remove(block);
-        if g.held.remove(block) {
+        if g.remove_held(block) {
             PUBLISHED.clear(block);
         }
     }
@@ -4948,7 +5066,7 @@ fn clear_changed_guards(g: &mut Guards, first: usize, last: usize) {
         let absent: Vec<usize> = g.absent.range(range.clone()).collect();
         for block in absent {
             g.absent.remove(block);
-            if g.held.remove(block) {
+            if g.remove_held(block) {
                 PUBLISHED.clear(block);
             }
         }
@@ -7378,8 +7496,8 @@ mod port7_tests {
         // Synthetic touching reservations must NEVER merge into one group.
         let syn_a = 0x5000_0000usize;
         let syn_b = syn_a + 16;
-        super::cache_reservation(super::Reservation { base: syn_a, end: syn_b });
-        super::cache_reservation(super::Reservation { base: syn_b, end: syn_b + 16 });
+        super::cache_reservation(super::Reservation { base: syn_a, end: syn_b, private: true });
+        super::cache_reservation(super::Reservation { base: syn_b, end: syn_b + 16, private: true });
         let syn_groups = super::group_pieces(&[(syn_a + 14, syn_b), (syn_b, syn_b + 2)], true);
         assert_eq!(syn_groups.len(), 2, "touching separate reservations must stay split: {syn_groups:?}");
         super::invalidate_reservations(syn_a, syn_b + 16);

@@ -94,7 +94,7 @@ pub(crate) struct Usage {
 /// What makes two instructions without an effect the same value.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Key {
-    Bin(u8, V, V),
+    Bin(u8, u8, V, V),
     Cast(u8, Ty, V),
     Cmp(u8, V, V),
     Select(V, V, V),
@@ -739,7 +739,8 @@ impl Module {
                 } else {
                     (*a, *b)
                 };
-                Key::Bin(*op as u8, a, b)
+                let flags = self.fast_math.get(&i).copied().unwrap_or(0);
+                Key::Bin(*op as u8, flags, a, b)
             }
             Op::Cast(op, v) => Key::Cast(*op as u8, inst.ty, *v),
             Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),

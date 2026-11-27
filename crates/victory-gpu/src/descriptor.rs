@@ -153,6 +153,11 @@ fn update_shader_heap_bounds(heaps: &[(u64, u64, usize)]) {
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    use std::sync::atomic::Ordering::Acquire;
+    let hi = SHADER_HEAPS_BOUNDS[1].load(Acquire);
+    if hi == 0 || handle >= hi || handle < SHADER_HEAPS_BOUNDS[0].load(Acquire) {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let Some(&(_, _, at)) = heaps
         .iter()
@@ -168,6 +173,12 @@ fn mirror(handle: u64) {
     };
     // Renderer port #2: its record is looked at again with the title's own.
     crate::port_descriptors::mark(handle);
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -175,6 +186,73 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Batched [`mirror`] for a contiguous descriptor copy (`CopyDescriptorsSimple`),
+/// resolving `SHADER_HEAPS` once and mirroring via [`host::HostHeap::mirror_batch`].
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    use std::sync::atomic::Ordering::Acquire;
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        mirror(dst);
+        return;
+    }
+    let end = dst.saturating_add(u64::from(count).saturating_mul(step));
+    let hi = SHADER_HEAPS_BOUNDS[1].load(Acquire);
+    if hi == 0 || dst >= hi || end <= SHADER_HEAPS_BOUNDS[0].load(Acquire) {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(_, _, at)) = heaps
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&dst))
+    else {
+        return;
+    };
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+    // the `SHADER_HEAPS` lock we hold here.
+    let heap = unsafe { &*(at as *const Heap) };
+    let Some(first) = heap.index(dst) else {
+        return;
+    };
+    let n = count.min(heap.desc.count.saturating_sub(first));
+    if n == 0 {
+        return;
+    }
+    for i in 0..n {
+        crate::port_descriptors::mark(dst + u64::from(i) * step);
+    }
+    let batch = |host: &host::HostHeap| {
+        if n <= 64 {
+            let mut stack = [0u32; 64];
+            for (i, slot) in stack[..n as usize].iter_mut().enumerate() {
+                *slot = first + i as u32;
+            }
+            host.mirror_batch(&stack[..n as usize], heap.start, step, false);
+        } else {
+            let slots: Vec<u32> = (first..first + n).collect();
+            host.mirror_batch(&slots, heap.start, step, false);
+        }
+    };
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            batch(host);
+        }
+        return;
+    }
+    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    match heap.host.get() {
+        None => pending.extend(first..first + n),
+        Some(host) => {
+            drop(pending);
+            if let Some(host) = host {
+                batch(host);
             }
         }
     }
@@ -503,13 +581,17 @@ fn scan_heap_parts(
             let records: &[u8] = if in_place {
                 // Read where they are, each record once, and compared
                 // as it is read (`host::Copied::changes_in_place`).
+                #[cfg(feature = "diagnostics")]
                 let at = std::time::Instant::now();
                 let count = (to.saturating_sub(lead) as u64 / step).min(slots.end.saturating_sub(first));
                 changed.clear();
                 // SAFETY: as below; title memory is read by a copy that
                 // fails where a page is not there.
                 let whole = unsafe { copied.changes_in_place(first as u32, lead as *const u8, count as usize, &mut bits, &mut changed) };
-                out.ns[1] += since(at);
+                #[cfg(feature = "diagnostics")]
+                {
+                    out.ns[1] += since(at);
+                }
                 // (A run of marked slots is no page; nor does it ask the guards.)
                 if !port || check {
                     out.pages += 1;
@@ -527,12 +609,16 @@ fn scan_heap_parts(
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
+                #[cfg(feature = "diagnostics")]
                 let at = std::time::Instant::now();
                 page_bytes.resize(to - from, 0);
                 if !crate::host::read_into(from as *const u8, &mut page_bytes) {
                     continue;
                 }
-                out.ns[0] += since(at);
+                #[cfg(feature = "diagnostics")]
+                {
+                    out.ns[0] += since(at);
+                }
                 // (A run of marked slots is no page; nor does it ask the guards.)
                 if !port || check {
                     out.pages += 1;
@@ -547,13 +633,18 @@ fn scan_heap_parts(
                 // Only the records that are not the ones last seen
                 // there (`host::Copied::changes`).
                 changed.clear();
+                #[cfg(feature = "diagnostics")]
                 let at = std::time::Instant::now();
                 // SAFETY: the parts are ranges of the heap apart from one
                 // another, and only records that lie whole in one are its.
                 unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
-                out.ns[1] += since(at);
+                #[cfg(feature = "diagnostics")]
+                {
+                    out.ns[1] += since(at);
+                }
                 records
             };
+            #[cfg(feature = "diagnostics")]
             let at = std::time::Instant::now();
             for &index in &changed {
                 let at = (u64::from(index) - first) as usize * step as usize;
@@ -601,7 +692,10 @@ fn scan_heap_parts(
                     2
                 }] += 1;
             }
-            out.ns[2] += since(at);
+            #[cfg(feature = "diagnostics")]
+            {
+                out.ns[2] += since(at);
+            }
             if let Some(began) = checking {
                 crate::port_descriptors::CHECKED[4].fetch_add(since(began), Relaxed);
             }
@@ -2030,9 +2124,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 

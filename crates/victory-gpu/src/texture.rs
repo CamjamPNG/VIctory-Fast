@@ -597,10 +597,13 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 4] = [const { std::sy
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
-fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+#[inline]
+fn waited<T>(_slot: usize, f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let out = f();
-    REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    REFRESH_WAITS[_slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     out
 }
 
@@ -751,6 +754,7 @@ pub(crate) fn host_written(resource: This) {
     if host_wrote(resource as usize) {
         return;
     }
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let new = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         let set = set.get_or_insert_with(Default::default);
@@ -763,6 +767,7 @@ pub(crate) fn host_written(resource: This) {
     };
     // Diagnostics (run 177): where its title memory is, for placed views
     // the title reads that memory through ([`placed_in_host_written`]).
+    #[cfg(feature = "diagnostics")]
     if new && let Some((at, desc)) = crate::resource::texture_memory(resource) {
         // SAFETY: 56 bytes in the description's layout.
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
@@ -778,8 +783,10 @@ pub(crate) fn host_written(resource: This) {
 /// The title memory of textures the host copied into, by address: bytes
 /// and description words 4, 6, 7 and 8 (width, height, layers and levels,
 /// format).
+#[cfg(feature = "diagnostics")]
 static HOST_WRITTEN_AT: Mutex<std::collections::BTreeMap<u64, (u64, u32, u32, u32, u32, usize)>> =
     Mutex::new(std::collections::BTreeMap::new());
+#[cfg(feature = "diagnostics")]
 static HOST_WRITTEN_AT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// A texture the title placed at `address` (description words `desc`) was
@@ -788,6 +795,7 @@ static HOST_WRITTEN_AT_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// memory, which the copy never reached: the copied texels are on the
 /// card in the other texture, where no shader that reads this view finds
 /// them.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     if HOST_WRITTEN_AT_COUNT.load(Ordering::Acquire) == 0 {
         return;
@@ -820,6 +828,10 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
         }
     }
 }
+
+#[cfg(not(feature = "diagnostics"))]
+#[inline]
+pub(crate) fn placed_in_host_written(_address: u64, _desc: &[u32; 14]) {}
 
 /// Whether the host GPU wrote `resource` by a copy or resolve
 /// ([`host_written`]): its host copy cannot be made again from title
@@ -856,6 +868,7 @@ pub(crate) fn forget(resource: usize) {
             STAGING_EPOCH.fetch_add(1, Ordering::Release);
         }
     }
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let removed_host_written = if host_wrote(resource) {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(set) = set.as_mut()
@@ -872,6 +885,7 @@ pub(crate) fn forget(resource: usize) {
     };
     // Its memory may be given to other textures now (run 177: most of the
     // "HERO LEAD" lines were views in memory a released texture had held).
+    #[cfg(feature = "diagnostics")]
     if removed_host_written && HOST_WRITTEN_AT_COUNT.load(Ordering::Acquire) > 0 {
         let mut map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, d| d.5 != resource);
@@ -1792,13 +1806,19 @@ impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let preparing = &crate::host::PREPARING;
+            preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+            preparing[3].fetch_add(read as u64, Relaxed);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = read;
     }
 
     fn movie_plane(&self) -> bool {
@@ -1817,10 +1837,82 @@ impl Staging {
 
     /// Returns the bytes of title memory read.
     fn refresh_now(&self) -> usize {
+        #[cfg(feature = "diagnostics")]
         let whole = std::time::Instant::now();
         let read = self.refresh_timed();
+        #[cfg(feature = "diagnostics")]
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
+    }
+
+    /// Copies only the tiled byte spans of dirty subresources into `read` at
+    /// their exact offsets when `sub_mask` is a strict subset and detiling will
+    /// not read outside those spans; falls back to copying all `read.len()` bytes.
+    fn copy_dirty_mapped(&self, read: &mut [u8], sub_mask: u64, gpu_seeded: bool) -> usize {
+        let sub_count = self.footprints.len();
+        let all = all_subs_mask(sub_count);
+        if !self.on_demand
+            && (!self.gpu_detile || gpu_seeded)
+            && sub_count > 1
+            && sub_count <= 64
+            && (sub_mask & all) != all
+        {
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            let mut ok = true;
+            for i in 0..sub_count {
+                if !sub_selected(sub_mask, i, sub_count) {
+                    continue;
+                }
+                let (mip, slice) = self.part(i);
+                let Some((s, e)) = self.layout.subresource_byte_span(mip, slice) else {
+                    ok = false;
+                    break;
+                };
+                let (s, e) = (s as usize, e as usize);
+                if s > e || e > read.len() {
+                    ok = false;
+                    break;
+                }
+                if e > s {
+                    spans.push((s, e));
+                }
+            }
+            if ok && !spans.is_empty() {
+                spans.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+                let mut total = 0usize;
+                for (s, e) in spans {
+                    if let Some(last) = merged.last_mut()
+                        && s <= last.1
+                    {
+                        if e > last.1 {
+                            total += e - last.1;
+                            last.1 = e;
+                        }
+                    } else {
+                        total += e - s;
+                        merged.push((s, e));
+                    }
+                }
+                if total < read.len() {
+                    for (s, e) in merged {
+                        // SAFETY: `s < e <= read.len() == self.read`; writing
+                        // into `read[s..e]` matches `self.memory + s`.
+                        unsafe {
+                            crate::host::copy_mapped(
+                                read.as_mut_ptr().add(s),
+                                self.memory.wrapping_add(s),
+                                e - s,
+                                false,
+                            );
+                        }
+                    }
+                    return total;
+                }
+            }
+        }
+        crate::host::copy_mapped(read.as_mut_ptr(), self.memory, read.len(), false);
+        read.len()
     }
 
     fn refresh_timed(&self) -> usize {
@@ -1858,13 +1950,14 @@ impl Staging {
             }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let copied = with_read(size, |read| {
+                let copied = self.copy_dirty_mapped(read, sub_mask, last.gpu_seeded);
                 self.detile_masked(read, last, sub_mask);
+                copied
             });
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            crate::copystat::add(crate::copystat::C::TexWatched, copied as u64);
+            return copied;
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -1873,20 +1966,21 @@ impl Staging {
         // is noted, a mapping is announced by the runtime. While neither
         // happened the texture is as it was. What the guard cannot see (a
         // write to the same pages through another view) is still found by
-        // the hash, which is taken every eighth frame only, by the
-        // texture's address, so the textures take turns.
+        // the hash, which is taken periodically by the texture's address so
+        // textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
+        let mut guarded_dirty_mask: Option<u64> = None;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            const HASH_EVERY: u64 = 120;
             let prev_asked = last.asked;
             let unwritten = prev_asked != 0 && written.iter().all(|&(_, w)| w <= prev_asked);
-            let guarded_dirty_mask = if !unwritten && prev_asked != 0 && last.hash.is_some() {
+            guarded_dirty_mask = if !unwritten && prev_asked != 0 && last.hash.is_some() {
                 Some(dirty_subs_from_pages(
                     &self.layout,
                     self.first,
@@ -1907,11 +2001,6 @@ impl Staging {
                 .wrapping_add((start >> 16) as u64)
                 .is_multiple_of(HASH_EVERY)
                 && !recent_ahead;
-            // A texture starts hot: one written that way from its first
-            // frames on changes before the hash has ever caught it.
-            if last.hot_until == 0 {
-                last.hot_until = frame + HOT_FRAMES;
-            }
             let hot = hot_textures() && frame < last.hot_until && !recent_ahead;
             if !exact && (unwritten || guarded_dirty_mask == Some(0)) && !turn && !hot {
                 return 0;
@@ -1924,6 +2013,16 @@ impl Staging {
                 last.hot_until = crate::frame::current() + HOT_FRAMES;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
+            }
+        };
+        let pick_sub_mask = |tiled: &[u8], last: &mut Last, had_prev: bool| -> u64 {
+            if !exact
+                && let Some(mask) = guarded_dirty_mask.filter(|&m| m != 0)
+            {
+                last.sub_hashes.clear();
+                mask
+            } else {
+                self.changed_subs_by_hash(tiled, last, had_prev)
             }
         };
         // From here on the texture's memory may be read in place. Held until
@@ -1969,7 +2068,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                let sub_mask = self.changed_subs_by_hash(read, last, had_prev);
+                let sub_mask = pick_sub_mask(read, last, had_prev);
                 self.detile_masked(read, last, sub_mask);
                 true
             });
@@ -1993,7 +2092,7 @@ impl Staging {
                 let had_prev = last.hash.is_some();
                 last.hash = Some(hash);
                 found_blind(last);
-                let sub_mask = self.changed_subs_by_hash(tiled, last, had_prev);
+                let sub_mask = pick_sub_mask(tiled, last, had_prev);
                 self.detile_masked(tiled, last, sub_mask);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -2012,7 +2111,7 @@ impl Staging {
         let had_prev = last.hash.is_some();
         last.hash = Some(hash);
         found_blind(last);
-        let sub_mask = self.changed_subs_by_hash(tiled, last, had_prev);
+        let sub_mask = pick_sub_mask(tiled, last, had_prev);
         self.detile_masked(tiled, last, sub_mask);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);

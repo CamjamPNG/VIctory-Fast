@@ -17,9 +17,9 @@
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -483,23 +483,62 @@ fn texture_alignment(small: bool) -> u64 {
     if small { u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) } else { 0 }
 }
 
+struct Recent {
+    map: HashMap<usize, u64>,
+    order: VecDeque<(usize, u64)>,
+}
+
+/// Coarse timestamp (`>= 1`) of the most recent pooled texture creation; `0`
+/// means none yet, letting [`fresh`] skip the map lock in steady state.
+static LAST_MADE_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Textures made in the last second ([`fresh`]), and when.
-static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
+static RECENT: OnceLock<RwLock<Recent>> = OnceLock::new();
+
+fn recent_now() -> u64 {
+    crate::host::coarse_ms().max(1)
+}
 
 /// Whether `texture` was made in a block in the last second.
 pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
+    let last = LAST_MADE_MS.load(Ordering::Acquire);
+    if last == 0 {
+        return false;
+    }
+    let current = recent_now();
+    if last.saturating_add(1000) < current {
+        return false;
+    }
+    let Some(recent) = RECENT.get() else {
+        return false;
+    };
     let raw = texture.as_raw() as usize;
-    let since = now().saturating_sub(1000);
-    RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
+    let since = current.saturating_sub(1000);
+    recent
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .get(&raw)
+        .is_some_and(|&ts| ts >= since)
 }
 
 fn made_now(texture: &ID3D12Resource) {
-    let now = now();
-    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
-    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
-        recent.pop_front();
+    let current = recent_now();
+    let raw = texture.as_raw() as usize;
+    let recent = RECENT.get_or_init(|| RwLock::new(Recent { map: HashMap::new(), order: VecDeque::new() }));
+    let mut guard = recent.write().unwrap_or_else(|e| e.into_inner());
+    while let Some(&(old_raw, old_ts)) = guard.order.front()
+        && old_ts.saturating_add(1000) < current
+    {
+        guard.order.pop_front();
+        if guard.map.get(&old_raw) == Some(&old_ts) {
+            guard.map.remove(&old_raw);
+        }
     }
-    recent.push_back((texture.as_raw() as usize, now));
+    guard.map.insert(raw, current);
+    guard.order.push_back((raw, current));
+    drop(guard);
+    LAST_MADE_MS.fetch_max(current, Ordering::Release);
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.

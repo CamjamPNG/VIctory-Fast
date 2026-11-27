@@ -809,6 +809,39 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+#[inline]
+fn is_state_op(op: u64) -> bool {
+    op == Plain::GRAPHICS_TABLE as u64
+        || op == Plain::COMPUTE_TABLE as u64
+        || op == Plain::GRAPHICS_CONSTANT as u64
+        || op == Plain::COMPUTE_CONSTANT as u64
+        || op == Plain::GRAPHICS_VIEW as u64
+        || op == Plain::COMPUTE_VIEW as u64
+        || op == Plain::SET_PIPELINE as u64
+        || op == Plain::TOPOLOGY as u64
+        || op == Plain::STENCIL_REF as u64
+        || op == Plain::DEPTH_BOUNDS as u64
+        || op == Plain::DRAW as u64
+        || op == Plain::DRAW_INDEXED as u64
+        || op == Plain::DISPATCH as u64
+        || op == Plain::DISPATCH_X as u64
+        || op == Plain::DISPATCH_MESH as u64
+        || op == Plain::DISPATCH_MESH_X as u64
+        || op == Plain::EXECUTE_INDIRECT as u64
+        || matches!(
+            op,
+            GRAPHICS_CONSTANTS
+                | COMPUTE_CONSTANTS
+                | VIEWPORTS
+                | SCISSORS
+                | BLEND_FACTOR
+                | HEAPS
+                | INDEX_BUFFER
+                | VERTEX_BUFFERS
+                | TARGETS
+        )
+}
+
 /// Attempts to execute a hot state/draw/dispatch opcode directly against an
 /// already-held `(&HostList, &mut draw::State)` without re-locking `list.state`
 /// or taking per-call diagnostic timestamps. Returns `true` if handled.
@@ -861,6 +894,10 @@ fn run_state_op(op: u64, host: &crate::host::HostList, state: &mut crate::draw::
         n if n == Plain::DISPATCH as u64 => {
             super::count_dispatch();
             state.dispatch(host, word(0) as u32, word(1) as u32, word(2) as u32, 0);
+        }
+        n if n == Plain::DISPATCH_X as u64 => {
+            super::count_dispatch();
+            state.dispatch(host, word(0) as u32, word(1) as u32, word(2) as u32, word(3) as u32);
         }
         n if n == Plain::DISPATCH_MESH as u64 => {
             super::count_draw();
@@ -1037,27 +1074,29 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
-        if held_state.is_none()
-            && let Some(host) = super::host_list(list)
-        {
-            // SAFETY: `list` is one of our backing `List`s, exclusively owned by this worker.
-            let state = unsafe { &(*list.cast::<List>()).state }
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            #[cfg(feature = "diagnostics")]
+        if is_state_op(op) {
+            if held_state.is_none()
+                && let Some(host) = super::host_list(list)
             {
-                batch = Some((0, std::time::Instant::now()));
+                // SAFETY: `list` is one of our backing `List`s, exclusively owned by this worker.
+                let state = unsafe { &(*list.cast::<List>()).state }
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                {
+                    batch = Some((0, std::time::Instant::now()));
+                }
+                held_state = Some((host, state));
             }
-            held_state = Some((host, state));
-        }
-        if let Some((host, state)) = held_state.as_mut()
-            && run_state_op(op, host, state, w)
-        {
-            #[cfg(feature = "diagnostics")]
-            if let Some((n, _)) = batch.as_mut() {
-                *n += 1;
+            if let Some((host, state)) = held_state.as_mut()
+                && run_state_op(op, host, state, w)
+            {
+                #[cfg(feature = "diagnostics")]
+                if let Some((n, _)) = batch.as_mut() {
+                    *n += 1;
+                }
+                continue;
             }
-            continue;
         }
         flush_held(
             &mut held_state,

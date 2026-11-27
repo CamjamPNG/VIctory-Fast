@@ -85,6 +85,24 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// `dx.op.barrier` modes emitted for `s_barrier` instructions, in order.
+    #[cfg(test)]
+    pub barrier_modes: Vec<u32>,
+    /// Whether dynamic `MSG_GS_ALLOC_REQ` counts were forwarded to `SetMeshOutputCounts`.
+    #[cfg(test)]
+    pub dynamic_mesh_counts: bool,
+    /// `fdiv arcp` instructions emitted for `v_rcp_f32` / `v_rcp_iflag_f32`.
+    #[cfg(test)]
+    pub arcp_fdivs: u32,
+    /// `v_div_scale_f32..v_div_fixup_f32` sequences collapsed into strict IEEE `fdiv`.
+    #[cfg(test)]
+    pub collapsed_fdivs: u32,
+    /// Declared LDS dwords (`Shader::lds_dwords`).
+    #[cfg(test)]
+    pub lds_dwords: u32,
+    /// Whether the shader declares `flags::INT64`.
+    #[cfg(test)]
+    pub uses_int64: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -255,6 +273,21 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+#[derive(Debug, Clone)]
+enum MeshAllocExpr {
+    Val(Value),
+    Const(u32),
+    Bin(Bin, Box<MeshAllocExpr>, Box<MeshAllocExpr>),
+    BfeU32(Box<MeshAllocExpr>, Box<MeshAllocExpr>),
+}
+
+#[derive(Debug, Clone)]
+struct MeshAllocPlan {
+    block: usize,
+    after_inst: Option<usize>,
+    expr: MeshAllocExpr,
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -327,6 +360,17 @@ struct Lower<'a> {
     tail: Vec<Option<usize>>,
     /// The program writes UAVs: barriers fence them too.
     writes_uavs: bool,
+    /// Per-`s_barrier` DXIL fence mode computed by CFG UAV reachability + `s_waitcnt`.
+    barrier_modes: HashMap<Site, u32>,
+    /// `dx.op.barrier` modes emitted for `s_barrier` instructions, for tests.
+    #[cfg(test)]
+    emitted_barriers: Vec<u32>,
+    /// Values written by `v_div_scale_f32`: never emit `arcp` on `v_rcp_f32` of these.
+    div_scale_vals: HashSet<Value>,
+    #[cfg(test)]
+    arcp_fdivs: u32,
+    #[cfg(test)]
+    collapsed_fdivs: u32,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
@@ -334,6 +378,10 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh: planned dynamic `SetMeshOutputCounts` emission site (from `MSG_GS_ALLOC_REQ`).
+    mesh_alloc_plan: Option<MeshAllocPlan>,
+    /// Mesh: dynamic `(verts, prims)` values passed to `SetMeshOutputCounts`, when active.
+    mesh_counts: Option<(V, V)>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -369,10 +417,15 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// A console wave64 program lowered to 32-lane host waves.
+    split_wave: bool,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
     wave_base: Option<V>,
+    /// Bindless heap `s_buffer_load_dword*` skipped `SLOT_STRIDES` under `VICTORY_PORT_CBV=1`:
+    /// still advertise `SLOT_STRIDES` in `Lowered::root_srvs` so the host prepares heap buffers.
+    needs_heap_buffers: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -479,6 +532,97 @@ fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
         }
     }
     Some(all)
+}
+
+/// Whether a multi-wave (`group >= 128`) console wave64 compute shader with LDS
+/// separates every LDS write/atomic from every LDS read (both RAW and WAR) with a
+/// full-group `s_barrier`, so AMD RDNA can run it in Wave32 without `split_lds`
+/// barriers or implicit 64-lane lockstep assumptions.
+pub(super) fn lds_barrier_safe(p: &Program, st: &Structured, group: u32) -> bool {
+    if group < 128 || super::group_sync() == 0 {
+        return false;
+    }
+    let Some(all) = all_lane_blocks(st) else {
+        return false;
+    };
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut place = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        place[b] = n;
+    }
+    let back = |from: usize, to: usize| {
+        let at = |b: usize| place.get(b).copied().unwrap_or(usize::MAX);
+        at(from) != usize::MAX && at(to) <= at(from)
+    };
+    if st
+        .exits
+        .iter()
+        .enumerate()
+        .any(|(b, e)| matches!(*e, LaneExit::Jump(t) if back(b, t)))
+    {
+        return false;
+    }
+    let has_full_barrier = p.blocks.iter().enumerate().any(|(b, blk)| {
+        all.get(b).copied().unwrap_or(false)
+            && blk.insts.iter().any(|i| i.name() == "s_barrier")
+    });
+    if !has_full_barrier {
+        return false;
+    }
+    let is_lds = |i: &Inst| {
+        matches!(i.fields, Fields::Ds { .. })
+            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+    };
+    let n = p.blocks.len();
+    const SEEN_WRITE: u8 = 1;
+    const SEEN_READ: u8 = 2;
+    let mut state_in = vec![0u8; n];
+    let mut state_out = vec![0u8; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 0..n {
+            if place[b] == usize::MAX {
+                continue;
+            }
+            let mut st_b = 0u8;
+            for &pred in &p.blocks[b].preds {
+                st_b |= state_out[pred];
+            }
+            let inn = st_b;
+            let full_bar_blk = all.get(b).copied().unwrap_or(false);
+            for inst in &p.blocks[b].insts {
+                let name = inst.name();
+                if name == "s_barrier" && full_bar_blk {
+                    st_b = 0;
+                    continue;
+                }
+                if !is_lds(inst) {
+                    continue;
+                }
+                if name.starts_with("ds_append") || name.starts_with("ds_consume") {
+                    return false;
+                }
+                if name.starts_with("ds_read") {
+                    if (st_b & SEEN_WRITE) != 0 {
+                        return false;
+                    }
+                    st_b |= SEEN_READ;
+                } else {
+                    if (st_b & SEEN_READ) != 0 {
+                        return false;
+                    }
+                    st_b |= SEEN_WRITE;
+                }
+            }
+            if inn != state_in[b] || st_b != state_out[b] {
+                state_in[b] = inn;
+                state_out[b] = st_b;
+                changed = true;
+            }
+        }
+    }
+    true
 }
 
 /// Every per-lane branch (by its block) with its region: the blocks reachable from it that do
@@ -1329,11 +1473,22 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-/// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// What the translator was told of the host and active optimization switches,
+/// for a cache's key: the widest wave, the view heap's limit, where the raw
+/// twins of its views start, what it writes for the console's own hardware,
+/// and the optimization toggle bitmask.
+pub fn host_settings() -> [u32; 5] {
+    let opt_flags = u32::from(super::narrow_barrier_on())
+        | (u32::from(super::mesh_alloc_counts_on()) << 1)
+        | (u32::from(super::fast_rcp_on()) << 2)
+        | (u32::from(super::rdna_opt_on()) << 3);
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        opt_flags,
+    ]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1354,6 +1509,14 @@ thread_local! {
     pub(super) static TEST_RDNA_WAVE32: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
     /// Test hook for [`super::loop_limit_enabled`], for its thread only.
     pub(super) static TEST_LOOP_LIMIT_ENABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::narrow_barrier_on`], for its thread only.
+    pub(super) static TEST_NARROW_BARRIER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::mesh_alloc_counts_on`], for its thread only.
+    pub(super) static TEST_MESH_ALLOC_COUNTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::fast_rcp_on`], for its thread only.
+    pub(super) static TEST_FAST_RCP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Test hook for [`super::rdna_opt_on`], for its thread only.
+    pub(super) static TEST_RDNA_OPT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -1364,6 +1527,26 @@ pub(super) fn test_rdna_wave32() -> Option<u8> {
 #[cfg(test)]
 pub(super) fn test_loop_limit_enabled() -> Option<bool> {
     TEST_LOOP_LIMIT_ENABLED.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_narrow_barrier() -> Option<bool> {
+    TEST_NARROW_BARRIER.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_mesh_alloc_counts() -> Option<bool> {
+    TEST_MESH_ALLOC_COUNTS.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_fast_rcp() -> Option<bool> {
+    TEST_FAST_RCP.get()
+}
+
+#[cfg(test)]
+pub(super) fn test_rdna_opt() -> Option<bool> {
+    TEST_RDNA_OPT.get()
 }
 
 /// The bits of [`super::rdna`] that count on this host.
@@ -1715,6 +1898,8 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // a console wave64 program lowered to 32-lane host waves
+        let mut split_wave = false;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1743,7 +1928,9 @@ impl<'a> Lower<'a> {
             // the exact barrier-free paths only (`!crosses` in mode 1, plus `wave_local`
             // idiom under `with_local_waves` in mode 2 / AnyHit); never `split_lds`, LDS
             // exchange, or `LOCAL_ANY`. If exact Wave32 does not apply, keep Wave64 cleanly.
-            let lds_safe_w32 = s.lds_dwords == 0 || group <= 32;
+            let lds_safe_w32 = s.lds_dwords == 0
+                || group <= 32
+                || (super::rdna_opt_on() && lds_barrier_safe(p, x.st, group));
             let rdna_mode = super::rdna_wave32();
             let rdna_anyhit_wave32 =
                 host_rdna() != 0 && x.native.wave64 && has_anyhit_loop && host_max_wave() != 32;
@@ -1867,9 +2054,14 @@ impl<'a> Lower<'a> {
                 }
             }
             if wave == 32 && x.native.wave64 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                split_wave = true;
+                // AMD RDNA assigns consecutive `flattenedThreadIdInGroup` lanes to each
+                // Wave32, so no LDS counter + barrier + atomic prologue (`wave_base`) is needed.
+                if !(host_rdna() != 0 && super::rdna_opt_on()) {
+                    // console threads go to host waves in the order the waves take them (`wave_base`)
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -2025,6 +2217,14 @@ impl<'a> Lower<'a> {
             idom: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
             writes_uavs,
+            barrier_modes: HashMap::new(),
+            #[cfg(test)]
+            emitted_barriers: Vec::new(),
+            div_scale_vals: HashSet::new(),
+            #[cfg(test)]
+            arcp_fdivs: 0,
+            #[cfg(test)]
+            collapsed_fdivs: 0,
             src0: None,
             console_lanes,
             split_lds,
@@ -2047,9 +2247,13 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            split_wave,
             halves,
             wave_base: None,
+            needs_heap_buffers: false,
             flat: None,
+            mesh_alloc_plan: None,
+            mesh_counts: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2230,6 +2434,17 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if sub.is_none()
+            && let Some(h) = h
+            && n > 1
+            && super::rdna_opt_on()
+        {
+            let dwords = self.raw_dwords(h, off, n);
+            for (k, x) in dwords.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -2694,6 +2909,9 @@ impl<'a> Lower<'a> {
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
         self.find_coherent();
+        if super::narrow_barrier_on() {
+            self.compute_barrier_modes();
+        }
         self.halves_only = self.places_read_as_halves();
         let ray_loops = std::mem::take(&mut self.ray_loops);
         let ray_by_entry: HashMap<usize, usize> = ray_loops
@@ -3038,6 +3256,15 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 self.inst(b, i)?;
+                if self
+                    .mesh_alloc_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.block == b && plan.after_inst == Some(i))
+                    && let Some(mesh) = self.s.mesh
+                {
+                    let plan = self.mesh_alloc_plan.take().unwrap();
+                    self.emit_dynamic_mesh_counts(mesh, &plan.expr);
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -3046,6 +3273,15 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            if self
+                .mesh_alloc_plan
+                .as_ref()
+                .is_some_and(|plan| plan.block == b && plan.after_inst.is_none())
+                && let Some(mesh) = self.s.mesh
+            {
+                let plan = self.mesh_alloc_plan.take().unwrap();
+                self.emit_dynamic_mesh_counts(mesh, &plan.expr);
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
@@ -3113,12 +3349,19 @@ impl<'a> Lower<'a> {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
-        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let mut root_srvs: Vec<u8> = self.s.root_srvs.iter().map(|r| r.0).collect();
+        if self.needs_heap_buffers && !root_srvs.contains(&super::shader::SLOT_STRIDES) {
+            root_srvs.push(super::shader::SLOT_STRIDES);
+        }
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         let has_anyhit_loop = self.has_anyhit_loop;
+        #[cfg(test)]
+        let lds_dwords = self.s.lds_dwords;
+        #[cfg(test)]
+        let uses_int64 = self.s.flags & flags::INT64 != 0;
         Ok(Lowered {
             wave_size,
             has_anyhit_loop,
@@ -3135,6 +3378,18 @@ impl<'a> Lower<'a> {
             loop_counters,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            barrier_modes: self.emitted_barriers,
+            #[cfg(test)]
+            dynamic_mesh_counts: self.mesh_counts.is_some(),
+            #[cfg(test)]
+            arcp_fdivs: self.arcp_fdivs,
+            #[cfg(test)]
+            collapsed_fdivs: self.collapsed_fdivs,
+            #[cfg(test)]
+            lds_dwords,
+            #[cfg(test)]
+            uses_int64,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3751,6 +4006,180 @@ impl<'a> Lower<'a> {
             .filter_map(|d| self.entry(&d.source))
             .collect();
         self.coherent.extend(found);
+    }
+
+    /// Computes the minimal sound `dx.op.barrier` mode for each `s_barrier` site
+    /// via CFG UAV-write reachability and console `s_waitcnt*` flags.
+    fn compute_barrier_modes(&mut self) {
+        let p = self.x.p;
+        if !p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name() == "s_barrier")
+        {
+            return;
+        }
+        let is_uav_write = |i: &Inst| match &i.fields {
+            Fields::Image { .. } | Fields::Buffer { .. } => {
+                i.name().contains("store") || i.name().contains("atomic")
+            }
+            Fields::Flat { .. } => {
+                i.name().starts_with("global_")
+                    && (i.name().contains("store") || i.name().contains("atomic"))
+            }
+            Fields::Smem { .. } => i.name().contains("_store_"),
+            _ => false,
+        };
+        let is_cache_op = |i: &Inst| {
+            matches!(
+                i.name(),
+                "buffer_wbl2"
+                    | "buffer_gl0_inv"
+                    | "buffer_gl1_inv"
+                    | "s_gl1_inv"
+                    | "s_dcache_wb"
+                    | "s_dcache_inv"
+            )
+        };
+        let is_uav_global_write = |i: &Inst| {
+            if is_cache_op(i) || i.name().contains("atomic") {
+                return true;
+            }
+            match &i.fields {
+                Fields::Image { cache, .. }
+                | Fields::Buffer { cache, .. }
+                | Fields::Flat { cache, .. }
+                | Fields::Smem { cache, .. } => cache.glc || cache.slc,
+                _ => false,
+            }
+        };
+        let is_uav_op = |i: &Inst| {
+            is_uav_write(i)
+                || is_cache_op(i)
+                || match &i.fields {
+                    Fields::Image { .. } => !matches!(i.name(), "image_get_resinfo" | "image_get_lod"),
+                    Fields::Buffer { .. } => true,
+                    Fields::Flat { .. } => i.name().starts_with("global_"),
+                    Fields::Smem { .. } => i.name().contains("_load_") || i.name().contains("_store_"),
+                    _ => false,
+                }
+        };
+        let is_vmem_wait = |i: &Inst| {
+            (i.wait & (crate::ir::wait::VM | crate::ir::wait::VS)) != 0 || is_cache_op(i)
+        };
+
+        let n = p.blocks.len();
+        let has_waitcnt = p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.wait != 0);
+        let has_any_atomic = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| is_uav_write(i) && i.name().contains("atomic"));
+        let allow_tg_only =
+            !has_any_atomic && !crate::spill::is_spilled(self.x.native) && self.coherent.is_empty();
+        let group_sync = super::group_sync();
+
+        // Backward reachability: can any UAV read/write/atomic run after block b?
+        let block_uav_op: Vec<bool> = p
+            .blocks
+            .iter()
+            .map(|blk| blk.insts.iter().any(is_uav_op))
+            .collect();
+        let mut uav_after_out = vec![false; n];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (0..n).rev() {
+                let mut out = false;
+                for s in p.blocks[b].exit.successors() {
+                    if block_uav_op[s] || uav_after_out[s] {
+                        out = true;
+                        break;
+                    }
+                }
+                if out && !uav_after_out[b] {
+                    uav_after_out[b] = true;
+                    changed = true;
+                }
+            }
+        }
+
+        // Forward reachability: track (BIT_WRITTEN, BIT_WAITED, BIT_GLOBAL) across CFG.
+        const BIT_WRITTEN: u8 = 1;
+        const BIT_WAITED: u8 = 2;
+        const BIT_GLOBAL: u8 = 4;
+        let mut state_in = vec![0u8; n];
+        let mut state_out = vec![0u8; n];
+        let step = |b: usize, mut st: u8, mut record: Option<&mut HashMap<Site, u8>>| -> u8 {
+            let full_sync_block =
+                group_sync != 0 && !self.no_barrier.contains(&b) && !self.fence_only.contains(&b);
+            for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+                if (st & BIT_WRITTEN) != 0 && is_vmem_wait(inst) {
+                    st |= BIT_WAITED;
+                    if is_cache_op(inst) {
+                        st |= BIT_GLOBAL;
+                    }
+                }
+                if inst.name() == "s_barrier" {
+                    if let Some(rec) = record.as_deref_mut() {
+                        rec.insert((b, i), st);
+                    }
+                    // A full-group barrier that is not strictly lgkm-only fences all prior UAV writes.
+                    if full_sync_block && !(has_waitcnt && inst.wait == crate::ir::wait::LGKM) {
+                        st = 0;
+                    }
+                }
+                if is_uav_write(inst) {
+                    st |= BIT_WRITTEN;
+                    if is_uav_global_write(inst) {
+                        st |= BIT_GLOBAL;
+                    }
+                }
+            }
+            st
+        };
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 0..n {
+                let mut inn = 0u8;
+                for &pred in &p.blocks[b].preds {
+                    inn |= state_out[pred];
+                }
+                let out = step(b, inn, None);
+                if inn != state_in[b] || out != state_out[b] {
+                    state_in[b] = inn;
+                    state_out[b] = out;
+                    changed = true;
+                }
+            }
+        }
+
+        let mut at_barrier = HashMap::new();
+        for b in 0..n {
+            step(b, state_in[b], Some(&mut at_barrier));
+        }
+
+        for ((b, i), st) in at_barrier {
+            let uav_after = uav_after_out[b]
+                || p.blocks[b].insts[i + 1..].iter().any(is_uav_op);
+            let inst = &p.blocks[b].insts[i];
+            let needs_uav_fence = (st & BIT_WRITTEN) != 0
+                && uav_after
+                && (!has_waitcnt
+                    || (st & BIT_WAITED) != 0
+                    || inst.wait != crate::ir::wait::LGKM);
+            let mode = if !needs_uav_fence {
+                1 | 8
+            } else if allow_tg_only && (st & BIT_GLOBAL) == 0 {
+                1 | 4 | 8
+            } else {
+                1 | 2 | 8
+            };
+            self.barrier_modes.insert((b, i), mode);
+        }
     }
 
     /// The kind of a view no instruction uses (in this program, or through
@@ -4711,6 +5140,17 @@ impl<'a> Lower<'a> {
     /// The high dword of a 32 × 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
+        if super::rdna_opt_on() {
+            // Native DXIL `IMul` (41) / `UMul` (42) returns `{ hi, lo }` without
+            // widening to `i64` or setting `SFI0::INT64`.
+            let i32t = self.s.t.i32;
+            let two = self.s.m.named_struct("dx.types.twoi32", vec![i32t, i32t]);
+            let op = if signed { 41 } else { 42 };
+            let r = self
+                .s
+                .op(c, "binaryWithTwoOuts.i32", Attr::ReadNone, two, op, &[a, b]);
+            return self.s.m.extract(c, r, 0);
+        }
         let i64t = self.s.m.int(64);
         let ext = if signed { Cast::SExt } else { Cast::ZExt };
         let a = self.s.m.cast(c, ext, a, i64t);
@@ -4775,6 +5215,35 @@ impl<'a> Lower<'a> {
     /// than turning an infinite or NaN factor into a NaN.
     fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
         let cur = self.cur;
+        if host_rdna() & super::rdna::LEGACY != 0 && super::fast_rcp_on() {
+            // RDNA DXIL flushes f32 subnormals to zero in hardware; reuse the
+            // same bounded/finite fast path as `legacy_mul`.
+            let fused = self.fmad(a, b, c);
+            let zero = self.s.m.f32(0);
+            let (fa, fb) = (
+                self.s.m.bounded(a, 12).is_some(),
+                self.s.m.bounded(b, 12).is_some(),
+            );
+            let not_zero = |l: &Self, x: V| {
+                l.s.m.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite())
+            };
+            if a == b || (fa && fb) || not_zero(self, a) || not_zero(self, b) {
+                return fused;
+            }
+            let asked = match (fa, fb) {
+                (true, _) => a,
+                (_, true) => b,
+                _ => {
+                    let (aa, bb) = (self.unary(6, a), self.unary(6, b));
+                    self.binary(36, aa, bb)
+                }
+            };
+            let z = self.s.m.cmp(cur, pred::OEQ, asked, zero);
+            let addend = self.s.m.bin(cur, Bin::Add, zero, c);
+            return self.s.m.select(cur, z, addend, fused);
+        }
+        let (a, b, c) = (self.ftz(a), self.ftz(b), self.ftz(c));
+        let cur = self.cur;
         let fused = self.fmad(a, b, c);
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
@@ -4783,6 +5252,231 @@ impl<'a> Lower<'a> {
         // +0 + c, so the sign of a zero addend follows the addition.
         let addend = self.s.m.bin(cur, Bin::Add, zero, c);
         self.s.m.select(cur, z, addend, fused)
+    }
+
+    /// Recognizes the standard RDNA2 9-instruction IEEE-754 f32 division idiom
+    /// ending at `v_div_fixup_f32` `(b, i)` within the same block:
+    /// `v_div_scale_f32` (den, num) -> `v_rcp_f32` -> 2x `v_fma_f32` ->
+    /// `v_mul_f32` -> `v_fma_f32` -> `v_div_fmas_f32` -> `v_div_fixup_f32`.
+    fn is_ieee_fdiv_sequence(&self, b: usize, i: usize) -> bool {
+        let blk = &self.x.p.blocks[b];
+        let fix = &blk.insts[i];
+        let Fields::Valu(fv) = &fix.fields else {
+            return false;
+        };
+        if fv.dpp.is_some() || (fv.abs & 1) != 0 || (fv.neg & 1) != 0 {
+            return false;
+        }
+        let read_op = |inst: &Inst, idx: usize| -> Option<Value> {
+            let Fields::Valu(v) = &inst.fields else {
+                return None;
+            };
+            match *v.src.get(idx)? {
+                Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+                Operand::Scalar { code, .. } => inst.read(Reg::S(code)),
+                _ => None,
+            }
+        };
+        let is_one = |inst: &Inst, idx: usize| -> bool {
+            let Fields::Valu(v) = &inst.fields else {
+                return false;
+            };
+            if ((v.abs | v.neg) & (1 << idx)) != 0 {
+                return false;
+            }
+            matches!(
+                v.src.get(idx),
+                Some(Operand::Const(242)) | Some(Operand::Literal(0x3F80_0000))
+            )
+        };
+        let find_def = |val: Value, before: usize| -> Option<(usize, &Inst, &crate::gfx10::Valu)> {
+            for idx in (0..before).rev() {
+                let inst = &blk.insts[idx];
+                if inst.writes.iter().any(|&(_, w)| w == val) {
+                    if let Fields::Valu(v) = &inst.fields {
+                        return Some((idx, inst, v));
+                    }
+                    return None;
+                }
+            }
+            None
+        };
+        let plain_valu = |v: &crate::gfx10::Valu| -> bool {
+            v.dpp.is_none() && v.abs == 0 && v.neg == 0 && !v.clamp && v.omod == 0
+        };
+        let same_signed_op = |inst_a: &Inst,
+                              va: &crate::gfx10::Valu,
+                              ia: usize,
+                              inst_b: &Inst,
+                              vb: &crate::gfx10::Valu,
+                              ib: usize|
+         -> bool {
+            let abs_a = (va.abs >> ia) & 1;
+            let neg_a = (va.neg >> ia) & 1;
+            let abs_b = (vb.abs >> ib) & 1;
+            let neg_b = (vb.neg >> ib) & 1;
+            if abs_a != abs_b || neg_a != neg_b {
+                return false;
+            }
+            match (va.src.get(ia), vb.src.get(ib)) {
+                (Some(Operand::Vector { .. } | Operand::Scalar { .. }), Some(Operand::Vector { .. } | Operand::Scalar { .. })) => {
+                    read_op(inst_a, ia).is_some() && read_op(inst_a, ia) == read_op(inst_b, ib)
+                }
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        };
+
+        // 1) q = v_div_fmas_f32(rem, rcp1, q0), using VCC from scale_den.
+        let Some(q_val) = read_op(fix, 0) else {
+            return false;
+        };
+        let Some((fmas_i, fmas, fmas_v)) = find_def(q_val, i) else {
+            return false;
+        };
+        if fmas.name() != "v_div_fmas_f32" || !plain_valu(fmas_v) {
+            return false;
+        }
+        let Some(vcc_val) = fmas.read(Reg::S(crate::ir::VCC)) else {
+            return false;
+        };
+        let Some((sden_i, sden, sden_v)) = find_def(vcc_val, fmas_i) else {
+            return false;
+        };
+        if sden.name() != "v_div_scale_f32"
+            || sden_v.dpp.is_some()
+            || sden_v.clamp
+            || sden_v.omod != 0
+            || !same_signed_op(sden, sden_v, 0, fix, fv, 1)
+            || !same_signed_op(sden, sden_v, 1, fix, fv, 1)
+            || !same_signed_op(sden, sden_v, 2, fix, fv, 2)
+        {
+            return false;
+        }
+        let Some(Operand::Vector { reg: sden_reg, .. }) = sden_v.dst else {
+            return false;
+        };
+        let Some(scaled_den) = sden.write(Reg::V(sden_reg)) else {
+            return false;
+        };
+
+        // 2) rem = v_fma_f32(-scaled_den, q0, scaled_num) (either order for first two args)
+        let (Some(rem_val), Some(rcp1_val), Some(q0_val)) = (
+            read_op(fmas, 0),
+            read_op(fmas, 1),
+            read_op(fmas, 2),
+        ) else {
+            return false;
+        };
+        let Some((rem_i, rem, rem_v)) = find_def(rem_val, fmas_i) else {
+            return false;
+        };
+        if rem.name() != "v_fma_f32"
+            || rem_v.dpp.is_some()
+            || rem_v.abs != 0
+            || rem_v.clamp
+            || rem_v.omod != 0
+        {
+            return false;
+        }
+        let rem_ok = (read_op(rem, 0) == Some(scaled_den)
+            && read_op(rem, 1) == Some(q0_val)
+            && rem_v.neg == 1)
+            || (read_op(rem, 0) == Some(q0_val)
+                && read_op(rem, 1) == Some(scaled_den)
+                && rem_v.neg == 2);
+        if !rem_ok {
+            return false;
+        }
+        let Some(scaled_num) = read_op(rem, 2) else {
+            return false;
+        };
+        let Some((_snum_i, snum, snum_v)) = find_def(scaled_num, rem_i) else {
+            return false;
+        };
+        if snum.name() != "v_div_scale_f32"
+            || snum_v.dpp.is_some()
+            || snum_v.clamp
+            || snum_v.omod != 0
+            || !same_signed_op(snum, snum_v, 0, fix, fv, 2)
+            || !same_signed_op(snum, snum_v, 1, fix, fv, 1)
+            || !same_signed_op(snum, snum_v, 2, fix, fv, 2)
+        {
+            return false;
+        }
+
+        // 3) q0 = v_mul_f32(scaled_num, rcp1) (either order)
+        let Some((_q0_i, q0, q0_v)) = find_def(q0_val, rem_i) else {
+            return false;
+        };
+        if q0.name() != "v_mul_f32" || !plain_valu(q0_v) {
+            return false;
+        }
+        let q0_ok = (read_op(q0, 0) == Some(scaled_num) && read_op(q0, 1) == Some(rcp1_val))
+            || (read_op(q0, 0) == Some(rcp1_val) && read_op(q0, 1) == Some(scaled_num));
+        if !q0_ok {
+            return false;
+        }
+
+        // 4) rcp1 = v_fma_f32(err, rcp0, rcp0) (either order for first two args)
+        let Some((rcp1_i, rcp1, rcp1_v)) = find_def(rcp1_val, fmas_i) else {
+            return false;
+        };
+        if rcp1.name() != "v_fma_f32" || !plain_valu(rcp1_v) {
+            return false;
+        }
+        let Some(rcp0_val) = read_op(rcp1, 2) else {
+            return false;
+        };
+        let err_val = if read_op(rcp1, 1) == Some(rcp0_val) {
+            let Some(e) = read_op(rcp1, 0) else {
+                return false;
+            };
+            e
+        } else if read_op(rcp1, 0) == Some(rcp0_val) {
+            let Some(e) = read_op(rcp1, 1) else {
+                return false;
+            };
+            e
+        } else {
+            return false;
+        };
+
+        // 5) err = v_fma_f32(-scaled_den, rcp0, 1.0)
+        let Some((err_i, err, err_v)) = find_def(err_val, rcp1_i) else {
+            return false;
+        };
+        if err.name() != "v_fma_f32"
+            || err_v.dpp.is_some()
+            || err_v.abs != 0
+            || err_v.clamp
+            || err_v.omod != 0
+            || !is_one(err, 2)
+        {
+            return false;
+        }
+        let err_ok = (read_op(err, 0) == Some(scaled_den)
+            && read_op(err, 1) == Some(rcp0_val)
+            && err_v.neg == 1)
+            || (read_op(err, 0) == Some(rcp0_val)
+                && read_op(err, 1) == Some(scaled_den)
+                && err_v.neg == 2);
+        if !err_ok {
+            return false;
+        }
+
+        // 6) rcp0 = v_rcp_f32(scaled_den)
+        let Some((rcp0_i, rcp0, rcp0_v)) = find_def(rcp0_val, err_i) else {
+            return false;
+        };
+        if !matches!(rcp0.name(), "v_rcp_f32" | "v_rcp_iflag_f32")
+            || !plain_valu(rcp0_v)
+            || read_op(rcp0, 0) != Some(scaled_den)
+            || rcp0_i <= sden_i
+        {
+            return false;
+        }
+        true
     }
 
     // ---- lane booleans ----
@@ -4918,9 +5612,17 @@ impl<'a> Lower<'a> {
         if let Some(base) = self.wave_base() {
             return self.s.m.bin(e, Bin::Add, base, lane);
         }
+        let wave = self.s.wave_size.unwrap_or(32);
+        if super::rdna_opt_on()
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() <= wave)
+        {
+            return lane;
+        }
         let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
         let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
-        let wave = self.s.wave_size.unwrap_or(32);
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         self.s.m.bin(e, Bin::Add, base, lane)
@@ -5049,7 +5751,7 @@ impl<'a> Lower<'a> {
     fn scc_some(&mut self, scc: Value) -> Result<V, Why> {
         let &m = self.x.st.scc_some.get(&scc).ok_or(LANE_MASK)?;
         // (not for a console wave cut into host waves that do not exchange)
-        if !self.console_lanes || self.local || self.exchange.is_none() && self.halves.is_some() {
+        if !self.console_lanes || self.local || self.exchange.is_none() && self.split_wave {
             return Err(LANE_MASK);
         }
         let made = self.def_block.get(&scc).copied();
@@ -5082,7 +5784,7 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
-        if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
+        if self.exchange.is_none() && !self.split_wave && self.console_lanes && self.mask_data == MaskData::Console {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
@@ -5384,7 +6086,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.split_wave {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -5430,14 +6132,9 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// Mesh: the counts and the primitives no lane exports. The console's
-    /// counts come from one lane's allocation request, which DXIL cannot
-    /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
-    // program's count are culled and vertices past it unused; this costs
-    // the host the unused vertex and primitive slots. Pass the program's own
-    // counts if that shows in frame time.
+    /// Mesh: validates limits, adjusts maxima to fit the 32 KiB output budget,
+    /// and either schedules dynamic `MSG_GS_ALLOC_REQ` forwarding or emits the
+    /// static `(max_vertices, max_primitives)` counts and zeroing prologue.
     fn mesh_prologue(&mut self, mut mesh: super::shader::Mesh) -> Result<(), Why> {
         let threads = self.s.threads.expect("mesh")[0];
         if mesh.topology != 2 {
@@ -5467,6 +6164,12 @@ impl<'a> Lower<'a> {
             }
             self.s.mesh = Some(mesh);
         }
+        if super::mesh_alloc_counts_on()
+            && let Some(plan) = self.find_mesh_alloc_plan()
+        {
+            self.mesh_alloc_plan = Some(plan);
+            return Ok(());
+        }
         let e = self.s.entry;
         let void = self.s.t.void;
         let (v, p) = (
@@ -5475,13 +6178,18 @@ impl<'a> Lower<'a> {
         );
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        self.emit_mesh_zero_prims(mesh, None);
+        Ok(())
+    }
+
+    /// Emits `emitIndices(index, 0, 0, 0)` for every primitive slot up to `dyn_prims`
+    /// (when known dynamically from `MSG_GS_ALLOC_REQ`) or `mesh.max_primitives`.
+    fn emit_mesh_zero_prims(&mut self, mesh: super::shader::Mesh, dyn_prims: Option<V>) {
+        let threads = self.s.threads.expect("mesh")[0];
+        let void = self.s.t.void;
         let flat = self.mesh_thread();
         let z = self.s.m.i32(0);
-        // Every primitive of the declared count starts culled, also those
-        // past the lanes (a count of 256 with 128 lanes): lane n culls
-        // primitives n, n + lanes, ... The host draws all it was promised,
-        // and one never written has whatever indices its memory held: long
-        // triangles over the whole target, each pixel of them shaded.
+        let p_limit = dyn_prims.unwrap_or_else(|| self.s.m.i32(mesh.max_primitives));
         let passes = mesh.max_primitives.div_ceil(threads.max(1));
         for pass in 0..passes {
             let index = if pass == 0 {
@@ -5490,8 +6198,8 @@ impl<'a> Lower<'a> {
                 let past = self.s.m.i32(pass * threads);
                 self.s.m.bin(self.cur, Bin::Add, flat, past)
             };
-            let guard = ((pass + 1) * threads > mesh.max_primitives)
-                .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
+            let guard = (dyn_prims.is_some() || (pass + 1) * threads > mesh.max_primitives)
+                .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p_limit));
             let at = self.begin_guarded(guard);
             self.s.op(
                 self.cur,
@@ -5503,7 +6211,342 @@ impl<'a> Lower<'a> {
             );
             self.end_guarded(at, &[]);
         }
-        Ok(())
+    }
+
+    /// Finds a uniform, non-loop block that post-dominates entry and dominates every
+    /// mesh export where the console's unique `s_sendmsg(MSG_GS_ALLOC_REQ)` `m0`
+    /// counts (`verts = m0 & 0xFFF`, `prims = (m0 >> 12) & 0xFFF`) can be forwarded
+    /// safely to `dx.op.setMeshOutputCounts`.
+    fn find_mesh_alloc_plan(&self) -> Option<MeshAllocPlan> {
+        let p = self.x.p;
+        let n = p.blocks.len();
+        if n == 0 {
+            return None;
+        }
+        let mut allocs = Vec::new();
+        let mut exp_blocks = Vec::new();
+        for (b, blk) in p.blocks.iter().enumerate() {
+            if self.rpo[b] == usize::MAX {
+                continue;
+            }
+            for (i, inst) in blk.insts.iter().enumerate() {
+                if inst.name() == "s_sendmsg"
+                    && matches!(inst.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+                {
+                    allocs.push((b, i));
+                }
+                if matches!(inst.fields, Fields::Exp { .. }) && !exp_blocks.contains(&b) {
+                    exp_blocks.push(b);
+                }
+            }
+        }
+        if allocs.len() != 1 || exp_blocks.is_empty() {
+            return None;
+        }
+        let (alloc_b, alloc_i) = allocs[0];
+        let all = all_lane_blocks(self.x.st)?;
+        let dominates = |a: usize, mut b: usize| -> bool {
+            while b != a {
+                let d = self.idom[b];
+                if d == b || d == usize::MAX {
+                    return false;
+                }
+                b = d;
+            }
+            true
+        };
+        let in_loop = |target: usize| -> bool {
+            let mut seen = vec![false; n];
+            let mut stack = p.blocks[target].exit.successors();
+            while let Some(cur) = stack.pop() {
+                if cur == target {
+                    return true;
+                }
+                if !std::mem::replace(&mut seen[cur], true) {
+                    stack.extend(p.blocks[cur].exit.successors());
+                }
+            }
+            false
+        };
+        let post_dominates_entry = |cand: usize| -> bool {
+            if cand == 0 {
+                return true;
+            }
+            let mut seen = vec![false; n];
+            let mut stack = vec![0usize];
+            while let Some(cur) = stack.pop() {
+                if cur == cand || std::mem::replace(&mut seen[cur], true) {
+                    continue;
+                }
+                match p.blocks[cur].exit {
+                    Exit::End | Exit::Indirect => return false,
+                    Exit::Jump(s) => stack.push(s),
+                    Exit::Branch { taken, not_taken } => {
+                        stack.push(taken);
+                        stack.push(not_taken);
+                    }
+                }
+            }
+            true
+        };
+
+        // Pick the closest dominator `cand` of `alloc_b` that is uniform across the
+        // entire threadgroup, not in a loop, post-dominates entry, and dominates all exports.
+        let mut cand = alloc_b;
+        let place = loop {
+            let ok = all.get(cand).copied().unwrap_or(false)
+                && !in_loop(cand)
+                && post_dominates_entry(cand)
+                && exp_blocks.iter().all(|&eb| dominates(cand, eb))
+                && if cand == alloc_b {
+                    // No export in `alloc_b` may precede `MSG_GS_ALLOC_REQ`.
+                    !p.blocks[cand].insts[..alloc_i]
+                        .iter()
+                        .any(|inst| matches!(inst.fields, Fields::Exp { .. }))
+                } else {
+                    // No export in `cand` may precede the end of `cand`.
+                    !p.blocks[cand]
+                        .insts
+                        .iter()
+                        .any(|inst| matches!(inst.fields, Fields::Exp { .. }))
+                };
+            if ok {
+                break cand;
+            }
+            let parent = self.idom[cand];
+            if parent == cand || parent == usize::MAX {
+                return None;
+            }
+            cand = parent;
+        };
+
+        let after_inst = (place == alloc_b).then_some(alloc_i);
+        let m0 = p.blocks[alloc_b].insts[alloc_i].read(Reg::S(crate::ir::M0))?;
+
+        // Build lookup for defining instructions of SSA values.
+        let mut def_inst: HashMap<Value, (usize, usize)> = HashMap::new();
+        for (b, blk) in p.blocks.iter().enumerate() {
+            for (i, inst) in blk.insts.iter().enumerate() {
+                for &(_, w) in &inst.writes {
+                    def_inst.insert(w, (b, i));
+                }
+            }
+        }
+        let available_at_place = |v: Value| -> bool {
+            if let Some(&(db, di)) = def_inst.get(&v) {
+                if db == place {
+                    after_inst.is_none_or(|ai| di < ai)
+                } else {
+                    dominates(db, place)
+                }
+            } else if let Some(&db) = self.def_block.get(&v) {
+                // Phi defined in `place` or a strict dominator.
+                dominates(db, place)
+            } else {
+                // Program input.
+                true
+            }
+        };
+        let is_group_uniform = |root: Value| -> bool {
+            let mut visited = HashSet::new();
+            let mut stack = vec![root];
+            while let Some(v) = stack.pop() {
+                if !visited.insert(v) || visited.len() > 64 {
+                    continue;
+                }
+                if self.bad.contains_key(&v) {
+                    return false;
+                }
+                if self.x.io.inputs.iter().any(|&(iv, kind)| {
+                    iv == v
+                        && matches!(kind, Input::ThreadIdInGroup(_) | Input::MergedWaveInfo)
+                }) {
+                    return false;
+                }
+                if let Some(&(db, di)) = def_inst.get(&v) {
+                    let inst = &p.blocks[db].insts[di];
+                    let n = inst.name();
+                    if n.starts_with("v_mbcnt") || n == "s_get_waveid_in_workgroup" {
+                        return false;
+                    }
+                    // Allow scalar instructions and `v_readfirstlane_b32`; stop tracing past loads.
+                    if matches!(
+                        inst.fields,
+                        Fields::Smem { .. } | Fields::Buffer { .. } | Fields::Image { .. }
+                    ) {
+                        continue;
+                    }
+                    for &(reg, rv) in &inst.reads {
+                        if matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                            continue;
+                        }
+                        stack.push(rv);
+                    }
+                }
+            }
+            true
+        };
+
+        fn trace_op(
+            op: &Operand,
+            inst: &Inst,
+            def_inst: &HashMap<Value, (usize, usize)>,
+            p: &Program,
+            available: &dyn Fn(Value) -> bool,
+            depth: u8,
+        ) -> Option<MeshAllocExpr> {
+            match *op {
+                Operand::Const(c) if (128..=192).contains(&c) => {
+                    Some(MeshAllocExpr::Const(u32::from(c - 128)))
+                }
+                Operand::Const(c) if (193..=208).contains(&c) => {
+                    Some(MeshAllocExpr::Const((192i32 - i32::from(c)) as u32))
+                }
+                Operand::Literal(k) => Some(MeshAllocExpr::Const(k)),
+                Operand::Scalar { code: NULL, .. } => Some(MeshAllocExpr::Const(0)),
+                Operand::Scalar { code, .. } => {
+                    let v = inst.read(Reg::S(code))?;
+                    trace_val(v, def_inst, p, available, depth)
+                }
+                _ => None,
+            }
+        }
+
+        fn trace_val(
+            v: Value,
+            def_inst: &HashMap<Value, (usize, usize)>,
+            p: &Program,
+            available: &dyn Fn(Value) -> bool,
+            depth: u8,
+        ) -> Option<MeshAllocExpr> {
+            if available(v) {
+                return Some(MeshAllocExpr::Val(v));
+            }
+            if depth == 0 {
+                return None;
+            }
+            let &(db, di) = def_inst.get(&v)?;
+            let inst = &p.blocks[db].insts[di];
+            let Fields::Sop { src, imm, .. } = &inst.fields else {
+                return None;
+            };
+            match inst.name() {
+                "s_mov_b32" => trace_op(src.first()?, inst, def_inst, p, available, depth - 1),
+                "s_movk_i32" => Some(MeshAllocExpr::Const(i32::from((*imm)? as i16) as u32)),
+                "s_or_b32" | "s_and_b32" | "s_xor_b32" | "s_add_u32" | "s_add_i32"
+                | "s_sub_u32" | "s_sub_i32" | "s_lshl_b32" | "s_lshr_b32" | "s_ashr_i32"
+                | "s_mul_i32" => {
+                    let bin = match inst.name() {
+                        "s_or_b32" => Bin::Or,
+                        "s_and_b32" => Bin::And,
+                        "s_xor_b32" => Bin::Xor,
+                        "s_add_u32" | "s_add_i32" => Bin::Add,
+                        "s_sub_u32" | "s_sub_i32" => Bin::Sub,
+                        "s_lshl_b32" => Bin::Shl,
+                        "s_lshr_b32" => Bin::LShr,
+                        "s_ashr_i32" => Bin::AShr,
+                        _ => Bin::Mul,
+                    };
+                    let a = trace_op(src.first()?, inst, def_inst, p, available, depth - 1)?;
+                    let b = trace_op(src.get(1)?, inst, def_inst, p, available, depth - 1)?;
+                    Some(MeshAllocExpr::Bin(bin, Box::new(a), Box::new(b)))
+                }
+                "s_bfe_u32" => {
+                    let a = trace_op(src.first()?, inst, def_inst, p, available, depth - 1)?;
+                    let b = trace_op(src.get(1)?, inst, def_inst, p, available, depth - 1)?;
+                    Some(MeshAllocExpr::BfeU32(Box::new(a), Box::new(b)))
+                }
+                _ => None,
+            }
+        }
+
+        fn check_leaves(expr: &MeshAllocExpr, ok: &dyn Fn(Value) -> bool) -> bool {
+            match expr {
+                MeshAllocExpr::Val(v) => ok(*v),
+                MeshAllocExpr::Const(_) => true,
+                MeshAllocExpr::Bin(_, a, b) => check_leaves(a, ok) && check_leaves(b, ok),
+                MeshAllocExpr::BfeU32(a, b) => check_leaves(a, ok) && check_leaves(b, ok),
+            }
+        }
+
+        let expr = trace_val(m0, &def_inst, p, &available_at_place, 16)?;
+        if !check_leaves(&expr, &is_group_uniform) {
+            return None;
+        }
+        Some(MeshAllocPlan {
+            block: place,
+            after_inst,
+            expr,
+        })
+    }
+
+    fn eval_mesh_alloc_expr(&mut self, expr: &MeshAllocExpr) -> Option<V> {
+        let c = self.cur;
+        match expr {
+            MeshAllocExpr::Val(v) => self.i32_of(*v).ok(),
+            MeshAllocExpr::Const(k) => Some(self.s.m.i32(*k)),
+            MeshAllocExpr::Bin(bin, a, b) => {
+                let a = self.eval_mesh_alloc_expr(a)?;
+                let b = self.eval_mesh_alloc_expr(b)?;
+                let b = match bin {
+                    Bin::Shl | Bin::LShr | Bin::AShr => {
+                        let mask31 = self.s.m.i32(31);
+                        self.s.m.bin(c, Bin::And, b, mask31)
+                    }
+                    _ => b,
+                };
+                Some(self.s.m.bin(c, *bin, a, b))
+            }
+            MeshAllocExpr::BfeU32(src, ctrl) => {
+                let src = self.eval_mesh_alloc_expr(src)?;
+                let ctrl = self.eval_mesh_alloc_expr(ctrl)?;
+                let k31 = self.s.m.i32(31);
+                let k16 = self.s.m.i32(16);
+                let k7f = self.s.m.i32(0x7F);
+                let k32 = self.s.m.i32(32);
+                let k1 = self.s.m.i32(1);
+                let k0 = self.s.m.i32(0);
+                let off = self.s.m.bin(c, Bin::And, ctrl, k31);
+                let w_raw = self.s.m.bin(c, Bin::LShr, ctrl, k16);
+                let width = self.s.m.bin(c, Bin::And, w_raw, k7f);
+                let shifted = self.s.m.bin(c, Bin::LShr, src, off);
+                let lt32 = self.s.m.cmp(c, pred::IULT, width, k32);
+                let w_safe = self.s.m.bin(c, Bin::And, width, k31);
+                let bit = self.s.m.bin(c, Bin::Shl, k1, w_safe);
+                let mask_lt = self.s.m.bin(c, Bin::Sub, bit, k1);
+                let all_ones = self.s.m.i32(u32::MAX);
+                let mask = self.s.m.select(c, lt32, mask_lt, all_ones);
+                let zero_w = self.s.m.cmp(c, pred::EQ, width, k0);
+                let res = self.s.m.bin(c, Bin::And, shifted, mask);
+                Some(self.s.m.select(c, zero_w, k0, res))
+            }
+        }
+    }
+
+    fn emit_dynamic_mesh_counts(&mut self, mesh: super::shader::Mesh, expr: &MeshAllocExpr) {
+        let void = self.s.t.void;
+        let max_v = self.s.m.i32(mesh.max_vertices);
+        let max_p = self.s.m.i32(mesh.max_primitives);
+        let Some(packed) = self.eval_mesh_alloc_expr(expr) else {
+            self.s
+                .op(self.cur, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[max_v, max_p]);
+            self.emit_mesh_zero_prims(mesh, None);
+            return;
+        };
+        let c = self.cur;
+        let mask12 = self.s.m.i32(0xFFF);
+        let k12 = self.s.m.i32(12);
+        let v_raw = self.s.m.bin(c, Bin::And, packed, mask12);
+        let p_sh = self.s.m.bin(c, Bin::LShr, packed, k12);
+        let p_raw = self.s.m.bin(c, Bin::And, p_sh, mask12);
+        let v_ok = self.s.m.cmp(c, pred::IULT, v_raw, max_v);
+        let verts = self.s.m.select(c, v_ok, v_raw, max_v);
+        let p_ok = self.s.m.cmp(c, pred::IULT, p_raw, max_p);
+        let prims = self.s.m.select(c, p_ok, p_raw, max_p);
+        self.s
+            .op(c, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[verts, prims]);
+        self.mesh_counts = Some((verts, prims));
+        self.emit_mesh_zero_prims(mesh, Some(prims));
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -6241,10 +7284,19 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                // Thread-group sync with a shared-memory fence, and a UAV
-                // fence when the program writes UAVs (the waits before an
-                // s_barrier make those writes visible on the console).
-                let mut mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+                // Thread-group sync with a shared-memory fence, plus a UAV fence only when
+                // CFG reachability + console `s_waitcnt` say a UAV write needs visibility
+                // (or always when `VICTORY_NARROW_BARRIER=0` and the shader writes UAVs).
+                let mut mode = if super::narrow_barrier_on() {
+                    self.barrier_modes
+                        .get(&(b, i))
+                        .copied()
+                        .unwrap_or(if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 })
+                } else if self.writes_uavs {
+                    1 | 2 | 8
+                } else {
+                    1 | 8
+                };
                 // Without the wait for the group (bit 0) where not every
                 // lane arrives, or where the switch says so.
                 let waits = match super::group_sync() {
@@ -6255,6 +7307,8 @@ impl<'a> Lower<'a> {
                 if !waits {
                     mode &= !1;
                 }
+                #[cfg(test)]
+                self.emitted_barriers.push(mode);
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -7083,6 +8137,33 @@ impl<'a> Lower<'a> {
         // The host's table of strides by heap slot tells a buffer view
         // (not 0) from anything else, which is still read as a constant
         // buffer; only the load that fits the slot runs.
+        // Under `VICTORY_PORT_CBV=1` + `raw_views() != 0`, both branches of the
+        // `SLOT_STRIDES` diamond read the exact same raw twin (`props = (11, 0)`):
+        // skip the stride load + 2-branch diamond, while still advertising
+        // `SLOT_STRIDES` in `Lowered::root_srvs` so the host prepares heap buffers.
+        let picked_heap = kind.is_none()
+            && matches!(
+                src,
+                Source::Loaded { load, .. }
+                    if self
+                        .scalar
+                        .get(load)
+                        .and_then(|a| self.x.native.layout.get(a.param))
+                        .is_some_and(|p| p.root == RootType::ResourceHeap)
+            );
+        if picked_heap
+            && super::rdna_opt_on()
+            && super::shader::constants_raw()
+            && super::shader::raw_views() != 0
+        {
+            self.needs_heap_buffers = true;
+            let h = self.handle(site, src, false, (11, 0))?;
+            let dwords = self.raw_dwords(h, addr, count);
+            for (k, x) in dwords.into_iter().enumerate() {
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
@@ -9056,7 +10137,7 @@ impl<'a> Lower<'a> {
             };
             self.src0 = Some(x);
         }
-        let r = self.valu_op(inst, guard);
+        let r = self.valu_op(inst, guard, (b, i));
         self.src0 = None;
         r
     }
@@ -9196,7 +10277,7 @@ impl<'a> Lower<'a> {
         Ok((r, enable))
     }
 
-    fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
+    fn valu_op(&mut self, inst: &Inst, guard: Option<V>, (b, i): Site) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -9544,6 +10625,11 @@ impl<'a> Lower<'a> {
                 let qnan = self.s.m.f32(0x7FC0_0000);
                 let r = self.s.m.select(c, any_zero, qnan, r);
                 float(self, r)?;
+                if let Some(Operand::Vector { reg, .. }) = v.dst
+                    && let Some(w) = inst.write(Reg::V(reg))
+                {
+                    self.div_scale_vals.insert(w);
+                }
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
@@ -9576,6 +10662,15 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_div_fixup_f32" => {
+                if super::fast_rcp_on() && self.is_ieee_fdiv_sequence(b, i) {
+                    let (den, num) = (f(self, 1)?, f(self, 2)?);
+                    let r = self.s.m.bin(c, Bin::SDiv, num, den);
+                    #[cfg(test)]
+                    {
+                        self.collapsed_fdivs += 1;
+                    }
+                    return float(self, r);
+                }
                 let (q, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
                 let (ksign, kabs, kinf) = (
@@ -9644,10 +10739,7 @@ impl<'a> Lower<'a> {
                     // On RDNA 2 the legacy encoding decodes as fused
                     // (`v_fma_legacy_f32`) and flushes its sources; the
                     // zero-factor rule of the legacy multiply comes with it.
-                    _ => {
-                        let (a, bb, acc) = (self.ftz(a), self.ftz(bb), self.ftz(acc));
-                        self.legacy_fmad(a, bb, acc)
-                    }
+                    _ => self.legacy_fmad(a, bb, acc),
                 };
                 float(self, r)
             }
@@ -9659,7 +10751,6 @@ impl<'a> Lower<'a> {
             }
             "v_mad_legacy_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
                 let r = self.legacy_fmad(a, bb, cc);
                 float(self, r)
             }
@@ -9679,10 +10770,32 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_rcp_f32" | "v_rcp_iflag_f32" => {
-                // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
+                // Console `v_rcp_f32` is 1-ULP approximate: emit LLVM `arcp` so RDNA
+                // compiles `1.0 / x` to a single `v_rcp_f32`, except when fed by
+                // `v_div_scale_f32` (strict IEEE division sequence).
                 let a = f(self, 0)?;
                 let one = self.s.m.f32(1.0f32.to_bits());
-                let r = self.s.m.bin(c, Bin::SDiv, one, a);
+                let from_div_scale = match v.src.first() {
+                    Some(Operand::Vector { reg, .. }) => inst
+                        .read(Reg::V(*reg))
+                        .is_some_and(|val| self.div_scale_vals.contains(&val)),
+                    _ => false,
+                };
+                let r = if super::fast_rcp_on() && !from_div_scale {
+                    #[cfg(test)]
+                    {
+                        self.arcp_fdivs += 1;
+                    }
+                    self.s.m.bin_fast(
+                        c,
+                        Bin::SDiv,
+                        one,
+                        a,
+                        super::bitcode::fast_math::ARCP,
+                    )
+                } else {
+                    self.s.m.bin(c, Bin::SDiv, one, a)
+                };
                 float(self, r)
             }
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
@@ -13061,14 +14174,21 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for k in 0..count {
-                let four = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = match raw {
-                    Some(_) => self.raw_dwords(h, a, 1)[0],
-                    None => self.cbuffer_dword(h, a),
-                };
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            if raw.is_some() && super::rdna_opt_on() {
+                let dwords = self.raw_dwords(h, byte, count);
+                for (k, x) in dwords.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+            } else {
+                for k in 0..count {
+                    let four = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, byte, four);
+                    let x = match raw {
+                        Some(_) => self.raw_dwords(h, a, 1)[0],
+                        None => self.cbuffer_dword(h, a),
+                    };
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
             }
             return Ok(());
         }
@@ -13631,6 +14751,7 @@ impl<'a> Lower<'a> {
         // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh {
             let flat = self.mesh_thread();
+            let dyn_limit = self.mesh_counts.map(|(v, p)| if primitive { p } else { v });
             let limit = if let Some(m) = self.s.mesh {
                 if primitive {
                     m.max_primitives
@@ -13641,7 +14762,13 @@ impl<'a> Lower<'a> {
                 0
             };
             let threads = self.s.threads.map(|t| t[0]).unwrap_or(u32::MAX);
-            let mesh_guard = if limit > 0 && threads > limit {
+            let mesh_guard = if let Some(lim) = dyn_limit {
+                let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, lim);
+                match guard {
+                    Some(g) => Some(self.s.m.bin(self.cur, Bin::And, g, in_bounds)),
+                    None => Some(in_bounds),
+                }
+            } else if limit > 0 && threads > limit {
                 let lim = self.s.m.i32(limit);
                 let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, lim);
                 match guard {
@@ -13720,7 +14847,13 @@ impl<'a> Lower<'a> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
         let flat = self.mesh_thread();
-        let guard = if let Some(mesh) = self.s.mesh {
+        let guard = if let Some((_, dyn_p)) = self.mesh_counts {
+            let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, dyn_p);
+            match guard {
+                Some(g) => Some(self.s.m.bin(self.cur, Bin::And, g, in_bounds)),
+                None => Some(in_bounds),
+            }
+        } else if let Some(mesh) = self.s.mesh {
             let threads = self.s.threads.map(|t| t[0]).unwrap_or(u32::MAX);
             if threads > mesh.max_primitives {
                 let p = self.s.m.i32(mesh.max_primitives);
@@ -13742,17 +14875,28 @@ impl<'a> Lower<'a> {
         // A primitive that names a vertex past the declared count, or one
         // no lane writes (lane n writes vertex n alone), is culled too: the
         // host would read a vertex nothing set, at any position.
-        let written = self.s.mesh.map(|m| {
-            m.max_vertices
-                .min(self.s.threads.map_or(u32::MAX, |t| t[0]))
-        });
+        let written = if let Some((dyn_v, _)) = self.mesh_counts {
+            if let Some(threads) = self.s.threads.map(|t| t[0]) {
+                let tk = self.s.m.i32(threads);
+                let lt = self.s.m.cmp(c, pred::IULT, dyn_v, tk);
+                Some(self.s.m.select(c, lt, dyn_v, tk))
+            } else {
+                Some(dyn_v)
+            }
+        } else {
+            self.s.mesh.map(|m| {
+                self.s.m.i32(
+                    m.max_vertices
+                        .min(self.s.threads.map_or(u32::MAX, |t| t[0])),
+                )
+            })
+        };
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
             let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
-                let n = self.s.m.i32(n);
                 let past = self.s.m.cmp(c, pred::IUGE, i, n);
                 culled = self.s.m.bin(c, Bin::Or, culled, past);
             }
@@ -15869,6 +17013,7 @@ mod tests {
                 fields,
                 reads: vec![],
                 writes: vec![],
+                wait: 0,
             }
         };
 
@@ -16103,6 +17248,680 @@ mod tests {
         if let Ok(mut v) = super::super::validator::Validator::load(None) {
             v.validate(&mut dxbc)
                 .expect("CSE'd CandidateTriangleRayT DXIL must pass dxil.dll validation");
+        }
+    }
+
+    #[test]
+    fn narrow_barrier_uses_cfg_uav_reachability_and_waitcnt() {
+        const S_BARRIER: u32 = 0xBF8A_0000;
+        const S_WAITCNT_LGKM0: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
+        // s_waitcnt_vscnt null, 0: SOPK op=0x17, sdst=null(125=0x7D), imm=0
+        const S_WAITCNT_VSCNT0: u32 = (0xB << 28) | (0x17 << 23) | (0x7D << 16);
+        let table_uav_layout = || vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 1, 1)];
+        let lower_table_cs = |words: &[u32]| {
+            let mut l = lower_with(words, table_uav_layout(), vec![])
+                .expect("narrow_barrier CS lowers");
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(None) {
+                v.validate(&mut l.dxil)
+                    .expect("narrow_barrier DXIL must pass dxil.dll validation");
+            }
+            l
+        };
+
+        // Preamble: load UAV descriptor from table s0 into s[8:11].
+        let pre: [u32; 4] = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        ];
+        // MUBUF op=0x1C (buffer_store_dword) v1, v0, s[8:11], 0 offen
+        let store_plain: [u32; 2] = [0xE070_1000, 0x8002_0100];
+        // MUBUF op=0x1C with glc=1 (bit 14 in word0)
+        let store_glc: [u32; 2] = [0xE070_5000, 0x8002_0100];
+        // MUBUF op=0x0C (buffer_load_dword) v2, v0, s[8:11], 0 offen
+        let load_uav: [u32; 2] = [0xE030_1000, 0x8002_0200];
+        // ds_write_b32 v0, v1 / ds_read_b32 v2, v0
+        let ds_write: [u32; 2] = [0xD834_0000, 0x0000_0100];
+        let ds_read: [u32; 2] = [0xD8D8_0000, 0x0200_0000];
+
+        // (a) LDS-only barrier BEFORE any UAV store -> mode 9 (SyncThreadGroup | TGSMFence).
+        let mut lds_before_uav = Vec::new();
+        lds_before_uav.extend_from_slice(&pre);
+        lds_before_uav.extend_from_slice(&ds_write);
+        lds_before_uav.push(S_WAITCNT_LGKM0);
+        lds_before_uav.push(S_BARRIER);
+        lds_before_uav.extend_from_slice(&ds_read);
+        lds_before_uav.extend_from_slice(&store_plain);
+        lds_before_uav.push(S_ENDPGM);
+        let l_a = lower_table_cs(&lds_before_uav);
+        assert_eq!(
+            l_a.barrier_modes,
+            vec![9],
+            "LDS-only barrier before any UAV store must narrow to mode 9"
+        );
+
+        // (b) Barrier after glc UAV store inside a loop back-edge -> stays mode 11.
+        let mut loop_uav = Vec::new();
+        loop_uav.extend_from_slice(&pre);
+        loop_uav.push(0xBE86_0380); // s_mov_b32 s6, 0
+        // loop header (back-edge target = -8 dwords from branch):
+        loop_uav.extend_from_slice(&ds_write); // 2 dwords
+        loop_uav.push(S_BARRIER); // 1 dword
+        loop_uav.extend_from_slice(&store_glc); // 2 dwords
+        loop_uav.push(S_WAITCNT_VSCNT0); // 1 dword
+        loop_uav.push(0x8006_8106); // s_add_u32 s6, s6, 1 (1 dword)
+        loop_uav.push(0xBF0A_8406); // s_cmp_lt_u32 s6, 4 (1 dword)
+        loop_uav.push(0xBF85_FFF7); // s_cbranch_scc1 -9 (jumps back to ds_write)
+        loop_uav.push(S_ENDPGM);
+        let l_b = lower_table_cs(&loop_uav);
+        assert_eq!(
+            l_b.barrier_modes,
+            vec![11],
+            "barrier reached by glc UAV store on loop back-edge must stay mode 11"
+        );
+
+        // (c) Non-glc, non-atomic UAV store + vscnt before barrier, UAV load after -> mode 13.
+        let mut tg_uav = Vec::new();
+        tg_uav.extend_from_slice(&pre);
+        tg_uav.extend_from_slice(&store_plain);
+        tg_uav.push(S_WAITCNT_VSCNT0);
+        tg_uav.push(S_BARRIER);
+        tg_uav.extend_from_slice(&load_uav);
+        tg_uav.extend_from_slice(&ds_write);
+        tg_uav.push(S_ENDPGM);
+        let l_c = lower_table_cs(&tg_uav);
+        assert_eq!(
+            l_c.barrier_modes,
+            vec![13],
+            "threadgroup-local UAV store + vscnt before barrier with UAV load after narrows to mode 13"
+        );
+
+        // (d) UAV store NOT waited by vscnt/vmcnt before lgkmcnt-only barrier -> mode 9.
+        let mut lgkm_only = Vec::new();
+        lgkm_only.extend_from_slice(&pre);
+        lgkm_only.extend_from_slice(&store_plain);
+        lgkm_only.extend_from_slice(&ds_write);
+        lgkm_only.push(S_WAITCNT_LGKM0);
+        lgkm_only.push(S_BARRIER);
+        lgkm_only.extend_from_slice(&ds_read);
+        lgkm_only.extend_from_slice(&load_uav);
+        lgkm_only.push(S_ENDPGM);
+        let l_d = lower_table_cs(&lgkm_only);
+        assert_eq!(
+            l_d.barrier_modes,
+            vec![9],
+            "barrier preceded only by lgkmcnt with no vscnt/vmcnt since UAV store narrows to mode 9"
+        );
+
+        // (e) VICTORY_NARROW_BARRIER=0 preserves legacy mode 11 and alters host_settings/fingerprint.
+        let hs_on = super::host_settings();
+        let fp_on = super::super::translation_fingerprint();
+        let prev = super::TEST_NARROW_BARRIER.replace(Some(false));
+        let hs_off = super::host_settings();
+        let fp_off = super::super::translation_fingerprint();
+        let l_off = lower_table_cs(&lds_before_uav);
+        super::TEST_NARROW_BARRIER.set(prev);
+        assert_eq!(
+            l_off.barrier_modes,
+            vec![11],
+            "VICTORY_NARROW_BARRIER=0 must preserve legacy mode 11"
+        );
+        assert_ne!(hs_on, hs_off, "VICTORY_NARROW_BARRIER must be reflected in host_settings()");
+        assert_ne!(fp_on, fp_off, "VICTORY_NARROW_BARRIER must be reflected in translation_fingerprint()");
+    }
+
+    #[test]
+    fn mesh_alloc_counts_forwards_gs_alloc_req() {
+        // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ): SOPP op=0x10, imm=9 -> 0xBF90_0009
+        const S_SENDMSG_ALLOC: u32 = 0xBF90_0009;
+        let position = super::SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let lower_ms = |words: &[u32], threads: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: false,
+                vgprs: 10,
+                layout: vec![root(RootType::Constants, 0, 0)],
+                used: vec![],
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads,
+                    max_vertices: 128,
+                    max_primitives: 128,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, native.vgprs).expect("mesh ir builds");
+            let st = structure::structure(&p).expect("mesh structures");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                .expect("mesh resources");
+            let io = io::raise(&p, &native).expect("mesh io");
+            let mut l = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![position.clone()],
+                prims: vec![],
+                mesh_stride: 1,
+            })
+            .expect("mesh lowers");
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(None) {
+                v.validate(&mut l.dxil)
+                    .expect("mesh DXIL must pass dxil.dll validation");
+            }
+            l
+        };
+
+        // 1) Unconditional entry-block MSG_GS_ALLOC_REQ from dynamic root constant s8 (user_data 0 in MS).
+        let direct_ms = [
+            0xBEFC_0308u32, // s_mov_b32 m0, s8
+            S_SENDMSG_ALLOC,
+            0x7E00_02F2,    // v_mov_b32 v0, 1.0
+            0x7E02_0280,    // v_mov_b32 v1, 0
+            0xF800_0941,
+            0x0000_0001,    // exp prim v1, off, off, off done
+            0xF800_08CF,
+            0x0000_0000,    // exp pos0 v0, v0, v0, v0 done
+            S_ENDPGM,
+        ];
+        let l_direct = lower_ms(&direct_ms, 128);
+        assert!(
+            l_direct.dynamic_mesh_counts,
+            "entry-block MSG_GS_ALLOC_REQ must forward dynamic SetMeshOutputCounts"
+        );
+
+        // 2) Multi-wave (128 threads) wave-0 guarded MSG_GS_ALLOC_REQ diamond:
+        //    s3 = MergedWaveInfo; if ((s3 >> 24) == 0) { m0 = s8; s_sendmsg(GS_ALLOC_REQ); }
+        let wave0_ms = [
+            0x9004_9803u32, // s_lshr_b32 s4, s3, 24
+            0xBF06_8004,    // s_cmp_eq_u32 s4, 0
+            0xBF84_0002,    // s_cbranch_scc0 +2 (skip m0 + sendmsg)
+            0xBEFC_0308,    // s_mov_b32 m0, s8
+            S_SENDMSG_ALLOC,
+            0x7E00_02F2,    // v_mov_b32 v0, 1.0
+            0x7E02_0280,    // v_mov_b32 v1, 0
+            0xF800_0941,
+            0x0000_0001,    // exp prim v1, off, off, off done
+            0xF800_08CF,
+            0x0000_0000,    // exp pos0 v0, v0, v0, v0 done
+            S_ENDPGM,
+        ];
+        let l_wave0 = lower_ms(&wave0_ms, 128);
+        assert!(
+            l_wave0.dynamic_mesh_counts,
+            "wave-0 guarded MSG_GS_ALLOC_REQ must hoist dynamic SetMeshOutputCounts to uniform dominator"
+        );
+
+        // 3) No MSG_GS_ALLOC_REQ -> safely falls back to static prologue.
+        let no_alloc_ms = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0x7E02_0280,    // v_mov_b32 v1, 0
+            0xF800_0941,
+            0x0000_0001,    // exp prim v1, off, off, off done
+            0xF800_08CF,
+            0x0000_0000,    // exp pos0 v0, v0, v0, v0 done
+            S_ENDPGM,
+        ];
+        let l_none = lower_ms(&no_alloc_ms, 128);
+        assert!(
+            !l_none.dynamic_mesh_counts,
+            "mesh shader without MSG_GS_ALLOC_REQ must fall back to static counts"
+        );
+
+        // 4) VICTORY_MESH_ALLOC_COUNTS=0 disables dynamic counts and updates host_settings/fingerprint.
+        let hs_on = super::host_settings();
+        let fp_on = super::super::translation_fingerprint();
+        let prev = super::TEST_MESH_ALLOC_COUNTS.replace(Some(false));
+        let hs_off = super::host_settings();
+        let fp_off = super::super::translation_fingerprint();
+        let l_off = lower_ms(&direct_ms, 128);
+        super::TEST_MESH_ALLOC_COUNTS.set(prev);
+        assert!(
+            !l_off.dynamic_mesh_counts,
+            "VICTORY_MESH_ALLOC_COUNTS=0 must restore static SetMeshOutputCounts"
+        );
+        assert_ne!(
+            hs_on, hs_off,
+            "VICTORY_MESH_ALLOC_COUNTS must be reflected in host_settings()"
+        );
+        assert_ne!(
+            fp_on, fp_off,
+            "VICTORY_MESH_ALLOC_COUNTS must be reflected in translation_fingerprint()"
+        );
+    }
+
+    #[test]
+    fn fast_rcp_arcp_div_collapse_and_legacy_fmad() {
+        let lower_cs = |words: &[u32]| {
+            let mut l = lower_with(
+                words,
+                vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 1, 1)],
+                vec![],
+            )
+            .expect("fast_rcp CS lowers");
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(None) {
+                v.validate(&mut l.dxil)
+                    .expect("fast_rcp DXIL must pass dxil.dll validation");
+            }
+            l
+        };
+        let pre: [u32; 6] = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xE034_1000,
+            0x8002_0100, // buffer_load_dwordx2 v[1:2], v0, s[8:11], 0 offen
+        ];
+        let store_v1: [u32; 2] = [0xE070_1000, 0x8002_0100]; // buffer_store_dword v1, v0, s[8:11], 0 offen
+
+        // 1) Plain v_rcp_f32 emits arcp and validates.
+        let mut rcp_words = Vec::new();
+        rcp_words.extend_from_slice(&pre);
+        rcp_words.push(0x7E02_5501); // v_rcp_f32 v1, v1
+        rcp_words.extend_from_slice(&store_v1);
+        rcp_words.push(S_ENDPGM);
+        let l_rcp = lower_cs(&rcp_words);
+        assert_eq!(l_rcp.arcp_fdivs, 1, "plain v_rcp_f32 must emit fdiv arcp");
+
+        // 2) Full v_div_scale..v_div_fixup collapses into strict IEEE fdiv (0 arcp).
+        let mut div_words = Vec::new();
+        div_words.extend_from_slice(&pre);
+        div_words.extend_from_slice(&[
+            0xD56D_6A03,
+            0x0406_0502, // v_div_scale_f32 v3, vcc_lo, v2, v2, v1
+            0xD56D_1008,
+            0x0406_0501, // v_div_scale_f32 v8, s16, v1, v2, v1
+            0x7E08_5503, // v_rcp_f32 v4, v3
+            0xD54B_0005,
+            0x23CA_0903, // v_fma_f32 v5, -v3, v4, 1.0
+            0xD54B_0004,
+            0x0412_0905, // v_fma_f32 v4, v5, v4, v4
+            0x100A_0908, // v_mul_f32 v5, v8, v4
+            0xD54B_0006,
+            0x2422_0B03, // v_fma_f32 v6, -v3, v5, v8
+            0xD56F_0004,
+            0x0416_0906, // v_div_fmas_f32 v4, v6, v4, v5
+            0xD55F_0001,
+            0x0406_0504, // v_div_fixup_f32 v1, v4, v2, v1
+        ]);
+        div_words.extend_from_slice(&store_v1);
+        div_words.push(S_ENDPGM);
+        let l_div = lower_cs(&div_words);
+        assert_eq!(l_div.arcp_fdivs, 0, "v_rcp_f32 fed by v_div_scale_f32 must stay strict IEEE");
+        assert_eq!(
+            l_div.collapsed_fdivs, 1,
+            "IEEE v_div_scale..v_div_fixup idiom must collapse into a single strict fdiv"
+        );
+
+        // 3) v_mad_legacy_f32 uses rdna::LEGACY fast path (bounded collapses to single FMad,
+        //    unbounded drops all 3x ftz() calls and differs from generic lowering).
+        let mut mad_legacy_unbounded = Vec::new();
+        mad_legacy_unbounded.extend_from_slice(&pre);
+        mad_legacy_unbounded.extend_from_slice(&[0xD540_0001, 0x040A_0501]); // v_mad_legacy_f32 v1, v1, v2, v2
+        mad_legacy_unbounded.extend_from_slice(&store_v1);
+        mad_legacy_unbounded.push(S_ENDPGM);
+
+        let mut mad_legacy_bounded = Vec::new();
+        mad_legacy_bounded.extend_from_slice(&pre);
+        // v_mad_legacy_f32 v1, v1, 2.0 (const 244 = 0xF4), v2 -> bounded finite non-zero factor
+        mad_legacy_bounded.extend_from_slice(&[0xD540_0001, 0x0409_E901]);
+        mad_legacy_bounded.extend_from_slice(&store_v1);
+        mad_legacy_bounded.push(S_ENDPGM);
+
+        let prev_rdna = super::TEST_RDNA.replace(Some(0));
+        let l_mad_gen = lower_cs(&mad_legacy_unbounded);
+        let l_mad_b_gen = lower_cs(&mad_legacy_bounded);
+        super::TEST_RDNA.set(Some(super::super::rdna::ALL));
+        let l_mad_rdna = lower_cs(&mad_legacy_unbounded);
+        let l_mad_b_rdna = lower_cs(&mad_legacy_bounded);
+        super::TEST_RDNA.set(prev_rdna);
+        assert_ne!(
+            l_mad_rdna.dxil, l_mad_gen.dxil,
+            "v_mad_legacy_f32 under rdna::LEGACY must use the RDNA fast path"
+        );
+        assert!(
+            l_mad_b_rdna.dxil.len() < l_mad_b_gen.dxil.len(),
+            "bounded v_mad_legacy_f32 under rdna::LEGACY must collapse to a single FMad ({} vs {})",
+            l_mad_b_rdna.dxil.len(),
+            l_mad_b_gen.dxil.len()
+        );
+
+        // 4) VICTORY_FAST_RCP=0 disables arcp + collapse + legacy_fmad fast path and alters cache keys.
+        let hs_on = super::host_settings();
+        let fp_on = super::super::translation_fingerprint();
+        let prev_rcp = super::TEST_FAST_RCP.replace(Some(false));
+        let hs_off = super::host_settings();
+        let fp_off = super::super::translation_fingerprint();
+        let l_rcp_off = lower_cs(&rcp_words);
+        let l_div_off = lower_cs(&div_words);
+        super::TEST_FAST_RCP.set(prev_rcp);
+        assert_eq!(l_rcp_off.arcp_fdivs, 0, "VICTORY_FAST_RCP=0 must disable arcp");
+        assert_eq!(l_div_off.collapsed_fdivs, 0, "VICTORY_FAST_RCP=0 must disable div collapse");
+        assert_ne!(hs_on, hs_off, "VICTORY_FAST_RCP must be reflected in host_settings()");
+        assert_ne!(fp_on, fp_off, "VICTORY_FAST_RCP must be reflected in translation_fingerprint()");
+    }
+
+    #[test]
+    fn rdna_opt_wave_base_lds_safe_bindless_and_mul_hi() {
+        const S_BARRIER: u32 = 0xBF8A_0000;
+        let validate = |dxil: &mut Vec<u8>| {
+            #[cfg(windows)]
+            if let Ok(mut v) = super::super::validator::Validator::load(None) {
+                v.validate(dxil).expect("G6 DXIL must pass dxil.dll validation");
+            }
+        };
+
+        // 1) AMD RDNA Wave32 wave_base kill: wave64 CS with group=64 and quad-confined ds_swizzle
+        //    under host_rdna() != 0 + VICTORY_RDNA_WAVE32=1 allocates 0 LDS dwords (no wave_base
+        //    LDS counter/barrier/atomic prologue), whereas VICTORY_RDNA_OPT=0 allocates 1 dword.
+        let swizzle_cs = [
+            0xD8D4_0000u32,
+            0x0000_0000, // ds_swizzle_b32 v0, v0 offset:0
+            S_ENDPGM,
+        ];
+        let lower_wave64_cs = |words: &[u32], threads: [u32; 3], lds_blocks: u32| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: true,
+                vgprs: 8,
+                layout: vec![root(RootType::Constants, 0, 0)],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    // rsrc2: lds_size in bits 15..23 (in 128-dword = 512-byte blocks)
+                    rsrc2: (lds_blocks << 15) | (1 << 1),
+                    threads,
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, true, native.vgprs).expect("w64 ir");
+            let st = structure::structure(&p).expect("w64 st");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("w64 res");
+            let io = io::raise(&p, &native).expect("w64 io");
+            let mut l = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .expect("w64 lowers");
+            validate(&mut l.dxil);
+            l
+        };
+
+        let prev_rdna = super::TEST_RDNA.replace(Some(super::super::rdna::ALL));
+        let prev_w32 = super::TEST_RDNA_WAVE32.replace(Some(1));
+        let prev_maxw = super::TEST_HOST_WAVE.replace(Some(64));
+
+        let l_wbase_on = lower_wave64_cs(&swizzle_cs, [64, 1, 1], 0);
+        assert_eq!(l_wbase_on.wave_size, Some(32));
+        assert_eq!(
+            l_wbase_on.lds_dwords, 0,
+            "RDNA Wave32 must not allocate wave_base LDS counter dword"
+        );
+
+        let prev_opt = super::TEST_RDNA_OPT.replace(Some(false));
+        let l_wbase_off = lower_wave64_cs(&swizzle_cs, [64, 1, 1], 0);
+        super::TEST_RDNA_OPT.set(prev_opt);
+        assert_eq!(l_wbase_off.wave_size, Some(32));
+        assert_eq!(
+            l_wbase_off.lds_dwords, 1,
+            "VICTORY_RDNA_OPT=0 must restore legacy 1-dword wave_base LDS counter"
+        );
+
+        // 2) Multi-wave (group=128) barrier-separated LDS shader gets Wave32 on RDNA,
+        //    whereas unbarriered write->read LDS stays Wave64.
+        let barrier_lds_cs = [
+            0xD834_0000u32,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_BARRIER,
+            0xD8D8_0000,
+            0x0200_0000, // ds_read_b32 v2, v0
+            S_ENDPGM,
+        ];
+        let unbarriered_lds_cs = [
+            0xD834_0000u32,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD8D8_0000,
+            0x0200_0000, // ds_read_b32 v2, v0 (no s_barrier!)
+            S_ENDPGM,
+        ];
+        let l_lds_safe = lower_wave64_cs(&barrier_lds_cs, [128, 1, 1], 1);
+        assert_eq!(
+            l_lds_safe.wave_size,
+            Some(32),
+            "barrier-separated multi-wave LDS shader must relax to RDNA Wave32"
+        );
+        let l_lds_unsafe = lower_wave64_cs(&unbarriered_lds_cs, [128, 1, 1], 1);
+        assert_ne!(
+            l_lds_unsafe.wave_size,
+            Some(32),
+            "unbarriered write->read LDS shader must NOT relax to Wave32"
+        );
+
+        super::TEST_HOST_WAVE.set(prev_maxw);
+        super::TEST_RDNA_WAVE32.set(prev_w32);
+        super::TEST_RDNA.set(prev_rdna);
+
+        // 3) Bindless s_buffer_load_dwordx4 skips SLOT_STRIDES load + diamond when
+        //    constants_raw() && raw_views() != 0, while still advertising SLOT_STRIDES
+        //    in root_srvs for host heap_buffers() prep.
+        let bindless_smem = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0 (ResourceHeap base)
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000,    // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF428_0304,
+            0xFA00_0000,    // s_buffer_load_dwordx4 s[12:15], s[8:11], null
+            0x7E00_020C,    // v_mov_b32 v0, s12
+            0xD834_0000,
+            0x0000_0000,    // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let prev_raw = super::super::shader::RAW_VIEWS_HERE.replace(Some(1 << 20));
+        let prev_cbv = super::super::shader::CONSTANTS_RAW_HERE.replace(Some(true));
+        let mut l_bindless_on = lower_with(
+            &bindless_smem,
+            vec![root(RootType::ResourceHeap, 0, 0)],
+            vec![],
+        )
+        .expect("bindless smem on lowers");
+        validate(&mut l_bindless_on.dxil);
+        assert_eq!(
+            l_bindless_on.stride_loads, 0,
+            "bindless s_buffer_load under PORT_CBV+raw_views must skip SLOT_STRIDES load"
+        );
+        assert!(
+            l_bindless_on.root_srvs.contains(&super::super::shader::SLOT_STRIDES),
+            "must still advertise SLOT_STRIDES in root_srvs so host syncs heap_buffers()"
+        );
+        let prev_opt2 = super::TEST_RDNA_OPT.replace(Some(false));
+        let mut l_bindless_off = lower_with(
+            &bindless_smem,
+            vec![root(RootType::ResourceHeap, 0, 0)],
+            vec![],
+        )
+        .expect("bindless smem off lowers");
+        validate(&mut l_bindless_off.dxil);
+        super::TEST_RDNA_OPT.set(prev_opt2);
+        super::super::shader::CONSTANTS_RAW_HERE.set(prev_cbv);
+        super::super::shader::RAW_VIEWS_HERE.set(prev_raw);
+        assert_eq!(
+            l_bindless_off.stride_loads, 1,
+            "VICTORY_RDNA_OPT=0 must restore SLOT_STRIDES load"
+        );
+
+        // 4) mul_hi uses native dx.op.binaryWithTwoOuts.i32 (IMul/UMul) with NO SFI0::INT64 flag,
+        //    and computes exact signed + unsigned high 32 bits on real GPU & WARP.
+        let mul_hi_cs = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000,    // s_load_dwordx4 s[8:11], s[4:5], null (SRV)
+            0xF408_0302,
+            0xFA00_0020,    // s_load_dwordx4 s[12:15], s[4:5], 0x20 (UAV)
+            0x340E_0083,    // v_lshlrev_b32 v7, 3, v0
+            0xE034_1000,
+            0x8002_0107,    // buffer_load_dwordx2 v[1:2], v7, s[8:11], 0 offen
+            0xD56A_0003,
+            0x0002_0501,    // v_mul_hi_u32 v3, v1, v2
+            0xD56C_0004,
+            0x0002_0501,    // v_mul_hi_i32 v4, v1, v2
+            0xE074_1000,
+            0x8003_0307,    // buffer_store_dwordx2 v[3:4], v7, s[12:15], 0 offen
+            S_ENDPGM,
+        ];
+        let layout_mul = vec![root(RootType::Table, 0, 0)];
+        let used_mul = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 4,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let lower_mul_cs = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: layout_mul.clone(),
+                used: used_mul.clone(),
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 1,
+                    threads: [4, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, native.vgprs).expect("mul ir");
+            let st = structure::structure(&p).expect("mul st");
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("mul res");
+            let io = io::raise(&p, &native).expect("mul io");
+            let mut l = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .expect("mul lowers");
+            validate(&mut l.dxil);
+            l
+        };
+        let l_mul_on = lower_mul_cs(&mul_hi_cs);
+        assert!(
+            !l_mul_on.uses_int64,
+            "native dx.op.binaryWithTwoOuts.i32 mul_hi must NOT set flags::INT64"
+        );
+
+        let hs_on = super::host_settings();
+        let fp_on = super::super::translation_fingerprint();
+        let prev_opt3 = super::TEST_RDNA_OPT.replace(Some(false));
+        let hs_off = super::host_settings();
+        let fp_off = super::super::translation_fingerprint();
+        let l_mul_off = lower_mul_cs(&mul_hi_cs);
+        super::TEST_RDNA_OPT.set(prev_opt3);
+        assert!(
+            l_mul_off.uses_int64,
+            "VICTORY_RDNA_OPT=0 must restore i64 mul_hi emulation"
+        );
+        assert_ne!(hs_on, hs_off, "VICTORY_RDNA_OPT must be reflected in host_settings()");
+        assert_ne!(fp_on, fp_off, "VICTORY_RDNA_OPT must be reflected in translation_fingerprint()");
+
+        // Execute native mul_hi on hardware & WARP to verify high-word extraction (not low-word!).
+        #[cfg(windows)]
+        for warp in [false, true] {
+            let Ok(host) = super::super::host::Host::new(warp) else {
+                continue;
+            };
+            let cs = super::super::HostShader {
+                stage: HwStage::Cs,
+                dxil: l_mul_on.dxil.clone(),
+                user_data: l_mul_on.user_data.clone(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l_mul_on.root_cbvs.clone(),
+                root_srvs: l_mul_on.root_srvs.clone(),
+                root_uavs: l_mul_on.root_uavs.clone(),
+                root_indexed_views: Vec::new(),
+                half_views: l_mul_on.half_views.clone(),
+            };
+            let (root_sig, pso) = host.compute_pipeline(&cs).expect("mul_hi pso");
+            let pairs: [(u32, u32); 4] = [
+                (0x8000_0000, 4),          // u_hi = 2, i_hi = -2 (0xFFFF_FFFE)
+                (0xFFFF_FFFE, 3),          // -2 * 3 = -6 -> u_hi = 2, i_hi = -1 (0xFFFF_FFFF)
+                (0x0001_0000, 0x0001_0000),// 2^32 -> u_hi = 1, i_hi = 1
+                (0xFFFF_FFFF, 0xFFFF_FFFF),// u_hi = 0xFFFF_FFFE, i_hi = 0
+            ];
+            let input_words: Vec<u32> = pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+            let out = host
+                .dispatch(
+                    &root_sig,
+                    &pso,
+                    &super::super::host::Dispatch {
+                        roots: vec![(0, super::super::host::Root::Constants(vec![0]))],
+                        views: &[
+                            super::super::host::View::Buffer {
+                                data: &input_words,
+                                stride: super::super::host::Stride::Raw,
+                            },
+                            super::super::host::View::RawUav(8),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("mul_hi dispatch");
+            let tag = if warp { "warp" } else { "hardware" };
+            for (idx, &(a, b)) in pairs.iter().enumerate() {
+                let want_u = ((u64::from(a) * u64::from(b)) >> 32) as u32;
+                let want_i = ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32;
+                assert_eq!(out[0][2 * idx], want_u, "{tag}: v_mul_hi_u32({a:#x}, {b:#x})");
+                assert_eq!(out[0][2 * idx + 1], want_i, "{tag}: v_mul_hi_i32({a:#x}, {b:#x})");
+            }
         }
     }
 }

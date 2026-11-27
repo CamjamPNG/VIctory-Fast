@@ -8754,6 +8754,7 @@ mod tests {
                 fields,
                 reads,
                 writes,
+                wait: 0,
             }
         };
 

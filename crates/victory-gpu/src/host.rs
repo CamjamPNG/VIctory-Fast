@@ -1344,6 +1344,7 @@ fn memory_summary_line(frames: f64) {
             .map(|a| a.swap(0, Ordering::Relaxed) as f64)
             .collect();
         let slots = crate::draw::heap_slots();
+        let sweep = crate::draw::heap_sweep();
         let present_ms = PRESENT_NS.swap(0, Ordering::Relaxed) as f64 / 1e6 / p_frames;
         if p.iter().sum::<f64>() > 0.1 {
             // The fields before "(sum)" are as they were, in their order, and
@@ -1355,7 +1356,10 @@ fn memory_summary_line(frames: f64) {
                  of snap_card {:.1} the snapshots and {:.1} the copies in the card's memory; \
                  {:.0} list calls a frame; heap slots looked at {:.0} a frame, mirrored {:.0}; \
                  title copies beside the submitting thread {:.0} a frame in {:.0} runs, {:.1} ms of them \
-                 (VICTORY_PREP_SPLIT: {}, {} thread(s) beside this one, VICTORY_PREP_SPLIT_THREADS)",
+                 (VICTORY_PREP_SPLIT: {}, {} thread(s) beside this one, VICTORY_PREP_SPLIT_THREADS); \
+                 of the heap sweep's slots {:.0} left out as a draw's table's before it was made, \
+                 {:.0} answered from what was kept of them, {:.0} read from the record \
+                 (VICTORY_HEAP_SWEEP_CACHED: {})",
                 p[9], p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[10], present_ms, p.iter().sum::<f64>(),
                 x[0], x[1],
                 crate::copystat::peek(crate::copystat::C::RecordCalls) as f64 / p_frames,
@@ -1366,6 +1370,10 @@ fn memory_summary_line(frames: f64) {
                 beside[2] / 1e6 / p_frames,
                 if prep_split::on() { "on" } else { "off" },
                 prep_split::beside_threads().saturating_sub(1),
+                sweep[0] as f64 / p_frames,
+                sweep[1] as f64 / p_frames,
+                sweep[2] as f64 / p_frames,
+                if crate::draw::heap_sweep_cached() { "on" } else { "off" },
             );
         }
     }

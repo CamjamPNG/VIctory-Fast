@@ -1943,9 +1943,8 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
         let _busy = Busy::begin();
         let mut physical = physical();
         let mut ops: Vec<Op> = Vec::new();
-        let mut group_pages = 0usize;
         let mut touched = std::collections::HashSet::new();
-        for &(to, from) in &pages[at..] {
+        for (group_pages, &(to, from)) in pages[at..].iter().enumerate() {
             // A page the group changes already, or one it would be mapped
             // from: after it.
             if group_pages >= MAX_GROUP_PAGES
@@ -1967,7 +1966,6 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             }
             ok &= !missing;
             touched.insert(to);
-            group_pages += 1;
             at += 1;
         }
         let _changing = victory_gpu::title_memory_remapping();

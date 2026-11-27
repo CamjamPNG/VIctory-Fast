@@ -936,17 +936,18 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        if !call.is_done.load(Ordering::Acquire) {
-            let done = lock(&call.done);
-            if !*done {
-                call.waiters.fetch_add(1, Ordering::AcqRel);
-                let _guard = CallWaiterGuard(&call.waiters);
-                let _done = call
-                    .finished
-                    .wait_while(done, |d| !*d)
-                    .unwrap_or_else(|e| e.into_inner());
-            }
+    if wait
+        && let Some(call) = call(block)
+        && !call.is_done.load(Ordering::Acquire)
+    {
+        let done = lock(&call.done);
+        if !*done {
+            call.waiters.fetch_add(1, Ordering::AcqRel);
+            let _guard = CallWaiterGuard(&call.waiters);
+            let _done = call
+                .finished
+                .wait_while(done, |d| !*d)
+                .unwrap_or_else(|e| e.into_inner());
         }
     }
     status(block)
@@ -1940,7 +1941,7 @@ mod tests {
             S_OK
         );
         assert_eq!(
-            XTaskQueueSubmitDelayedCallback(q, WORK, 20, 1 as *mut c_void, Some(record)),
+            XTaskQueueSubmitDelayedCallback(q, WORK, 20, std::ptr::dangling_mut::<c_void>(), Some(record)),
             S_OK
         );
         // A long-delayed callback that will be canceled by terminate.

@@ -9900,8 +9900,12 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
-    /// `true` while `ahead` still holds all front spans (cleared on title writes).
+    /// `true` while front spans remain intact (cleared on overlapping title writes).
     front_intact: bool,
+    /// Bounding box `[min_from, max_to)` of front spans when `all_covered`
+    /// omitted populating `ahead`, so `title_written_range` still clears
+    /// `front_intact` on any overlapping title write.
+    ahead_omitted: Option<(usize, usize)>,
     /// Unique `(shadow_ptr, address, len)` GPU writes declared in this submission,
     /// avoiding repeated `pending`/`flights` locking and eliminating a second
     /// pass over all lists for `declared_writes`.
@@ -10717,6 +10721,18 @@ mod written_spans_tests {
         assert!(!batch.textures.contains_key(&10));
         assert!(batch.textures.contains_key(&20));
 
+        // When `all_covered` omitted `ahead`, `title_written_range` must still
+        // clear `front_intact` on overlapping title writes.
+        let mut omitted = super::Batch::default();
+        omitted.front = true;
+        omitted.front_intact = true;
+        omitted.ahead_omitted = Some((0x1000, 0x5000));
+        omitted.title_written_range(0x5000, 0x6000);
+        assert!(omitted.front_intact, "disjoint write keeps omitted front intact");
+        omitted.title_written_range(0x2000, 0x2100);
+        assert!(!omitted.front_intact, "overlapping write must clear omitted front_intact");
+        assert!(omitted.ahead_omitted.is_none());
+
         // `fill_overlapping` keeps disjoint fills queued and flushes overlapping ones.
         let src = [0xabu8; 32];
         let mut dst = [0u8; 32];
@@ -10728,6 +10744,35 @@ mod written_spans_tests {
         batch.fill_overlapping(s_addr + 16, s_addr + 24);
         assert!(batch.fills.is_empty(), "overlapping write must flush fills");
         assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn dirty_span_indices_orders_largest_first_in_serial_and_parallel_modes() {
+        let mut backing = vec![0u8; 4096];
+        let ptr = backing.as_mut_ptr();
+        let make = |addr: u64, len: u64| crate::shadow::Shadow::unbacked(addr, ptr, len, false);
+        // Spread spans across distinct 64 MiB pieces (unsorted order) with varying lengths.
+        let spans: Vec<_> = (0..40usize)
+            .map(|i| {
+                let piece = (i * 7) % 19;
+                let base = (piece + 1) * (64 << 20) + i * 4096;
+                let len = ((i % 10) + 1) * 4096;
+                (make(base as u64, len as u64), base, base + len)
+            })
+            .collect();
+        for parallel in [false, true] {
+            let dirty = super::Batch::dirty_span_indices(&spans, parallel);
+            assert_eq!(dirty.len(), spans.len());
+            // Verify descending span-length ordering (LPT scheduling).
+            for w in dirty.windows(2) {
+                let len_a = spans[w[0]].2 - spans[w[0]].1;
+                let len_b = spans[w[1]].2 - spans[w[1]].1;
+                assert!(len_a >= len_b, "expected largest-first order: {len_a} < {len_b}");
+            }
+            let mut sorted = dirty;
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..spans.len()).collect::<Vec<_>>());
+        }
     }
 }
 
@@ -10960,7 +11005,12 @@ impl Batch {
                 self.flush_one(&shadow);
             }
         }
-        if !self.ahead.is_empty() {
+        if let Some((lo, hi)) = self.ahead_omitted {
+            if lo < end && hi > dst {
+                self.front_intact = false;
+                self.ahead_omitted = None;
+            }
+        } else if !self.ahead.is_empty() {
             let before = self.ahead.len();
             self.ahead.retain(|_, &mut (from, to)| to <= dst || from >= end);
             if self.ahead.len() < before {
@@ -10975,6 +11025,7 @@ impl Batch {
         self.check_textures();
         self.flush();
         self.ahead.clear();
+        self.ahead_omitted = None;
         self.front_intact = false;
         self.textures.clear();
     }
@@ -11065,11 +11116,96 @@ impl Batch {
         covered
     }
 
+    /// Filters `spans` down to the indices that may have new writes in the
+    /// journal, grouping spans by 64 MiB journal piece (`from >> 26`) so
+    /// `JournalScan`'s 1-shard read lock stays hot across consecutive spans,
+    /// then orders dirty indices largest-span-first so heavy copies start first.
+    fn dirty_span_indices(
+        spans: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+        parallel: bool,
+    ) -> Vec<usize> {
+        if spans.is_empty() {
+            return Vec::new();
+        }
+        const SORT_MIN: usize = 16;
+        let scan_slice = |offset: usize, slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]| -> Vec<usize> {
+            let mut out = Vec::new();
+            let j = crate::watch::journal_read();
+            let mut scan = j.scan();
+            if slice.len() < SORT_MIN {
+                for (i, (shadow, from, to)) in slice.iter().enumerate() {
+                    if !shadow.nothing_new_with_scan(&mut scan, *from, *to - *from) {
+                        out.push(offset + i);
+                    }
+                }
+            } else {
+                thread_local! {
+                    static ORDER: std::cell::RefCell<Vec<(usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+                }
+                ORDER.with_borrow_mut(|order| {
+                    order.clear();
+                    order.extend(slice.iter().enumerate().map(|(i, &(_, from, _))| (from >> 26, i as u32)));
+                    order.sort_unstable_by_key(|&(piece, _)| piece);
+                    for &(_, i) in order.iter() {
+                        let i = i as usize;
+                        let (shadow, from, to) = &slice[i];
+                        if !shadow.nothing_new_with_scan(&mut scan, *from, *to - *from) {
+                            out.push(offset + i);
+                        }
+                    }
+                });
+            }
+            out
+        };
+        let mut dirty = if parallel {
+            let workers = crate::shadow::wide_worker_count();
+            let chunks = workers.min(spans.len().div_ceil(128)).max(1);
+            let chunk_len = spans.len().div_ceil(chunks);
+            let buckets: Vec<std::sync::Mutex<Vec<usize>>> =
+                (0..chunks).map(|_| std::sync::Mutex::new(Vec::new())).collect();
+            crate::shadow::wide_each(chunks, |c| {
+                let start = c * chunk_len;
+                let end = (start + chunk_len).min(spans.len());
+                if start < end {
+                    let local = scan_slice(start, &spans[start..end]);
+                    if !local.is_empty() {
+                        *buckets[c].lock().unwrap_or_else(|e| e.into_inner()) = local;
+                    }
+                }
+            });
+            let mut parts: Vec<Vec<usize>> = buckets
+                .into_iter()
+                .map(|b| b.into_inner().unwrap_or_else(|e| e.into_inner()))
+                .collect();
+            if parts.len() == 1 {
+                parts.pop().unwrap()
+            } else {
+                let total: usize = parts.iter().map(Vec::len).sum();
+                let mut all = Vec::with_capacity(total);
+                for p in parts {
+                    all.extend(p);
+                }
+                all
+            }
+        } else {
+            scan_slice(0, spans)
+        };
+        if dirty.len() > 1 {
+            dirty.sort_unstable_by(|&a, &b| {
+                spans[b]
+                    .2
+                    .saturating_sub(spans[b].1)
+                    .cmp(&spans[a].2.saturating_sub(spans[a].1))
+            });
+        }
+        dirty
+    }
+
     /// The rest of [`Batch::refresh_front`]: `spans` brought up to date in
     /// front, and the textures `due`.
     fn refresh_spans(
         &mut self,
-        mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         due: Vec<std::sync::Arc<crate::texture::Staging>>,
         all_covered: bool,
         planning: crate::timeline::Span,
@@ -11078,9 +11214,18 @@ impl Batch {
         self.front = true;
         self.front_intact = true;
         // When every list in `runs` is `front_covered`, `run_deferred` skips
-        // `Step::Refresh` while `front_intact` holds (and `title_written` clears
-        // `ahead`), so `ahead` is never queried.
-        if !all_covered {
+        // `Step::Refresh` while `front_intact` holds; track the spans' bounding
+        // box so `title_written_range` still clears `front_intact` on overlap.
+        if all_covered {
+            let mut lo = usize::MAX;
+            let mut hi = 0usize;
+            for &(_, from, to) in &spans {
+                lo = lo.min(from);
+                hi = hi.max(to);
+            }
+            self.ahead_omitted = (lo < hi).then_some((lo, hi));
+        } else {
+            self.ahead_omitted = None;
             self.ahead.reserve(spans.len());
             for (shadow, from, to) in &spans {
                 self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
@@ -11094,93 +11239,45 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let tex_before = PREPARING[2].load(Ordering::Relaxed);
-        // Filter known-clean spans first so dirty spans run at 1-span granularity
-        // across workers (preventing chunk-0 straggler serialization) and clean
-        // flushes never wake the worker pool.
+        // Filter known-clean spans in piece/shard order first so dirty spans run
+        // at 1-span granularity (largest first) across workers and clean flushes
+        // never wake the worker pool.
         const FEW: usize = 512;
-        const CHUNK: usize = 64;
-        if spans.len() <= FEW {
-            if !spans.is_empty() {
-                let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
-                #[cfg(feature = "diagnostics")]
-                let all = spans.len();
-                let j = crate::watch::journal_read();
-                let mut scan = j.scan();
-                spans.retain(|(shadow, from, to)| !shadow.nothing_new_with_scan(&mut scan, *from, *to - *from));
-                drop(scan);
-                drop(j);
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        let parallel_scan = spans.len() > FEW;
+        let dirty = if !spans.is_empty() {
+            let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
+            let dirty = Self::dirty_span_indices(&spans, parallel_scan);
+            #[cfg(feature = "diagnostics")]
+            {
+                FLUSHES[2].fetch_add((spans.len() - dirty.len()) as u64, Ordering::Relaxed);
+                if parallel_scan {
+                    FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+                } else if !due.is_empty() || !dirty.is_empty() {
+                    FLUSHES[3].fetch_add(dirty.len() as u64, Ordering::Relaxed);
+                }
             }
-            let ahead = spans.len() > 1 && !crate::watch::once();
-            if ahead {
-                let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-                crate::watch::ask_ahead(&ranges);
-            }
-            if !due.is_empty() || !spans.is_empty() {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-                crate::shadow::wide_each(due.len() + spans.len(), |i| {
-                    let Some(idx) = i.checked_sub(due.len()) else {
-                        due[i].refresh();
-                        return;
-                    };
-                    let (shadow, from, to) = &spans[idx];
-                    Self::update_parallel(shadow, *from, *to);
-                });
-            }
-            if ahead {
-                crate::watch::ask_ahead_done();
-            }
+            dirty
         } else {
-            let chunks = spans.len().div_ceil(CHUNK);
-            let masks: Vec<std::sync::atomic::AtomicU64> = (0..chunks).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-            crate::shadow::wide_each(chunks, |chunk_idx| {
-                let start = chunk_idx * CHUNK;
-                let chunk = &spans[start..(start + CHUNK).min(spans.len())];
-                let mut dirty_mask = 0u64;
-                let j = crate::watch::journal_read();
-                let mut scan = j.scan();
-                for (bit, (shadow, from, to)) in chunk.iter().enumerate() {
-                    if !shadow.nothing_new_with_scan(&mut scan, *from, *to - *from) {
-                        dirty_mask |= 1u64 << bit;
-                    }
-                }
-                masks[chunk_idx].store(dirty_mask, Ordering::Relaxed);
+            Vec::new()
+        };
+        let ahead = dirty.len() > 1 && !crate::watch::once();
+        if ahead {
+            let ranges: Vec<(usize, usize)> =
+                dirty.iter().map(|&idx| &spans[idx]).filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+            crate::watch::ask_ahead(&ranges);
+        }
+        if !due.is_empty() || !dirty.is_empty() {
+            crate::shadow::wide_each(due.len() + dirty.len(), |i| {
+                let Some(di) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                let (shadow, from, to) = &spans[dirty[di]];
+                Self::update_parallel(shadow, *from, *to);
             });
-            let mut dirty: Vec<usize> = Vec::new();
-            for (chunk_idx, mask) in masks.into_iter().enumerate() {
-                let mut bits = mask.into_inner();
-                let base = chunk_idx * CHUNK;
-                while bits != 0 {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    dirty.push(base + bit);
-                }
-            }
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((spans.len() - dirty.len()) as u64, Ordering::Relaxed);
-            let ahead = dirty.len() > 1 && !crate::watch::once();
-            if ahead {
-                let ranges: Vec<(usize, usize)> =
-                    dirty.iter().map(|&idx| &spans[idx]).filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
-                crate::watch::ask_ahead(&ranges);
-            }
-            if !due.is_empty() || !dirty.is_empty() {
-                crate::shadow::wide_each(due.len() + dirty.len(), |i| {
-                    let Some(di) = i.checked_sub(due.len()) else {
-                        due[i].refresh();
-                        return;
-                    };
-                    let (shadow, from, to) = &spans[dirty[di]];
-                    Self::update_parallel(shadow, *from, *to);
-                });
-            }
-            if ahead {
-                crate::watch::ask_ahead_done();
-            }
+        }
+        if ahead {
+            crate::watch::ask_ahead_done();
         }
         // The time counted is the time it took, not the threads' sum.
         let took = started.elapsed().as_micros() as u64;
@@ -11211,7 +11308,7 @@ impl Batch {
                 });
             }
         }
-        let mut due: Vec<_> = written_spans(touches.into_iter())
+        let due: Vec<_> = written_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
@@ -11223,13 +11320,9 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         if !due.is_empty() {
-            let j = crate::watch::journal_read();
-            let mut scan = j.scan();
-            due.retain(|(shadow, from, to)| !shadow.nothing_new_with_scan(&mut scan, *from, *to - *from));
-            drop(scan);
-            drop(j);
-            crate::shadow::wide_each(due.len(), |i| {
-                let (shadow, from, to) = &due[i];
+            let dirty = Self::dirty_span_indices(&due, due.len() > 512);
+            crate::shadow::wide_each(dirty.len(), |di| {
+                let (shadow, from, to) = &due[dirty[di]];
                 Self::update_parallel(shadow, *from, *to);
             });
         }
@@ -11355,94 +11448,82 @@ impl Batch {
         // and any thread woken. (Thousands of them, the heap's buffer views
         // once a frame: on the threads, below.)
         const FEW: usize = 512;
-        const CHUNK: usize = 64;
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
+        let refreshes = std::mem::take(&mut self.refreshes);
+        let dirty: Option<Vec<usize>> = if light && (refreshes.len() <= FEW || wide_refresh()) {
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            let all = self.refreshes.len();
-            let j = crate::watch::journal_read();
-            let mut scan = j.scan();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_with_scan(&mut scan, *from, *to - *from));
-            drop(scan);
-            drop(j);
+            let parallel = refreshes.len() > FEW && wide_refresh();
+            let dirty = Self::dirty_span_indices(&refreshes, parallel);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
-        }
+            FLUSHES[2].fetch_add((refreshes.len() - dirty.len()) as u64, Ordering::Relaxed);
+            if dirty.is_empty() {
+                return;
+            }
+            Some(dirty)
+        } else {
+            None
+        };
+        let count = dirty.as_ref().map_or(refreshes.len(), Vec::len);
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
-        let ahead = self.refreshes.len() > 1 && !crate::watch::once();
+        let ahead = count > 1 && !crate::watch::once();
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|r| r.0.asked_ahead())
-                .map(|r| (r.1, r.2))
-                .collect();
+            let ranges: Vec<(usize, usize)> = match &dirty {
+                Some(dirty) => dirty
+                    .iter()
+                    .map(|&idx| &refreshes[idx])
+                    .filter(|r| r.0.asked_ahead())
+                    .map(|r| (r.1, r.2))
+                    .collect(),
+                None => refreshes
+                    .iter()
+                    .filter(|r| r.0.asked_ahead())
+                    .map(|r| (r.1, r.2))
+                    .collect(),
+            };
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && count >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
-            FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
-            if light {
-                let refreshes = std::mem::take(&mut self.refreshes);
-                if refreshes.len() > FEW {
-                    let chunks = refreshes.len().div_ceil(CHUNK);
-                    let masks: Vec<std::sync::atomic::AtomicU64> =
-                        (0..chunks).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
-                    crate::shadow::wide_each(chunks, |chunk_idx| {
-                        let start = chunk_idx * CHUNK;
-                        let chunk = &refreshes[start..(start + CHUNK).min(refreshes.len())];
-                        let mut dirty_mask = 0u64;
-                        let j = crate::watch::journal_read();
-                        let mut scan = j.scan();
-                        for (bit, (shadow, from, to)) in chunk.iter().enumerate() {
-                            if !shadow.nothing_new_with_scan(&mut scan, *from, *to - *from) {
-                                dirty_mask |= 1u64 << bit;
-                            }
-                        }
-                        masks[chunk_idx].store(dirty_mask, Ordering::Relaxed);
-                    });
-                    let mut dirty = Vec::new();
-                    for (chunk_idx, mask) in masks.into_iter().enumerate() {
-                        let mut bits = mask.into_inner();
-                        let base = chunk_idx * CHUNK;
-                        while bits != 0 {
-                            let bit = bits.trailing_zeros() as usize;
-                            bits &= bits - 1;
-                            dirty.push(base + bit);
-                        }
-                    }
-                    #[cfg(feature = "diagnostics")]
-                    FLUSHES[2].fetch_add((refreshes.len() - dirty.len()) as u64, Ordering::Relaxed);
+            FLUSHES[3].fetch_add(
+                if light && refreshes.len() > FEW { refreshes.len() } else { count } as u64,
+                Ordering::Relaxed,
+            );
+            match &dirty {
+                Some(dirty) => {
                     crate::shadow::wide_each(dirty.len(), |di| {
                         let (shadow, from, to) = &refreshes[dirty[di]];
                         Self::update_parallel(shadow, *from, *to);
                     });
-                } else {
+                }
+                None => {
                     crate::shadow::wide_each(refreshes.len(), |i| {
                         let (shadow, from, to) = &refreshes[i];
                         Self::update_parallel(shadow, *from, *to);
                     });
                 }
-            } else {
-                let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    Self::update_parallel(shadow, *from, *to);
-                });
             }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
+            match dirty {
+                Some(dirty) => {
+                    for idx in dirty {
+                        let (shadow, from, to) = &refreshes[idx];
+                        Self::update(shadow, *from, *to);
+                    }
+                }
+                None => {
+                    for (shadow, from, to) in refreshes {
+                        Self::update(&shadow, from, to);
+                    }
+                }
             }
         }
         if ahead {
@@ -11536,10 +11617,14 @@ pub(crate) fn copy_mapped_ok(dst: *mut u8, src: *const u8, len: usize, title_dst
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let since = crate::watch::changes();
     // (A title destination that is away only while the runtime changes a
     // mapping beside it is written when that is done.)
-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    let whole = if title_dst {
+        let since = crate::watch::changes();
+        read(src, dst, len) || crate::watch::again_after_change(since, || read(src, dst, len))
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {

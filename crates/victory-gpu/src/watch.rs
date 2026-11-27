@@ -962,6 +962,17 @@ impl Asking {
         held.push((first, last));
         Asking(first, last)
     }
+
+    /// Holds `[first, last)` in [`ASKING`] only if no overlapping asking is
+    /// already active; never blocks.
+    fn try_hold(first: usize, last: usize) -> Option<Asking> {
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if held.iter().any(|&(a, b)| a < last && first < b) {
+            return None;
+        }
+        held.push((first, last));
+        Some(Asking(first, last))
+    }
 }
 
 impl Drop for Asking {
@@ -1241,13 +1252,185 @@ impl WatchPool {
     }
 }
 
-/// Ranges of one submission closer than this are asked about together:
-/// walking the pages between them costs less than another kernel call (a
-/// call that resets written pages costs 30-70 microseconds whatever the
-/// range).
-const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Lock-free mirror of `Journal::kept` so `ask_early` yields immediately while
+/// a submission's standing asking is active.
+static JOURNAL_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Cached `MEM_PRIVATE` VirtualAlloc reservation `[base, end)` in 64 KiB pages.
+/// Used only to group (never to drop) ranges in `ask_once`/`ask_ahead` and to
+/// clamp `ask_early` slices to valid reservation bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reservation {
+    base: usize,
+    end: usize,
+}
+
+static RESERVATIONS: RwLock<Vec<Reservation>> = RwLock::new(Vec::new());
+
+/// Maximum intra-reservation gap (in 64 KiB pages) bridged between ranges in
+/// the same confirmed `MEM_PRIVATE` reservation (`VICTORY_WATCH_GAP_MB=<MiB>`,
+/// default `64` MiB; `0`: only touching/overlapping ranges merge).
+fn watch_gap_pages() -> usize {
+    #[cfg(test)]
+    if let Some(pages) = WATCH_GAP_IN_TEST.get() {
+        return pages;
+    }
+    static PAGES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        let mb = std::env::var("VICTORY_WATCH_GAP_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(64)
+            .min(1024);
+        (mb << 20) / PAGE
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static WATCH_GAP_IN_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Queries Windows for the `MEM_PRIVATE` VirtualAlloc reservation containing
+/// `page`. Returns `None` for non-private, free, or sub-64 KiB allocations.
+fn query_private_reservation(page: usize) -> Option<Reservation> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State == MEM_FREE || info.Type != MEM_PRIVATE {
+        return None;
+    }
+    let alloc_base = info.AllocationBase as usize;
+    if alloc_base == 0 {
+        return None;
+    }
+    let mut end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+    for _ in 0..256 {
+        // SAFETY: plain data filled in by `VirtualQuery`.
+        let mut next: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid out pointer of the right size.
+        let m = unsafe { VirtualQuery(end as *const _, &mut next, size_of_val(&next)) };
+        if m == 0
+            || next.State == MEM_FREE
+            || next.Type != MEM_PRIVATE
+            || next.AllocationBase as usize != alloc_base
+        {
+            break;
+        }
+        let next_end = (next.BaseAddress as usize).saturating_add(next.RegionSize);
+        if next_end <= end {
+            break;
+        }
+        end = next_end;
+    }
+    let base_page = alloc_base / PAGE;
+    let end_page = end / PAGE;
+    (base_page <= page && page < end_page).then_some(Reservation {
+        base: base_page,
+        end: end_page,
+    })
+}
+
+fn find_cached_reservation(res: &[Reservation], page: usize) -> Option<Reservation> {
+    let idx = res.partition_point(|r| r.end <= page);
+    res.get(idx).copied().filter(|r| r.base <= page && page < r.end)
+}
+
+fn cache_reservation(found: Reservation) {
+    let mut res = RESERVATIONS.write().unwrap_or_else(|e| e.into_inner());
+    res.retain(|r| !(r.base < found.end && found.base < r.end));
+    let pos = res.partition_point(|r| r.base < found.base);
+    res.insert(pos, found);
+}
+
+fn invalidate_reservations(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    {
+        let res = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+        let idx = res.partition_point(|r| r.end <= first);
+        if res.get(idx).is_none_or(|r| r.base >= last) {
+            return;
+        }
+    }
+    let mut res = RESERVATIONS.write().unwrap_or_else(|e| e.into_inner());
+    res.retain(|r| !(r.base < last && first < r.end));
+}
+
+/// Groups sorted, overlap-coalesced `pieces` into `(start_idx, end_idx, first, last)`
+/// `GetWriteWatch` spans that never cross `MEM_PRIVATE` reservation boundaries
+/// and bridge gaps up to [`watch_gap_pages`] inside the same reservation.
+fn group_pieces(pieces: &[(usize, usize)], allow_singletons: bool) -> Vec<(usize, usize, usize, usize)> {
+    let gap = watch_gap_pages();
+    let mut res_of: Vec<Option<Reservation>> = vec![None; pieces.len()];
+    let mut misses: Vec<usize> = Vec::new();
+    {
+        let cached = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+        for (i, &(first, last)) in pieces.iter().enumerate() {
+            if let Some(r) = find_cached_reservation(&cached, first) {
+                if last <= r.end {
+                    res_of[i] = Some(r);
+                }
+            } else {
+                misses.push(i);
+            }
+        }
+    }
+    if !misses.is_empty() {
+        let mut last_found: Option<Reservation> = None;
+        for i in misses {
+            let (first, last) = pieces[i];
+            let found = if let Some(r) = last_found
+                && r.base <= first
+                && first < r.end
+            {
+                Some(r)
+            } else {
+                let q = query_private_reservation(first);
+                if let Some(r) = q {
+                    cache_reservation(r);
+                    last_found = Some(r);
+                }
+                q
+            };
+            if let Some(r) = found
+                && last <= r.end
+            {
+                res_of[i] = Some(r);
+            }
+        }
+    }
+    let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        if let Some(r) = res_of[i] {
+            while k < pieces.len()
+                && pieces[k].1 <= r.end
+                && pieces[k].0 <= last.saturating_add(gap)
+                && last.max(pieces[k].1) - first <= AHEAD_MAX
+            {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+        }
+        if allow_singletons || k - i >= 2 {
+            groups.push((i, k, first, last));
+        }
+        i = k;
+    }
+    groups
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -1276,24 +1459,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if pieces.len() < 2 {
         return;
     }
-    let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        if k - i >= 2 {
-            groups.push((i, k, first, last));
-        }
-        i = k;
-    }
+    let groups = group_pieces(&pieces, false);
     if groups.is_empty() {
         return;
     }
@@ -1443,6 +1609,81 @@ fn note_hot(written: &[(usize, u16)]) {
     });
 }
 
+/// Clamps hot 2 MiB `pieces` to cached `MEM_PRIVATE` reservations, merges
+/// adjacent slices within the same reservation, and drains write-watch bits
+/// into the journal without blocking active submissions. Returns the number
+/// of 2 MiB piece-equivalents asked.
+fn drain_early_pieces(pieces: &mut Vec<usize>) -> u64 {
+    use std::sync::atomic::Ordering::Acquire;
+    if pieces.is_empty() || JOURNAL_KEPT.load(Acquire) {
+        return 0;
+    }
+    pieces.sort_unstable();
+    pieces.dedup();
+    // Clamp each hot 2 MiB bucket against known `MEM_PRIVATE` reservations and
+    // merge adjacent spans inside the same reservation into one `GetWriteWatch`.
+    let mut spans: Vec<(usize, usize, u64)> = Vec::new();
+    {
+        let cached = RESERVATIONS.read().unwrap_or_else(|e| e.into_inner());
+        for &piece in pieces.iter() {
+            let p_lo = piece * EARLY_PIECE;
+            let p_hi = (piece + 1) * EARLY_PIECE;
+            let mut idx = cached.partition_point(|r| r.end <= p_lo);
+            while let Some(&r) = cached.get(idx) {
+                if r.base >= p_hi {
+                    break;
+                }
+                let lo = p_lo.max(r.base);
+                let hi = p_hi.min(r.end);
+                if lo < hi
+                    && !published(lo * PAGE, hi * PAGE)
+                    && !refused_as_view(lo * PAGE, hi * PAGE)
+                {
+                    match spans.last_mut() {
+                        Some((prev_lo, prev_hi, count))
+                            if *prev_hi == lo && hi - *prev_lo <= AHEAD_MAX && *prev_lo >= r.base =>
+                        {
+                            *prev_hi = hi;
+                            *count += 1;
+                        }
+                        _ => spans.push((lo, hi, 1)),
+                    }
+                }
+                idx += 1;
+            }
+        }
+    }
+    let mut asked = 0u64;
+    let mut written: Vec<(usize, u16)> = Vec::new();
+    for (from, to, count) in spans {
+        if JOURNAL_KEPT.load(Acquire) {
+            break;
+        }
+        let Some(_held) = Asking::try_hold(from, to) else {
+            continue;
+        };
+        written.clear();
+        if !kernel_written_into(from, to, &mut written) {
+            invalidate_reservations(from, to);
+            continue;
+        }
+        asked += count;
+        if written.is_empty() {
+            continue;
+        }
+        if port_journal() {
+            let _ = note_shared(&written);
+        } else {
+            let mut j = journal_mut();
+            let now = next_asking();
+            for &(page, parts) in &written {
+                j.notes.note(page, parts, now);
+            }
+        }
+    }
+    asked
+}
+
 fn ask_early(every: std::time::Duration) {
     use std::sync::atomic::Ordering::Relaxed;
     // So many rounds without a submission's asking: wait for one.
@@ -1452,7 +1693,7 @@ fn ask_early(every: std::time::Duration) {
     let mut last = 0u64;
     loop {
         std::thread::sleep(every);
-        let pieces: Vec<usize> = {
+        let mut pieces: Vec<usize> = {
             let mut hot = HOT.lock().unwrap_or_else(|e| e.into_inner());
             let now = ASKED.load(Relaxed);
             idle = if now == last { idle + 1 } else { 0 };
@@ -1474,16 +1715,7 @@ fn ask_early(every: std::time::Duration) {
             most.into_iter().take(EARLY_MOST).map(|(_, p)| p).collect()
         };
         let began = std::time::Instant::now();
-        let mut asked = 0;
-        for piece in pieces {
-            // (A submission's asking stands: what it holds is answered from
-            // the journal, and costs nothing here.)
-            if published(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE) {
-                continue;
-            }
-            asked += 1;
-            let _ = writes(piece * EARLY_PIECE * PAGE, (piece + 1) * EARLY_PIECE * PAGE, false);
-        }
+        let asked = drain_early_pieces(&mut pieces);
         EARLY[0].fetch_add(asked, Relaxed);
         EARLY[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
         last = ASKED.load(Relaxed);
@@ -1548,22 +1780,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     pieces.sort_unstable();
     coalesce_overlapping_pieces(&mut pieces);
-    let mut groups: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        groups.push((i, k, first, last));
-        i = k;
-    }
+    let groups = group_pieces(&pieces, true);
     let _held = AskingMany::hold(groups.iter().map(|&(_, _, first, last)| (first, last)).collect());
     let (mut asked, mut written) = (Vec::with_capacity(groups.len()), Vec::new());
     let threads = watch_threads();
@@ -1577,6 +1794,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
                 ask_all_run(&pieces[i..k], &mut g_asked, &mut g_written);
             } else if kernel_written_into(first, last, &mut g_written) {
                 g_asked.push((first, last));
+            } else {
+                invalidate_reservations(first, last);
             }
             *slots[g].lock().unwrap_or_else(|e| e.into_inner()) = (g_asked, g_written);
         });
@@ -1591,6 +1810,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
                 ask_all_run(&pieces[i..k], &mut asked, &mut written);
             } else if kernel_written_into(first, last, &mut written) {
                 asked.push((first, last));
+            } else {
+                invalidate_reservations(first, last);
             }
         }
     }
@@ -1600,7 +1821,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         let now = note_shared(&written);
         let mut j = journal_mut();
         j.ahead_asked = now;
-        j.kept = !asked.is_empty();
+        let kept = !asked.is_empty();
+        j.kept = kept;
+        JOURNAL_KEPT.store(kept, std::sync::atomic::Ordering::Release);
         j.ahead = asked;
         return;
     }
@@ -1610,7 +1833,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.notes.note(page, parts, now);
     }
-    j.kept = !asked.is_empty();
+    let kept = !asked.is_empty();
+    j.kept = kept;
+    JOURNAL_KEPT.store(kept, std::sync::atomic::Ordering::Release);
     j.ahead = asked;
 }
 
@@ -1626,6 +1851,7 @@ fn ask_all_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, writt
         asked.push((first, last));
         return;
     }
+    invalidate_reservations(first, last);
     if pieces.len() < 2 {
         return;
     }
@@ -1645,6 +1871,7 @@ pub(crate) fn ask_once_end() {
     let mut j = journal_mut();
     if j.kept {
         j.kept = false;
+        JOURNAL_KEPT.store(false, std::sync::atomic::Ordering::Release);
         j.ahead.clear();
     }
 }
@@ -1701,6 +1928,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
         asked.push((first, last));
         return;
     }
+    invalidate_reservations(first, last);
     let (a, b) = pieces.split_at(pieces.len() / 2);
     ask_run(a, asked, written);
     ask_run(b, asked, written);
@@ -2112,8 +2340,8 @@ pub(crate) fn port_guard_plan() -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// [`hot_rest`] in milliseconds, for what this thread does (0: as set).
-    pub(crate) static HOT_IN_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// [`hot_rest`] in milliseconds, for what this thread does (`None`: env/default, `Some(0)`: off).
+    pub(crate) static HOT_IN_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     /// [`port_guard`], for what this thread does.
     pub(crate) static PORT_GUARD_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -2940,7 +3168,8 @@ struct Guards {
     /// is ([`hot_rest`]). Behind a lock of its own: faults note in it holding
     /// [`GUARDS`] shared.
     opened: Mutex<std::collections::HashMap<usize, Opened, std::hash::BuildHasherDefault<PageHash>>>,
-    opened_nonempty: std::sync::atomic::AtomicBool,
+    /// Fast lock-free hint of blocks currently resting in `opened`.
+    resting: Blocks,
 }
 
 /// When a write fault opened a block, and how often it had been written again
@@ -2951,19 +3180,26 @@ struct Opened {
     hot: u8,
 }
 
+/// Default ceiling (ms) for hot-block rest extension (`VICTORY_GUARD_HOT`).
+/// Roughly one 60 FPS frame: keeps blocks written repeatedly within a frame
+/// writable without re-protecting mid-burst, while re-protecting promptly
+/// once writes stop. `VICTORY_GUARD_HOT=0` disables hot-rest extension.
+const DEFAULT_HOT_REST_MS: u64 = 16;
+/// Repeat-fault window past the previous rest before a block cools down.
+const HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(25);
+/// Repeat-fault streak required before extending rest (probation avoids
+/// extending rest for one-off 2-write streaming bursts).
+const HOT_PROMOTE_AT: u8 = 2;
+
 /// How long a block the title writes again soon after each time it is taken
-/// rests at most (renderer port #6, `VICTORY_GUARD_HOT=<ms>`; unset or 0:
-/// off, [`rest`] for all). A block opened by a fault within its rest and
-/// 50 ms more after it last was rests twice as long the next time, up to
-/// this; one that stayed clean longer rests [`rest`] again. Such a block is
-/// told as written at every asking while it rests (as a resting block always
-/// was), so what is missed is nothing; what it costs is a look at its bytes
-/// at every refresh of a copy over it instead of a protection change and a
-/// fault each time.
+/// rests at most (`VICTORY_GUARD_HOT=<ms>`; default 16 ms; `0`: off, [`rest`]
+/// for all). A block opened by a fault repeatedly within its rest plus
+/// [`HOT_WINDOW`] rests twice as long per streak past [`HOT_PROMOTE_AT`], up
+/// to this ceiling; one that stayed clean longer rests [`rest`] again.
 fn hot_rest() -> std::time::Duration {
     #[cfg(test)]
-    if HOT_IN_TEST.get() != 0 {
-        return std::time::Duration::from_millis(HOT_IN_TEST.get());
+    if let Some(ms) = HOT_IN_TEST.get() {
+        return std::time::Duration::from_millis(ms);
     }
     #[cfg(feature = "diagnostics")]
     if crate::ab::pick("VICTORY_GUARD_HOT") == Some(false) {
@@ -2971,9 +3207,13 @@ fn hot_rest() -> std::time::Duration {
     }
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *MS.get_or_init(|| {
-        std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0).min(1000)
+        std::env::var("VICTORY_GUARD_HOT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_HOT_REST_MS)
+            .min(1000)
     });
-    if ms == 0 || !port_guard() {
+    if ms == 0 {
         return std::time::Duration::ZERO;
     }
     std::time::Duration::from_millis(ms)
@@ -2982,14 +3222,14 @@ fn hot_rest() -> std::time::Duration {
 impl Opened {
     /// How long a block opened so rests.
     fn rest(&self, rest: std::time::Duration) -> std::time::Duration {
-        if self.hot == 0 || rest.is_zero() {
+        if self.hot < HOT_PROMOTE_AT || rest.is_zero() {
             return rest;
         }
         let most = hot_rest();
         if most.is_zero() {
             return rest;
         }
-        rest.saturating_mul(1 << self.hot.min(16)).min(most.max(rest))
+        rest.saturating_mul(1 << (self.hot - HOT_PROMOTE_AT + 1).min(16)).min(most.max(rest))
     }
 }
 
@@ -3037,44 +3277,87 @@ impl Guards {
 
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
-        if rest.is_zero() || !self.opened_nonempty.load(std::sync::atomic::Ordering::Acquire) {
+        if rest.is_zero() || !self.resting.contains(block) {
             return false;
         }
         let opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
-        opened.get(&block).is_some_and(|o| {
+        let active = opened.get(&block).is_some_and(|o| {
             let elapsed = o.at.elapsed();
             let longer = o.rest(rest);
             if elapsed >= rest && elapsed < longer {
                 port6_count(P6_RESTED_HOT, 1);
             }
             elapsed < longer
-        })
+        });
+        if !active {
+            self.resting.remove(block);
+        }
+        active
+    }
+
+    fn clear_opened(&self, first: usize, last: usize) {
+        if first >= last {
+            return;
+        }
+        let mut opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
+        if opened.is_empty() {
+            return;
+        }
+        if last - first <= opened.len() {
+            for b in first..last {
+                if opened.remove(&b).is_some() {
+                    self.resting.remove(b);
+                }
+            }
+        } else {
+            opened.retain(|&b, _| {
+                if (first..last).contains(&b) {
+                    self.resting.remove(b);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     /// A write fault opened `block`.
     fn opened(&self, block: usize) {
         const MANY: usize = 1 << 13;
         let rest = rest();
+        let most = hot_rest();
         let mut opened = self.opened.lock().unwrap_or_else(|e| e.into_inner());
         if opened.len() >= MANY {
-            let keep = std::time::Duration::from_millis(50).max(hot_rest() + std::time::Duration::from_millis(50));
-            opened.retain(|_, o| o.at.elapsed() < keep);
+            let keep = HOT_WINDOW.max(most + HOT_WINDOW);
+            opened.retain(|&b, o| {
+                let alive = o.at.elapsed() < keep;
+                if !alive {
+                    self.resting.remove(b);
+                }
+                alive
+            });
             if opened.len() >= MANY {
+                for &b in opened.keys() {
+                    self.resting.remove(b);
+                }
                 opened.clear();
             }
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
         let now = std::time::Instant::now();
         let hot = match opened.get(&block) {
-            // Written again within its rest and a little more: hotter.
-            Some(o) if !hot_rest().is_zero() && now.duration_since(o.at) < o.rest(rest) + std::time::Duration::from_millis(50) => {
-                port6_count(P6_HOT, 1);
-                o.hot.saturating_add(1).min(16)
+            // Written again within its rest and HOT_WINDOW: hotter; extends rest once streak >= HOT_PROMOTE_AT.
+            Some(o) if !most.is_zero() && now.duration_since(o.at) < o.rest(rest) + HOT_WINDOW => {
+                let next = o.hot.saturating_add(1).min(16);
+                if next >= HOT_PROMOTE_AT {
+                    port6_count(P6_HOT, 1);
+                }
+                next
             }
             _ => 0,
         };
         opened.insert(block, Opened { at: now, hot });
-        self.opened_nonempty.store(true, std::sync::atomic::Ordering::Release);
+        self.resting.insert(block);
     }
 }
 
@@ -3089,7 +3372,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     kernel: Vec::new(),
     aliased: Blocks::new(),
     opened: Mutex::new(std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new())),
-    opened_nonempty: std::sync::atomic::AtomicBool::new(false),
+    resting: Blocks::new(),
 });
 
 /// The guards, alone.
@@ -3635,8 +3918,15 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// `[from, to)`'s blocks, and gets those of the other views' blocks it can
 /// have now; a view whose block's claim cannot be had is not covered.
 fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) -> bool {
+    let entries = elsewhere(from * BLOCK, (to - from) * BLOCK);
+    if entries.is_empty() {
+        return true;
+    }
+    let rest = rest();
     let mut all = true;
-    for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
+    let mut pending: Vec<usize> = Vec::new();
+    let mut deferred: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (page, others) in entries {
         let block = page / BLOCK;
         if !g.protected.contains(block) {
             continue; // not there, or not ours to guard
@@ -3645,10 +3935,57 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
         ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         g.aliased.insert(block);
         let mut covered = true;
+        let mut needed: Vec<usize> = Vec::new();
         for other in others {
-            covered &= protect_alias(g, other / BLOCK, claims.as_deref_mut());
+            let ob = other / BLOCK;
+            if let Some(claims) = claims.as_deref_mut()
+                && !claims.holds(ob)
+                && !claims.try_one(ob)
+            {
+                covered = false;
+                continue;
+            }
+            g.aliased.insert(ob);
+            if g.protected.contains(ob) {
+                continue;
+            }
+            if g.left_alone(ob) || g.rests(ob, rest) {
+                covered = false;
+                continue;
+            }
+            pending.push(ob);
+            needed.push(ob);
         }
         if !covered {
+            all = false;
+            g.clean.remove(block);
+        } else if !needed.is_empty() {
+            deferred.push((block, needed));
+        }
+    }
+    if pending.len() == 1 {
+        protect_alias_one(g, pending[0]);
+    } else if pending.len() > 1 {
+        pending.sort_unstable();
+        pending.dedup();
+        let mut i = 0;
+        while i < pending.len() {
+            let run_from = pending[i];
+            let mut run_to = run_from + 1;
+            i += 1;
+            while i < pending.len() && pending[i] == run_to {
+                run_to += 1;
+                i += 1;
+            }
+            if run_to - run_from == 1 {
+                protect_alias_one(g, run_from);
+            } else {
+                protect_alias_run(g, run_from, run_to);
+            }
+        }
+    }
+    for (block, needed) in deferred {
+        if needed.iter().any(|&ob| !g.protected.contains(ob)) {
             all = false;
             g.clean.remove(block);
         }
@@ -3656,41 +3993,25 @@ fn cover(g: &Guards, from: usize, to: usize, mut claims: Option<&mut Claims>) ->
     all
 }
 
-/// Makes `block` read-only: another view of a page a copy is about to take
-/// through its own, so that a write through this one faults too. It is not
-/// noted clean: the copies of title memory at this view have not taken the
-/// page ([`guard`] tells such a block as written, then notes it clean).
-/// One that is clean stays so: had the page been written since its copies
-/// took it, [`open`] would have opened it. Whether it is read-only now.
-fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool {
+/// Makes one claimed, non-resting alias `block` read-only.
+fn protect_alias_one(g: &Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
-    if let Some(claims) = claims
-        && !claims.holds(block)
-        && !claims.try_one(block)
-    {
-        // Another changes it now (a fault opens it): not covered.
-        return false;
-    }
-    g.aliased.insert(block);
-    if g.protected.contains(block) {
-        return true;
-    }
-    if g.left_alone(block) || g.rests(block, rest()) {
-        return false;
-    }
-    // Ahead of the protection.
+    // Ahead of the protection, with SeqCst Dekker re-check against `title_memory_unmapping`.
     PROTECTED.set(block);
+    if CHANGING_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) && is_changing(block) {
+        PROTECTED.clear(block);
+        return false;
+    }
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: title view memory; only its protection changes.
     let done = unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0;
     #[cfg(feature = "diagnostics")]
-    {
-        tally(5, 1);
-        tally(8, started.elapsed().as_nanos() as u64);
-    }
+    tally(8, started.elapsed().as_nanos() as u64);
     if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+        #[cfg(feature = "diagnostics")]
+        tally(5, 1);
         g.protected.insert(block);
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
@@ -3703,6 +4024,49 @@ fn protect_alias(g: &Guards, block: usize, claims: Option<&mut Claims>) -> bool 
     }
     PROTECTED.clear(block);
     false
+}
+
+/// Batches `VirtualProtect(PAGE_READONLY)` across a contiguous run of claimed
+/// alias blocks `[from, to)`, falling back per block if views or protections differ.
+fn protect_alias_run(g: &Guards, from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    (from..to).for_each(|b| PROTECTED.set(b));
+    if CHANGING_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) && (from..to).any(is_changing) {
+        for b in from..to {
+            if is_changing(b) {
+                PROTECTED.clear(b);
+            } else {
+                protect_alias_one(g, b);
+            }
+        }
+        return;
+    }
+    let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: contiguous title view memory; only its protection changes.
+    let done = unsafe {
+        VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READONLY, &mut old) != 0
+    };
+    #[cfg(feature = "diagnostics")]
+    tally(8, started.elapsed().as_nanos() as u64);
+    if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+        #[cfg(feature = "diagnostics")]
+        tally(5, (to - from) as u64);
+        g.protected.insert_all(from..to);
+        #[cfg(feature = "diagnostics")]
+        for b in from..to {
+            crate::faultbook::note(crate::faultbook::What::Alias, b, 0, 0);
+        }
+        return;
+    }
+    if done {
+        // SAFETY: restore unexpected protection before checking block by block.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+    }
+    for b in from..to {
+        protect_alias_one(g, b);
+    }
 }
 
 /// [`protect`] for one range, without the other views of its pages.
@@ -3730,7 +4094,9 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
         }
         #[cfg(feature = "diagnostics")]
         {
-            tally(5, (to - from) as u64);
+            if done {
+                tally(5, (to - from) as u64);
+            }
             tally(8, started.elapsed().as_nanos() as u64);
         }
         done
@@ -4394,6 +4760,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
     notify_title_memory_changed(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    invalidate_reservations(first, last);
     if !range_needs_guard_update(first, last, false) {
         return;
     }
@@ -4413,6 +4780,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
     }
     crate::texback::remapped(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    invalidate_reservations(first, last);
     // Record `changing` ahead of checking `VIEWS`/`g.aliased` so any concurrent
     // `guard`/`guard_shared`/`protect_alias` either observes `CHANGING_ACTIVE`
     // or is observed below and serialized through `guards()`.
@@ -4453,6 +4821,9 @@ pub fn title_memory_freed(at: usize, len: usize) {
     };
     if freed_len != 0 {
         crate::inplace::title_memory_freeing(at, freed_len);
+        invalidate_reservations(at / PAGE, at.saturating_add(freed_len).div_ceil(PAGE));
+    } else {
+        invalidate_reservations(at / PAGE, at / PAGE + 1);
     }
     if len != 0 {
         forget_views(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
@@ -4484,6 +4855,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
     for block in foreign {
         g.foreign.remove(&block);
     }
+    g.clear_opened(first, end);
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
     open(&g, at, end * BLOCK);
@@ -4572,6 +4944,7 @@ fn clear_changed_guards(g: &mut Guards, first: usize, last: usize) {
             g.aliased.remove(block);
         }
     }
+    g.clear_opened(first, last);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -6136,7 +6509,7 @@ mod many_askers_tests {
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
                     super::PORT_GUARD_IN_TEST.set(port == 1 || port == 2 && t % 2 == 1);
-                    super::HOT_IN_TEST.set(if rest.is_zero() { 0 } else { 20 });
+                    super::HOT_IN_TEST.set(Some(if rest.is_zero() { 0 } else { 20 }));
                     let mut last = [[0u64; PAGES]; VIEWS];
                     let mut seed = t as u64 * 7919 + 1;
                     let mut next = |n: usize| {
@@ -6799,5 +7172,276 @@ mod port7_tests {
             hits[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         });
         assert!(hits.iter().all(|h| h.load(std::sync::atomic::Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn hot_block_promotes_skips_reprotect_and_reports_every_write() {
+        for use_port_guard in [false, true] {
+            super::PORT_GUARD_IN_TEST.set(use_port_guard);
+            super::REST_IN_TEST.set(std::time::Duration::from_millis(15));
+            super::HOT_IN_TEST.set(Some(120));
+            // SAFETY: section and views owned by this test, cleaned up below.
+            let (section, one, two) = unsafe {
+                let section = CreateFileMappingW(
+                    -1isize as _,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    BLOCK as u32,
+                    std::ptr::null(),
+                );
+                assert!(!section.is_null());
+                let one = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+                let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+                assert!(one != 0 && two != 0);
+                super::title_memory_remapped(one, BLOCK);
+                super::title_memory_remapped(two, BLOCK);
+                crate::title_memory_view(one, BLOCK, section as usize, 0);
+                crate::title_memory_view(two, BLOCK, section as usize, 0);
+                (section, one, two)
+            };
+            let p1 = one / PAGE;
+            let p2 = two / PAGE;
+            assert_eq!(super::guard(one, one + BLOCK), Some(vec![p1]));
+            assert_eq!(super::guard(two, two + BLOCK), Some(vec![p2]));
+            assert!(!super::writable(one) && !super::writable(two));
+
+            let hot_before = super::PORT6[super::P6_HOT].load(Relaxed);
+            let rested_before = super::PORT6[super::P6_RESTED_HOT].load(Relaxed);
+
+            // Fault 1 (hot=0) and Fault 2 (hot=1, probation): both rest only `rest` (15 ms).
+            // Window is rest (15 ms) + HOT_WINDOW (25 ms) = 40 ms, so sleeping 22 ms expires rest
+            // while staying well inside the hot-promotion window.
+            for round in 0..2u8 {
+                // SAFETY: view opened by vectored exception handler.
+                unsafe { ((one + 8) as *mut u8).write_volatile(round + 1) };
+                assert!(super::writable(one));
+                std::thread::sleep(std::time::Duration::from_millis(22));
+                assert_eq!(super::guard(one, one + BLOCK), Some(vec![p1]));
+                assert!(!super::writable(one), "port_guard={use_port_guard} round {round} should re-protect after base rest");
+                assert_eq!(super::guard(two, two + BLOCK), Some(vec![p2]));
+            }
+
+            // Fault 3 (hot=2, promoted!) -> rests 2*rest = 30 ms; wait 38 ms (< 30+25=55 ms) to re-protect, then Fault 4 -> rests 60 ms!
+            // SAFETY: view opened by handler.
+            unsafe { ((one + 8) as *mut u8).write_volatile(3) };
+            std::thread::sleep(std::time::Duration::from_millis(38));
+            assert_eq!(super::guard(one, one + BLOCK), Some(vec![p1]));
+            assert!(!super::writable(one));
+            // Fault 4 -> hot=3, rests 4*rest = 60 ms!
+            unsafe { ((one + 8) as *mut u8).write_volatile(4) };
+            assert!(super::PORT6[super::P6_HOT].load(Relaxed) > hot_before, "hot counter must increment");
+
+            // Sleep 25 ms (> base rest 15 ms, < promoted rest 60 ms): must stay writable without VirtualProtect thrash,
+            // while still reporting every write accurately on both views!
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let (before, _) = super::writes(two, two + BLOCK, true).expect("view");
+            assert!(super::writable(one), "hot block must stay writable past base rest");
+            assert!(super::PORT6[super::P6_RESTED_HOT].load(Relaxed) > rested_before, "hot rest counter must increment");
+            unsafe { ((one + 16) as *mut u8).write_volatile(99) };
+            let (_, told1) = super::writes(one, one + BLOCK, true).expect("view");
+            let (_, told2) = super::writes(two, two + BLOCK, true).expect("view");
+            assert!(told1.iter().any(|&(p, at)| p == p1 && at > before), "primary view must report write");
+            assert!(told2.iter().any(|&(p, at)| p == p2 && at > before), "alias view must report write");
+            assert!(super::writable(one), "still resting hot");
+
+            // Wait past the promoted rest (60 ms total -> 45 ms more): block cools and re-protects cleanly.
+            std::thread::sleep(std::time::Duration::from_millis(45));
+            assert_eq!(super::guard(one, one + BLOCK), Some(vec![p1]));
+            assert!(!super::writable(one) && !super::writable(two), "must re-protect once rest expires");
+            assert_eq!(super::guard(one, one + BLOCK), Some(Vec::new()));
+
+            super::title_memory_unmapping(one, BLOCK);
+            super::title_memory_unmapping(two, BLOCK);
+            // SAFETY: views and section created above.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ });
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: two as *mut _ });
+                windows_sys::Win32::Foundation::CloseHandle(section);
+            }
+        }
+        super::REST_IN_TEST.set(std::time::Duration::ZERO);
+        super::HOT_IN_TEST.set(None);
+        super::PORT_GUARD_IN_TEST.set(false);
+    }
+
+    #[test]
+    fn batched_alias_cover_protects_contiguous_views() {
+        const BLOCKS: usize = 4;
+        const SIZE: usize = BLOCKS * BLOCK;
+        // SAFETY: views of a test-owned section, cleaned up below.
+        let (section, one, two) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let one = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert!(one != 0 && two != 0);
+            super::title_memory_remapped(one, SIZE);
+            super::title_memory_remapped(two, SIZE);
+            crate::title_memory_view(one, SIZE, section as usize, 0);
+            crate::title_memory_view(two, SIZE, section as usize, 0);
+            (section, one, two)
+        };
+        let pages: Vec<usize> = (0..BLOCKS).map(|k| one / PAGE + k).collect();
+        assert_eq!(super::guard(one, one + SIZE), Some(pages));
+        for k in 0..BLOCKS {
+            assert!(!super::writable(one + k * BLOCK));
+            assert!(!super::writable(two + k * BLOCK), "alias block {k} must be protected");
+        }
+        assert_eq!(super::guard(one, one + SIZE), Some(Vec::new()));
+        // Write through alias block 2 -> primary view reports block 2 only.
+        // SAFETY: view opened by handler.
+        unsafe { ((two + 2 * BLOCK + 12) as *mut u8).write_volatile(0x42) };
+        assert_eq!(super::guard(one, one + SIZE), Some(vec![one / PAGE + 2]));
+        assert!(!super::writable(two + 2 * BLOCK));
+
+        super::title_memory_unmapping(one, SIZE);
+        super::title_memory_unmapping(two, SIZE);
+        // SAFETY: views and section created above.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: two as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn group_pieces_coalesces_same_reservation_and_splits_across_reservations() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const RES_A_PAGES: usize = 320; // 20 MiB (> old 8 MiB AHEAD_GAP)
+        const RES_B_PAGES: usize = 32;  // 2 MiB
+        // Reserve 20 MiB with MEM_WRITE_WATCH, commit first 2 MiB and last 2 MiB (leaving a 16 MiB reserved hole in the middle!).
+        // SAFETY: private MEM_WRITE_WATCH reservations freed before return.
+        let res_a = unsafe {
+            VirtualAlloc(std::ptr::null(), RES_A_PAGES * PAGE, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(res_a != 0 && res_a.is_multiple_of(PAGE));
+        unsafe {
+            assert!(!VirtualAlloc(res_a as *const _, 32 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc((res_a + (RES_A_PAGES - 32) * PAGE) as *const _, 32 * PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+        }
+        let res_b = unsafe {
+            VirtualAlloc(std::ptr::null(), RES_B_PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(res_b != 0 && res_b.is_multiple_of(PAGE));
+
+        let a_base = res_a / PAGE;
+        let b_base = res_b / PAGE;
+        // Pieces 18 MiB apart inside res_a (> old 8 MiB gap) plus a piece in res_b.
+        let mut pieces = vec![
+            (a_base, a_base + 4),
+            (a_base + RES_A_PAGES - 4, a_base + RES_A_PAGES),
+            (b_base, b_base + 4),
+        ];
+        pieces.sort_unstable();
+        let groups = super::group_pieces(&pieces, true);
+        // Must coalesce the two pieces inside res_a into ONE group, and keep res_b separate!
+        assert_eq!(groups.len(), 2, "expected 2 groups (1 for res_a, 1 for res_b), got {groups:?}");
+        assert!(groups.iter().any(|&(_, _, f, l)| f == a_base && l == a_base + RES_A_PAGES));
+        assert!(groups.iter().any(|&(_, _, f, l)| f == b_base && l == b_base + 4));
+
+        // Synthetic touching reservations must NEVER merge into one group.
+        let syn_a = 0x5000_0000usize;
+        let syn_b = syn_a + 16;
+        super::cache_reservation(super::Reservation { base: syn_a, end: syn_b });
+        super::cache_reservation(super::Reservation { base: syn_b, end: syn_b + 16 });
+        let syn_groups = super::group_pieces(&[(syn_a + 14, syn_b), (syn_b, syn_b + 2)], true);
+        assert_eq!(syn_groups.len(), 2, "touching separate reservations must stay split: {syn_groups:?}");
+        super::invalidate_reservations(syn_a, syn_b + 16);
+
+        // Now verify real Windows GetWriteWatch across res_a's uncommitted middle hole + res_b via ask_once!
+        let (before_a, _) = super::writes(res_a, res_a + 4 * PAGE, false).expect("res_a watched");
+        let (before_b, _) = super::writes(res_b, res_b + 4 * PAGE, false).expect("res_b watched");
+        // SAFETY: committed pages of res_a (start + end) and res_b.
+        unsafe {
+            ((res_a + PAGE) as *mut u64).write_volatile(0x1111);
+            ((res_a + (RES_A_PAGES - 2) * PAGE) as *mut u64).write_volatile(0x2222);
+            ((res_b + 2 * PAGE) as *mut u64).write_volatile(0x3333);
+        }
+        super::ask_once(&[
+            (res_a, res_a + 4 * PAGE),
+            (res_a + (RES_A_PAGES - 4) * PAGE, res_a + RES_A_PAGES * PAGE),
+            (res_b, res_b + 4 * PAGE),
+        ]);
+        let (_, wa1) = super::asked(res_a, res_a + 4 * PAGE).expect("res_a start covered by ask_once");
+        let (_, wa2) = super::asked(res_a + (RES_A_PAGES - 4) * PAGE, res_a + RES_A_PAGES * PAGE)
+            .expect("res_a end covered by ask_once");
+        let (_, wb) = super::asked(res_b, res_b + 4 * PAGE).expect("res_b covered by ask_once");
+        assert!(wa1.iter().any(|&(p, at)| p == a_base + 1 && at > before_a));
+        assert!(wa2.iter().any(|&(p, at)| p == a_base + RES_A_PAGES - 2 && at > before_a));
+        assert!(wb.iter().any(|&(p, at)| p == b_base + 2 && at > before_b));
+        super::ask_once_end();
+
+        super::title_memory_freed(res_a, RES_A_PAGES * PAGE);
+        super::title_memory_freed(res_b, RES_B_PAGES * PAGE);
+        // SAFETY: reservations allocated above.
+        unsafe {
+            VirtualFree(res_a as *mut _, 0, MEM_RELEASE);
+            VirtualFree(res_b as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn drain_early_pieces_coalesces_respects_kept_and_never_loses_writes() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const PAGES: usize = 3 * super::EARLY_PIECE; // 6 MiB = 3 buckets of 2 MiB
+        // SAFETY: private MEM_WRITE_WATCH reservation freed before return.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert!(at != 0 && at.is_multiple_of(PAGE));
+
+        // Populate reservation cache and establish baseline asking numbers.
+        super::ask_once(&[(at, at + PAGES * PAGE)]);
+        let (baseline, _) = super::asked(at, at + PAGES * PAGE).expect("covered");
+        // While ask_once is standing (`JOURNAL_KEPT == true`), early drain must yield immediately (0 asked).
+        let first_bucket = (at / PAGE) / super::EARLY_PIECE;
+        let last_bucket = ((at / PAGE) + PAGES - 1) / super::EARLY_PIECE;
+        let mut buckets: Vec<usize> = (first_bucket..=last_bucket).collect();
+        assert_eq!(super::drain_early_pieces(&mut buckets), 0, "must skip while ask_once stands");
+        super::ask_once_end();
+
+        // While Asking holds the range, try_hold must skip without blocking.
+        {
+            let _held = super::Asking::hold(at / PAGE, at / PAGE + PAGES);
+            assert_eq!(super::drain_early_pieces(&mut buckets), 0, "must skip while range is held");
+        }
+
+        // Write pages across all 3 buckets, then drain early (both default and port_journal modes).
+        for use_port_journal in [false, true] {
+            super::PORT_JOURNAL_IN_TEST.set(use_port_journal);
+            let (before, _) = super::writes(at, at + PAGES * PAGE, false).expect("watched");
+            let targets = [1usize, super::EARLY_PIECE + 5, 2 * super::EARLY_PIECE + 9];
+            for &off in &targets {
+                // SAFETY: committed pages inside our allocation.
+                unsafe { ((at + off * PAGE) as *mut u64).write_volatile(0xdead_beef) };
+            }
+            let asked = super::drain_early_pieces(&mut buckets);
+            assert!(asked >= 3, "expected >= 3 piece-equivalents drained, got {asked}");
+
+            // Submission's ask_once after early drain must still see every write with asking > before!
+            super::ask_once(&[(at, at + PAGES * PAGE)]);
+            let (_, seen) = super::asked(at, at + PAGES * PAGE).expect("covered");
+            for &off in &targets {
+                let page = at / PAGE + off;
+                assert!(
+                    seen.iter().any(|&(p, w)| p == page && w > before && w > baseline),
+                    "port_journal={use_port_journal}: early-drained write on page {page} lost"
+                );
+            }
+            super::ask_once_end();
+        }
+        super::PORT_JOURNAL_IN_TEST.set(false);
+
+        super::title_memory_freed(at, PAGES * PAGE);
+        // SAFETY: reservation allocated above.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 }

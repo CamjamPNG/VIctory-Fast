@@ -4297,12 +4297,14 @@ impl HostHeap {
                         }
                         self.quick_is(index, 0);
                         let has_twin = (index as usize) < self.twins.len();
+                        let mut reserved_s0 = None;
                         let made = if later {
                             None
                         } else {
                             let s0 = stage.slot(stage_used);
                             let s1 = stage.slot(stage_used + 1);
                             stage_used += 2;
+                            reserved_s0 = Some(s0);
                             make_twinned_with_copy(&view, s0, has_twin.then_some(s1)).map(|(kept, sc)| (kept, sc, s0, s1))
                         };
                         match made {
@@ -4324,8 +4326,11 @@ impl HostHeap {
                                 {
                                     // Queued from cached null heap.
                                 } else {
-                                    let s0 = stage.slot(stage_used);
-                                    stage_used += 1;
+                                    let s0 = reserved_s0.unwrap_or_else(|| {
+                                        let s = stage.slot(stage_used);
+                                        stage_used += 1;
+                                        s
+                                    });
                                     null_for(&view, s0);
                                     self.queue_copy_from(index, s0, &mut copy_batch);
                                 }

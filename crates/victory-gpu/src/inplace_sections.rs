@@ -170,7 +170,7 @@ pub(crate) fn place_section(device: &ID3D12Device, start: u64, len: u64) -> Resu
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
     STATS[2].fetch_add(1, Ordering::Relaxed);
     STATS[3].fetch_add(len, Ordering::Relaxed);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, view: None, gpu, bias: start - at, pinned: 0 })
 }
 
 /// High-level entry point for [`crate::inplace::place_for`] and [`crate::port::place_for`]:
@@ -224,6 +224,27 @@ pub(crate) fn private_committed_subrange(at: usize, len: usize) -> bool {
         cursor = next;
     }
     true
+}
+
+/// Chooses the cached private region `(base, len)` covering 64 KiB-aligned
+/// `[at, end)`. Expands to a `chunk_bytes`-aligned chunk when the entire chunk
+/// is one committed `MEM_PRIVATE` `PAGE_READWRITE` sub-range of the same
+/// `AllocationBase`; otherwise falls back to exact `[at, end)`.
+pub(crate) fn private_chunk_bounds(at: usize, end: usize, chunk_bytes: usize) -> Option<(usize, usize)> {
+    let len = end.checked_sub(at)?;
+    if len == 0 || !private_committed_subrange(at, len) {
+        return None;
+    }
+    if chunk_bytes.is_power_of_two() && chunk_bytes >= K64 as usize && len < chunk_bytes {
+        let chunk_start = at & !(chunk_bytes - 1);
+        if let Some(chunk_end) = end.checked_next_multiple_of(chunk_bytes)
+            && chunk_end - chunk_start == chunk_bytes
+            && private_committed_subrange(chunk_start, chunk_bytes)
+        {
+            return Some((chunk_start, chunk_bytes));
+        }
+    }
+    Some((at, len))
 }
 
 /// Atomically reserves `bytes` from a working-set budget `limit` tracked in
@@ -325,6 +346,40 @@ mod tests {
             assert_ne!(mem::VirtualProtect(base.add(7 * K).cast(), K, mem::PAGE_READONLY, &mut old), 0);
             assert!(!private_committed_subrange(base.add(7 * K) as usize, 3 * K), "read-only rejected");
             assert!(private_committed_subrange(base.add(8 * K) as usize, 2 * K), "remaining rw accepted");
+
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn private_chunk_bounds_respects_partial_commit_and_allocation_boundaries() {
+        // SAFETY: test-owned VirtualAlloc allocation, released at end.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 16 * K, mem::MEM_RESERVE, mem::PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(private_chunk_bounds(base as usize, base as usize + K, 4 * K), None);
+
+            // Commit [4..12) (8 pages). With a 4-page chunk, an aligned 4-page chunk inside
+            // [4..12) may expand to 4 pages, while a partial-commit edge falls back to exact.
+            assert!(!mem::VirtualAlloc(base.add(4 * K).cast(), 8 * K, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+
+            let aligned_at = ((base as usize + 4 * K).next_multiple_of(4 * K)).min(base as usize + 8 * K);
+            if aligned_at + 4 * K <= base as usize + 12 * K {
+                assert_eq!(
+                    private_chunk_bounds(aligned_at + K, aligned_at + 2 * K, 4 * K),
+                    Some((aligned_at, 4 * K)),
+                    "fully committed aligned chunk expands cleanly"
+                );
+            }
+            // Decommit page 10: a request on [8..10) can no longer expand across page 10.
+            assert_ne!(mem::VirtualFree(base.add(10 * K).cast(), K, mem::MEM_DECOMMIT), 0);
+            let sub = private_chunk_bounds(base.add(8 * K) as usize, base.add(10 * K) as usize, 4 * K)
+                .expect("committed subrange falls back to exact bounds");
+            assert!(sub.0 >= base.add(4 * K) as usize && sub.0 + sub.1 <= base.add(10 * K) as usize);
+            assert!(sub.0 <= base.add(8 * K) as usize && sub.0 + sub.1 >= base.add(10 * K) as usize);
+
+            // Request overlapping the decommitted page 10 is rejected.
+            assert_eq!(private_chunk_bounds(base.add(9 * K) as usize, base.add(11 * K) as usize, 4 * K), None);
 
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }

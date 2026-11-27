@@ -53,9 +53,8 @@ pub(crate) enum Role {
     Air,
     /// Ends the title's reflections (`CS_UpdateHistory`).
     Reflect,
-    /// Forward/transparent/alpha reflection & transmission passes
-    /// (`CS_UpscaleAlpha`, `CS_TemporalResolveAlpha`, `CS_TemporalResolve1_Alpha`,
-    /// `CS_AlphaTransmissionHistoryResolve`, `CS_DeferredFallbacksAlpha_SkyProbe`).
+    /// Forward/transparent/alpha reflection passes
+    /// (`CS_UpscaleAlpha`, `CS_TemporalResolveAlpha`, `CS_TemporalResolve1_Alpha`).
     ReflectAlpha,
 }
 
@@ -70,14 +69,27 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Air)
     } else if has(b"CS_UpdateHistory") {
         Some(Role::Reflect)
-    } else if has(b"CS_UpscaleAlpha")
-        || has(b"CS_TemporalResolveAlpha")
-        || has(b"CS_TemporalResolve1_Alpha")
-        || has(b"CS_AlphaTransmissionHistoryResolve")
-        || has(b"CS_DeferredFallbacksAlpha_SkyProbe")
-    {
+    } else if has(b"CS_UpscaleAlpha") {
+        #[cfg(feature = "diagnostics")]
+        tracing::info!("ambient role=ReflectAlpha matched CS_UpscaleAlpha");
+        Some(Role::ReflectAlpha)
+    } else if has(b"CS_TemporalResolveAlpha") {
+        #[cfg(feature = "diagnostics")]
+        tracing::info!("ambient role=ReflectAlpha matched CS_TemporalResolveAlpha");
+        Some(Role::ReflectAlpha)
+    } else if has(b"CS_TemporalResolve1_Alpha") {
+        #[cfg(feature = "diagnostics")]
+        tracing::info!("ambient role=ReflectAlpha matched CS_TemporalResolve1_Alpha");
         Some(Role::ReflectAlpha)
     } else {
+        #[cfg(feature = "diagnostics")]
+        {
+            if has(b"CS_AlphaTransmissionHistoryResolve") {
+                tracing::info!("ambient skipped transmission shader CS_AlphaTransmissionHistoryResolve");
+            } else if has(b"CS_DeferredFallbacksAlpha_SkyProbe") {
+                tracing::info!("ambient skipped skyprobe shader CS_DeferredFallbacksAlpha_SkyProbe");
+            }
+        }
         None
     }
 }
@@ -190,6 +202,13 @@ fn parse_reflect(set: &str) -> f32 {
 fn reflect_cap() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| parse_reflect(&std::env::var("VICTORY_AMBIENT_REFLECT").unwrap_or_default()))
+}
+
+/// Opt-in forward/alpha reflection clamping (`VICTORY_AMBIENT_REFLECT_ALPHA=1`;
+/// default off until verified not to darken opaque surfaces or glass transmission).
+pub(crate) fn reflect_alpha_on() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_REFLECT_ALPHA").is_some_and(|v| v == "1"))
 }
 
 /// How the slow mean of the light around follows the frames
@@ -461,16 +480,15 @@ void hold_reflect(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef REFLECT_F
-RWTexture2D<float4> light_f : register(u0, space0);
+RWTexture2D<float3> light_f : register(u0);
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void hold_reflect_f(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     int2 p = int2(at.xy);
-    float4 raw = light_f[p];
-    float3 c = raw.rgb;
-    if (any(isnan(c)) || any(isinf(c))) { light_f[p] = float4(0, 0, 0, raw.a); return; }
-    if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) { light_f[p] = float4(0, 0, 0, raw.a); return; }
+    float3 c = light_f[p];
+    if (any(isnan(c)) || any(isinf(c))) { light_f[p] = float3(0, 0, 0); return; }
+    if (c.g < 0.5 * min(c.r, c.b) && max(c.r, c.b) > 0.02) { light_f[p] = float3(0, 0, 0); return; }
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
     float3 local = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
@@ -489,7 +507,7 @@ void hold_reflect_f(uint3 at : SV_DispatchThreadID) {
         float3 clamped = c * (cap / has);
         float excess = saturate((has / cap - 1.0) / 3.0);
         float3 room_tint = around * (cap / around_luma);
-        light_f[p] = float4(lerp(clamped, room_tint, 0.65 * excess), raw.a);
+        light_f[p] = lerp(clamped, room_tint, 0.65 * excess);
     }
 }
 #endif
@@ -686,6 +704,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         return false;
     }
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+        return false;
+    }
+    if role == Role::ReflectAlpha && !reflect_alpha_on() {
         return false;
     }
     if matches!(role, Role::Reflect | Role::ReflectAlpha) && (reflect_cap() <= 0.0 || (rays_run() && rt_band().is_none())) {

@@ -3887,6 +3887,9 @@ impl State {
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
         if role == Role::ReflectAlpha {
+            if !crate::ambient::reflect_alpha_on() {
+                return false;
+            }
             let mut ran = false;
             let mut seen_slots = [0u64; 8];
             let mut seen_len = 0usize;
@@ -3909,11 +3912,11 @@ impl State {
                     continue;
                 }
                 let fmt = of.Format.0;
-                if !matches!(fmt, 42 | 26 | 10) {
-                    once!(key, format = fmt, w = of.Width, h = of.Height, "alpha reflection UAV format skipped");
+                if !matches!(fmt, 42 | 26) {
+                    once!(key, pipeline = p.name, format = fmt, w = of.Width, h = of.Height, "alpha reflection UAV format skipped");
                     continue;
                 }
-                once!(key, slot = u.slot, off = u.table_offset_dwords, format = fmt, w = of.Width, h = of.Height, "clamping forward/alpha reflection UAV");
+                once!(key, pipeline = p.name, slot = u.slot, off = u.table_offset_dwords, format = fmt, w = of.Width, h = of.Height, "clamping forward/alpha reflection UAV");
                 ran |= crate::ambient::after(
                     list,
                     role,
@@ -3922,7 +3925,7 @@ impl State {
                         depth: image,
                         size: [of.Width as u32, of.Height],
                         slices: u32::from(of.DepthOrArraySize),
-                        float_uav: fmt != 42,
+                        float_uav: fmt == 26,
                     },
                 );
             }

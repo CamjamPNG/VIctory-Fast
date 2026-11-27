@@ -497,20 +497,16 @@ fn packed_add_selects_halves_of_inline_constants() {
     }
 }
 
-/// The float `v_cvt_f32_f64` gives for `x`: Rust's rounding (to nearest
-/// even), with results below the smallest normal float flushed to signed
-/// zero as the console's default float mode does.
-fn cvt_f32_f64_reference(x: f64) -> u32 {
-    let r = x as f32;
-    if r.is_subnormal() || (r == 0.0 && x != 0.0) {
-        r.to_bits() & 0x8000_0000
-    } else {
-        r.to_bits()
-    }
-}
-
+/// Rounding and the subnormal range of `v_cvt_f32_f64`: the console's float
+/// mode keeps f32 denormals (measured on RDNA2 with `ds_min_f32`, whose
+/// denormal operands order as floats rather than as zero), and the
+/// instruction honours that mode (unlike `v_rcp_f32`, `v_exp_f32`,
+/// `v_log_f32`, `v_sqrt_f32` and `v_mad_f32`, which flush regardless of
+/// it). An RTX 1660 SUPER returned the exact subnormal 0x000116c2 for
+/// `cvt(1e-40)`, which is what the IEEE lowering emits and what
+/// [`v_cvt_f32_f64_matches_ieee754`] asserts; the flush-to-zero reading of
+/// this test was a guess that both measurements contradict.
 #[test]
-#[ignore = "expects results below the smallest normal float flushed to zero; the IEEE lowering (v_cvt_f32_f64_matches_ieee754) is kept until the console's mode is checked"]
 fn v_cvt_f32_f64_rounds_to_nearest_even() {
     // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x0f)
     let shader = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
@@ -531,7 +527,7 @@ fn v_cvt_f32_f64_rounds_to_nearest_even() {
         f64::from(f32::MAX) * 1.000_000_1, // rounds to infinity
         1.0e300,
         -1.0e300,
-        1.0e-40, // a float denormal: flushed
+        1.0e-40, // a float denormal: kept
         -1.0e-300,
         f64::from(f32::MIN_POSITIVE),
         f64::INFINITY,
@@ -551,7 +547,7 @@ fn v_cvt_f32_f64_rounds_to_nearest_even() {
             assert!(f32::from_bits(got).is_nan(), "{backend}: cvt({x}) = {got:#010x}, want NaN");
             return;
         }
-        let want = cvt_f32_f64_reference(x);
+        let want = (x as f32).to_bits();
         assert_eq!(got, want, "{backend}: cvt({x:e}) = {got:#010x}, want {want:#010x}");
     });
 }

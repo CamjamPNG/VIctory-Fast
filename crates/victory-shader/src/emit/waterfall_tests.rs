@@ -133,12 +133,23 @@ pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec
             assert_eq!(u.root, RootType::Table, "{u:?}");
             ud[u.index as usize] = 0;
         }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        // The host binds its slot table on every submission; a shader that
+        // reads a view's record count or element size reads it by
+        // (`SLOT_STRIDES` / `SLOT_TABLE_STRIDES`), and without it reads an
+        // unbound root SRV.
+        for slot in [super::shader::SLOT_TABLE_STRIDES, super::shader::SLOT_STRIDES] {
+            if let Some(param) = shader.root_view_parameter(slot, 1) {
+                let table = super::host::slot_table(views);
+                roots.push((param, Root::View { srv: true, data: table }));
+            }
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],

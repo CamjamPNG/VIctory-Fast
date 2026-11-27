@@ -1190,14 +1190,14 @@ fn join(ranges: &mut Vec<(u64, u64)>) {
 
 /// Frames for which a slot a draw read through a table counts as a table's
 /// slot ([`HostHeap::tabled`]).
-const TABLED_FRAMES: u64 = 240;
+const TABLED_FRAMES: u64 = 120;
 
 /// Frames a write of a table's slot waits in the queue for the draw that
 /// reads it, before the slot is taken for one shaders pick by index.
 /// Frames as `crate::frame::current` counts them: in its opening cutscene
 /// The title begins two or three of them per frame it presents
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
-const TABLED_GRACE: u64 = 8;
+const TABLED_GRACE: u64 = 4;
 
 /// Frames for which a record copied into a slot a draw read through a
 /// table is left to such a draw ([`HostHeap::copied_tabled`]).
@@ -1266,6 +1266,11 @@ pub(crate) struct TextureQueue {
 }
 
 impl TextureQueue {
+    /// Maximum already-uploaded `RECHECK_FRAMES` slots handed out per `due()`
+    /// call so burst rechecks never preempt fresh uploads or trigger false
+    /// catch-up passes.
+    const RECHECK_CAP: usize = 256;
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -1283,38 +1288,61 @@ impl TextureQueue {
         self.slots.remove(&index);
     }
 
-    /// Up to `max` slots due at `frame`, each with its write number, in
-    /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
-    ///   25,000-40,000 while the textures of the shot on screen waited
-    ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    /// Up to `max` slots due at `frame`, each with its write number, in three
+    /// priority tiers:
+    /// 1. partial uploads (newest write first) and fresh / mip-upgrade writes
+    ///    (newest and oldest alternating to avoid starving either end of a
+    ///    scene-load backlog);
+    /// 2. unmapped-memory retries (`looks > 0`, never uploaded), newest first;
+    /// 3. already-uploaded `RECHECK_FRAMES` zombies (`checked.2 != 0`), oldest
+    ///    due first and capped at [`Self::RECHECK_CAP`].
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        let mut partial: Vec<(u32, u64)> = Vec::new();
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
+        let mut unmapped: Vec<(u32, u64)> = Vec::new();
+        let mut recheck: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            if w.checked.2 != 0 {
+                recheck.push((w.due, index, w.write));
+            } else if w.mapped > 0 {
+                partial.push((index, w.write));
+            } else if w.looks == 0 {
+                fresh.push((index, w.write));
+            } else {
+                unmapped.push((index, w.write));
+            }
         }
-        // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        partial.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        unmapped.sort_unstable_by(newest_first);
+        // Most overdue rechecks first so every uploaded slot rotates under the cap.
+        recheck.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+
+        let mut order: Vec<(u32, u64)> = Vec::with_capacity(
+            (partial.len() + fresh.len() + unmapped.len() + recheck.len().min(Self::RECHECK_CAP)).min(max),
+        );
+        // Tier 1: partial uploads, then fresh / mip-upgrade writes (newest/oldest interleaved).
+        order.extend(partial.into_iter().take(max));
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+            order.push(fresh[new]);
             new += 1;
             if new < old && order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                order.push(fresh[old]);
             }
         }
-        order.truncate(max);
+        // Tier 2: unmapped-memory retries.
+        if order.len() < max {
+            let rem = max - order.len();
+            order.extend(unmapped.into_iter().take(rem));
+        }
+        // Tier 3: capped recheck zombies.
+        if order.len() < max {
+            let rem = (max - order.len()).min(Self::RECHECK_CAP);
+            order.extend(recheck.into_iter().take(rem).map(|(_, index, write)| (index, write)));
+        }
         order
     }
 
@@ -1336,6 +1364,7 @@ impl TextureQueue {
         if let Some(w) = self.same(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
+            w.checked = (0, 0, 0, 0, 0);
         }
     }
 
@@ -1385,7 +1414,7 @@ impl TextureQueue {
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
         if let Some(w) = self.same(index, write) {
-            (w.due, w.looks, w.mapped) = (due, 1, 0);
+            (w.due, w.looks, w.mapped) = (due, 0, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
     }
@@ -1414,19 +1443,22 @@ impl TextureQueue {
     }
 
     /// For the frame line: slots in the queue; of them due at `frame`;
-    /// waiting for their memory (looked at, never uploaded); uploaded in
-    /// part; and the frames the oldest due one has waited since its write.
+    /// waiting for their memory (looked at, never uploaded; excludes
+    /// already-uploaded rechecks); uploaded in part; and the frames the
+    /// oldest due non-recheck slot has waited since its write.
     fn census(&self, frame: u64) -> [u64; 5] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
         for w in self.slots.values() {
             if w.mapped > 0 {
                 c[3] += 1;
-            } else if w.looks > 0 {
+            } else if w.looks > 0 && w.checked.2 == 0 {
                 c[2] += 1;
             }
             if w.due <= frame {
                 c[1] += 1;
-                c[4] = c[4].max(frame.saturating_sub(w.written));
+                if w.checked.2 == 0 {
+                    c[4] = c[4].max(frame.saturating_sub(w.written));
+                }
             }
         }
         c
@@ -2561,7 +2593,7 @@ impl HostHeap {
     /// away `AWAY_MS` after it was first found away
     /// (`VICTORY_TEXTURE_AWAY_MS`; 0: at once, as before).
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        const AWAY_MS: u64 = 3000;
+        const AWAY_MS: u64 = 1000;
         static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let wait = *WAIT.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AWAY_MS)
@@ -3030,22 +3062,25 @@ impl HostHeap {
 
     /// The queue's part of a write of title slot `index` in `frame`:
     /// `texture`, whether it now holds a view of a texture the title may
-    /// fill; `seen` as for [`HostHeap::note_buffer`].
-    fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+    /// fill; `seen` as for [`HostHeap::note_buffer`]; `same_texture`, whether
+    /// the write is a `Kin::Same` mip upgrade of the texture already shown
+    /// (zero table grace so resolution upgrades aren't delayed).
+    fn queue_texture(&self, index: u32, texture: bool, seen: bool, same_texture: bool, frame: u64) {
         if PUBLISHING.get() {
             return;
         }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
-        // texture, so its write waits for that draw.
+        // texture, so its write waits for that draw (except `Kin::Same` mip
+        // upgrades of an existing texture, which need zero grace).
         let lately = stamp != 0 && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES;
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
         if texture && !read_now {
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            let due = if lately && !seen {
+            let due = if lately && !seen && !same_texture {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame + TABLED_GRACE
             } else {
@@ -3102,10 +3137,17 @@ impl HostHeap {
     /// caller's to make null when it has let go of its own slot's lock
     /// ([`HostHeap::unmake_stale`]).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<(u32, u64)> {
-        self.note_buffer_inner(index, view, seen, true)
+        self.note_buffer_inner(index, view, seen, true, false)
     }
 
-    fn note_buffer_inner(&self, index: u32, view: Option<&View>, seen: bool, record_change: bool) -> Vec<(u32, u64)> {
+    fn note_buffer_inner(
+        &self,
+        index: u32,
+        view: Option<&View>,
+        seen: bool,
+        record_change: bool,
+        same_texture: bool,
+    ) -> Vec<(u32, u64)> {
         if self.sampler {
             return Vec::new();
         }
@@ -3129,7 +3171,7 @@ impl HostHeap {
             }
             _ => false,
         };
-        self.queue_texture(index, texture, seen, crate::frame::current());
+        self.queue_texture(index, texture, seen, same_texture, crate::frame::current());
         // The memory a placed texture view describes. Not for a slot
         // tables read (thousands of writes a frame, each read by its
         // draw): no pass looks at it, and the same texture's view in a
@@ -4248,10 +4290,10 @@ impl HostHeap {
                             }
                             self.write_stride(index, 0, 0);
                             self.clear_twin_batched(index, &mut copy_batch);
-                            let _ = self.note_buffer_inner(index, None, false, record_change);
+                            let _ = self.note_buffer_inner(index, None, false, record_change, false);
                             publish.push((index, 0, None, true));
                         } else if for_draw {
-                            let _ = self.note_buffer_inner(index, None, false, record_change);
+                            let _ = self.note_buffer_inner(index, None, false, record_change, false);
                         }
                         continue;
                     };
@@ -4259,22 +4301,31 @@ impl HostHeap {
                     let mut direct_copy = None;
                     let mut made_now = false;
                     if shown != key {
-                        let stale = self.note_buffer_inner(index, Some(&view), for_draw, record_change);
                         let waiting = if for_draw { None } else { view.waiting_texture() };
                         if let Some(texture) = waiting {
                             super::wait_for(texture, handle);
                         }
                         let later = !for_draw && (view.is_buffer() || waiting.is_some());
+                        let placed_tex = matches!(view, View::Placed(false, r, _) if r[0] != 1);
+                        let old = if shown != 0 && !for_draw && (placed_tex || (later && keep_views())) {
+                            view_at(shown as u32, (shown >> 32) as u32)
+                        } else {
+                            None
+                        };
+                        let old_kin = old.as_ref().map(|old| kin(old, &view));
+                        let stale = self.note_buffer_inner(
+                            index,
+                            Some(&view),
+                            for_draw,
+                            record_change,
+                            old_kin == Some(Kin::Same),
+                        );
                         let mut kept_old = false;
-                        if later
-                            && keep_views()
-                            && let Some(old) = view_at(shown as u32, (shown >> 32) as u32)
-                        {
-                            let k = kin(&old, &view);
+                        if later && keep_views() && let (Some(old), Some(k)) = (old.as_ref(), old_kin) {
                             if k == Kin::Same {
                                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 kept_old = true;
-                            } else if is_texture_view(&old) {
+                            } else if is_texture_view(old) {
                                 let kept = crate::resource::room_lately() && k.kept(keep_shown());
                                 rewritten(k, kept);
                                 if kept {
@@ -4403,19 +4454,14 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 self.make_null(index);
-                let _ = self.note_buffer_inner(index, None, false, record_change);
+                let _ = self.note_buffer_inner(index, None, false, record_change, false);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer_inner(index, None, false, record_change);
+                let _ = self.note_buffer_inner(index, None, false, record_change, false);
             }
             return None;
         };
         if shown != key {
-            // Views of other textures in the memory this one describes
-            // are stale: their host slots read nothing from here on, and
-            // let go of the host copies they held.
-            // (When this slot's lock is let go: a lock at a time.)
-            let stale = self.note_buffer_inner(index, Some(&view), for_draw, record_change);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -4425,6 +4471,24 @@ impl HostHeap {
                 super::wait_for(texture, handle);
             }
             let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            let placed_tex = matches!(view, View::Placed(false, r, _) if r[0] != 1);
+            let old = if shown != 0 && !for_draw && (placed_tex || (later && keep_views())) {
+                view_at(shown as u32, (shown >> 32) as u32)
+            } else {
+                None
+            };
+            let old_kin = old.as_ref().map(|old| kin(old, &view));
+            // Views of other textures in the memory this one describes
+            // are stale: their host slots read nothing from here on, and
+            // let go of the host copies they held.
+            // (When this slot's lock is let go: a lock at a time.)
+            let stale = self.note_buffer_inner(
+                index,
+                Some(&view),
+                for_draw,
+                record_change,
+                old_kin == Some(Kin::Same),
+            );
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -4432,11 +4496,7 @@ impl HostHeap {
             // one and uploads what it shows. Made null here, the texture
             // read as nothing for as long as it waited in the queue, every
             // time it got sharper.
-            if later
-                && keep_views()
-                && let Some(old) = view_at(shown as u32, (shown >> 32) as u32)
-            {
-                let kin = kin(&old, &view);
+            if later && keep_views() && let (Some(old), Some(kin)) = (old.as_ref(), old_kin) {
                 if kin == Kin::Same {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     drop(held);
@@ -4446,7 +4506,7 @@ impl HostHeap {
                 // And of another texture that can stand for it
                 // ([`keep_shown`]): black, then grey for a frame or two is
                 // what popped.
-                if is_texture_view(&old) {
+                if is_texture_view(old) {
                     let kept = crate::resource::room_lately() && kin.kept(keep_shown());
                     rewritten(kin, kept);
                     if kept {
@@ -7011,9 +7071,9 @@ mod tests {
         }
     }
 
-    /// The queue of textures picked by index serves the slots looked at
-    /// before first, then the newest write and the oldest in turns; a
-    /// slot whose memory is not there is looked at again after
+    /// The queue of textures picked by index serves partial and fresh/mip-upgrade
+    /// uploads first, unmapped-memory retries second, and capped recheck zombies
+    /// last; a slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
     #[test]
@@ -7037,13 +7097,14 @@ mod tests {
             q.later(17, w17, frame, 4);
             assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
             frame += wait;
-            // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            // Due again in Tier 2, after fresh Tier 1 slots (never preempting fresh uploads).
+            let due = q.due(frame, 100);
+            assert_eq!(due.last().unwrap().0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
         assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
-        // Uploaded with part of its memory there: kept, with what was there.
+        // Uploaded with part of its memory there: kept in Tier 1 ahead of fresh.
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
@@ -7067,6 +7128,61 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    #[test]
+    fn texture_queue_tiers_cap_rechecks_and_keep_census_accurate() {
+        let mut q = TextureQueue::default();
+        // Tier 1 partial, Tier 1 fresh, Tier 2 unmapped retry, Tier 3 rechecks.
+        q.written(1, 10, 0, false);
+        let w1 = q.due(10, 10)[0].1;
+        q.partly(1, w1, 20, 4096);
+
+        q.written(2, 12, 0, false); // fresh
+        q.written(3, 14, 0, false); // fresh
+
+        q.written(4, 11, 0, false);
+        let w4 = q.due(11, 10).iter().find(|d| d.0 == 4).unwrap().1;
+        q.later(4, w4, 19, 4); // due at 20, unmapped retry (Tier 2)
+
+        // 300 already-uploaded recheck zombies due across frames 15..20.
+        for i in 0..300u32 {
+            let slot = 100 + i;
+            q.written(slot, 1, 0, false);
+            let w = q.slots[&slot].write;
+            let due_at = 15 + u64::from(i % 6);
+            q.recheck(slot, w, due_at, (0x1000 + u64::from(i) * 0x100, 4096), 0xdead_beef | 1, 0, 1);
+        }
+
+        // Census must NOT count recheck zombies as "waiting for their memory" (c[2])
+        // nor let their old write frame inflate oldest non-recheck age (c[4]).
+        let c = q.census(20);
+        assert_eq!(c[0], 304); // total slots
+        assert_eq!(c[1], 304); // all due at frame 20
+        assert_eq!(c[2], 1, "only unmapped slot 4 waits for memory");
+        assert_eq!(c[3], 1, "only partial slot 1 is uploaded in part");
+        assert_eq!(c[4], 10, "oldest non-recheck slot (1) written at frame 10 -> age 10");
+
+        let due = q.due(20, 4096);
+        // 4 non-recheck slots + RECHECK_CAP (256) capped zombies.
+        assert_eq!(due.len(), 4 + TextureQueue::RECHECK_CAP);
+        // Tier 1 first: partial (1), then fresh (3, 2).
+        assert_eq!(due[0].0, 1);
+        assert_eq!(due[1].0, 3);
+        assert_eq!(due[2].0, 2);
+        // Tier 2 second: unmapped retry (4).
+        assert_eq!(due[3].0, 4);
+        // Tier 3 last: oldest due rechecks (due_at == 15) come before later ones (due_at == 20).
+        let first_recheck_due = q.slots[&due[4].0].due;
+        let last_recheck_due = q.slots[&due.last().unwrap().0].due;
+        assert_eq!(first_recheck_due, 15);
+        assert!(last_recheck_due >= first_recheck_due);
+
+        // If a recheck zombie later turns unmapped (`later()`), it leaves Tier 3 cleanly.
+        let (r_slot, r_write) = due[4];
+        q.later(r_slot, r_write, 20, 4);
+        assert!(q.checked(r_slot).is_none());
+        assert_eq!(q.census(20)[2], 2);
     }
 
     /// Slots held back for lack of room on the card are not handed out
@@ -7397,29 +7513,34 @@ mod tests {
         let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
         let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
         assert!(is_texture_view(&texture));
-        heap.queue_texture(2, true, false, frame);
-        heap.queue_texture(3, true, false, frame);
+        heap.queue_texture(2, true, false, false, frame);
+        heap.queue_texture(3, true, false, false, frame);
         assert_eq!(slots(frame), [3, 2]);
         heap.tabled_in(3, true, frame);
         assert_eq!(slots(frame), [2]);
         // Made in place by the draw that read it: still out.
-        heap.queue_texture(3, true, true, frame);
+        heap.queue_texture(3, true, true, false, frame);
         assert_eq!(slots(frame), [2]);
         // Written again in the next frame: due once the grace frames have
         // passed without a draw that reads it.
-        heap.queue_texture(3, true, false, frame + 1);
+        heap.queue_texture(3, true, false, false, frame + 1);
         assert_eq!(slots(frame + TABLED_GRACE), [2]);
         assert_eq!(slots(frame + 1 + TABLED_GRACE), [3, 2]);
-        // The draw comes after all: out again.
+        // A `Kin::Same` mip upgrade on a recently-tabled slot takes zero grace.
         heap.tabled_in(3, true, frame + 1);
+        assert_eq!(slots(u64::MAX), [2]);
+        heap.queue_texture(3, true, false, true, frame + 2);
+        assert_eq!(slots(frame + 2), [3, 2]);
+        // The draw comes after all: out again.
+        heap.tabled_in(3, true, frame + 2);
         assert_eq!(slots(u64::MAX), [2]);
         // A slot of a table no draw read stays queued; its next write waits.
         heap.tabled_in(2, false, frame + 1);
         assert_eq!(slots(frame + 1), [2]);
-        heap.queue_texture(2, true, false, frame + 2);
+        heap.queue_texture(2, true, false, false, frame + 2);
         assert_eq!(slots(frame + 2), []);
         // Long after the last table, a write is due at once.
-        heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
+        heap.queue_texture(2, true, false, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
     }
 

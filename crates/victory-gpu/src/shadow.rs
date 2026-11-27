@@ -764,6 +764,14 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Pure calculation for [`card_room_kept`]: caps the reservation at `SEEN`
+/// (800 MiB, covering the ~738–762 MiB world-load buffer burst with headroom
+/// without locking ~286 MiB of phantom VRAM once buffers settle).
+fn card_room_kept_for(limit: u64, live: u64, refused: u64) -> u64 {
+    const SEEN: u64 = 800 << 20;
+    limit.min(SEEN).saturating_sub(live.saturating_add(refused))
+}
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -771,13 +779,11 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    // Not more than such copies came to in any session, whatever they may
-    // come to: on a card of 24 GB a quarter of its budget was kept for them,
-    // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
-    // no texture was made any more with 5 GB of the card free (session
-    // play-1125-0127: 1,453 passes refused, the ground and people black).
-    const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_room_kept_for(
+        card_limits().1,
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+    )
 }
 
 /// The copies in the card's memory: `(start, end, weak)` so overlap checks
@@ -7783,6 +7789,17 @@ mod window_tests {
             assert_eq!(copied.1[1], (a.0, a.1, 30));
         }
         assert_eq!(&held[..], &raw[align..align + len]);
+    }
+
+    #[test]
+    fn card_room_kept_trims_phantom_headroom() {
+        const MIB: u64 = 1 << 20;
+        // Respects smaller card-buffer caps (e.g. 512 MiB on <=12 GB GPUs).
+        assert_eq!(super::card_room_kept_for(512 * MIB, 100 * MIB, 0), 412 * MIB);
+        // Covers the ~738-762 MiB burst on 16+ GB GPUs without locking 286 MiB phantom.
+        assert_eq!(super::card_room_kept_for(2048 * MIB, 0, 0), 800 * MIB);
+        assert_eq!(super::card_room_kept_for(2048 * MIB, 738 * MIB, 0), 62 * MIB);
+        assert_eq!(super::card_room_kept_for(2048 * MIB, 738 * MIB, 100 * MIB), 0);
     }
 }
 

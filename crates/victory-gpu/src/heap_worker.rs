@@ -30,12 +30,13 @@
 // than when the recording thread did it all; with a backlog it is earlier,
 // since the pass has the whole frame instead of a slice of it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use crate::descriptor::Heap;
 use crate::host::HostList;
 use crate::object::This;
+use crate::texture::Staging;
 
 /// Whether the pass runs on its own thread now.
 pub(crate) fn on() -> bool {
@@ -50,9 +51,219 @@ pub(crate) fn on() -> bool {
 pub(crate) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// One upload list holds at most this much texture memory, or this many
-/// milliseconds of work, so that its textures show soon.
-const LIST_BYTES: u64 = 48 << 20;
-const LIST_MS: u128 = 40;
+/// milliseconds of work, so newly streamed mips flush promptly on scene cuts
+/// without fragmenting into single-texture command lists.
+const LIST_BYTES: u64 = 16 << 20;
+const LIST_MS: u128 = 12;
+
+/// Minimum textures in a flushed batch to fan out CPU detiling across the
+/// dedicated background detile pool.
+const PARALLEL_DETILE_MIN: usize = 8;
+
+#[inline]
+fn should_flush(bytes: u64, elapsed_ms: u128) -> bool {
+    bytes >= LIST_BYTES || elapsed_ms >= LIST_MS
+}
+
+/// Bounded helper thread count for background CPU detiling (`victory-detile-*`),
+/// sized to avoid oversubscribing the CPU or contending with `victory-submit`.
+fn detile_helper_count(logical_cpus: usize) -> usize {
+    if logical_cpus <= 2 {
+        0
+    } else {
+        (logical_cpus / 4).clamp(1, 3)
+    }
+}
+
+struct DetileWork {
+    work: *const (dyn Fn(usize) + Sync),
+    count: usize,
+    next: AtomicUsize,
+    running: AtomicUsize,
+    panicked: AtomicBool,
+}
+
+// SAFETY: `work` is `Sync`, and `DetilePool::run` removes the slot and waits
+// until `running == 0` before the caller's stack frame returns.
+unsafe impl Send for DetileWork {}
+unsafe impl Sync for DetileWork {}
+
+struct DetileState {
+    active: Vec<*const DetileWork>,
+}
+
+// SAFETY: raw pointers in `active` are only dereferenced while `running`
+// pins their owning stack frame.
+unsafe impl Send for DetileState {}
+
+/// Persistent low-priority helper pool for burst CPU texture detiling so
+/// `heap_worker` never spawns threads per burst and never steals workers from
+/// `victory-submit`'s `WidePool`.
+struct DetilePool {
+    state: Mutex<DetileState>,
+    more: Condvar,
+    idle: Condvar,
+    helpers: usize,
+}
+
+impl DetilePool {
+    fn new(helpers: usize) -> &'static DetilePool {
+        let pool: &'static DetilePool = Box::leak(Box::new(DetilePool {
+            state: Mutex::new(DetileState { active: Vec::with_capacity(2) }),
+            more: Condvar::new(),
+            idle: Condvar::new(),
+            helpers,
+        }));
+        for i in 0..helpers {
+            let _ = std::thread::Builder::new()
+                .name(format!("victory-detile-{i}"))
+                .spawn(move || {
+                    // Below-normal priority so background detiling never preempts
+                    // `victory-submit`, `victory-wide-*`, or title threads.
+                    use windows_sys::Win32::System::Threading::{
+                        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+                    };
+                    // SAFETY: sets priority of this helper thread only.
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+                    pool.help();
+                });
+        }
+        pool
+    }
+
+    fn help(&self) {
+        loop {
+            let slot_ptr = {
+                let mut state = lock(&self.state);
+                loop {
+                    let found = state.active.iter().rev().copied().find(|&ptr| {
+                        // SAFETY: `ptr` remains live while listed in `state.active`.
+                        unsafe { (*ptr).next.load(Relaxed) < (*ptr).count }
+                    });
+                    if let Some(ptr) = found {
+                        // SAFETY: incrementing `running` under `state` pins `ptr` after removal.
+                        unsafe { (*ptr).running.fetch_add(1, std::sync::atomic::Ordering::AcqRel) };
+                        break ptr;
+                    }
+                    state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // SAFETY: pinned by `running` increment above.
+                let slot = unsafe { &*slot_ptr };
+                loop {
+                    let i = slot.next.fetch_add(1, Relaxed);
+                    if i >= slot.count {
+                        break;
+                    }
+                    // SAFETY: `work` is valid until `running` drops to 0.
+                    unsafe { (*slot.work)(i) };
+                }
+            }));
+            if ran.is_err() {
+                // SAFETY: still pinned by `running`.
+                unsafe { (*slot_ptr).panicked.store(true, std::sync::atomic::Ordering::Release) };
+            }
+            // SAFETY: last dereference of `slot_ptr` before releasing the pin.
+            let was = unsafe { (*slot_ptr).running.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) };
+            if was == 1 {
+                let _state = lock(&self.state);
+                self.idle.notify_all();
+            }
+        }
+    }
+
+    fn run(&self, n: usize, work: &(dyn Fn(usize) + Sync)) {
+        if n == 0 {
+            return;
+        }
+        if n == 1 || self.helpers == 0 {
+            for i in 0..n {
+                work(i);
+            }
+            return;
+        }
+        // SAFETY: lifetime erased only for this stack frame; `run` removes
+        // `slot_ptr` from `state.active` and waits until `running == 0` before returning.
+        let work_ptr = unsafe {
+            std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(work)
+        };
+        let slot = DetileWork {
+            work: work_ptr,
+            count: n,
+            next: AtomicUsize::new(0),
+            running: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
+        };
+        let slot_ptr: *const DetileWork = &slot;
+        {
+            let mut state = lock(&self.state);
+            state.active.push(slot_ptr);
+        }
+        if n > self.helpers {
+            self.more.notify_all();
+        } else {
+            (1..n).for_each(|_| self.more.notify_one());
+        }
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                let i = slot.next.fetch_add(1, Relaxed);
+                if i >= n {
+                    break;
+                }
+                work(i);
+            }
+        }));
+        {
+            let mut state = lock(&self.state);
+            if let Some(pos) = state.active.iter().rposition(|&p| p == slot_ptr) {
+                state.active.remove(pos);
+            }
+            while slot.running.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        if let Err(panic) = ran {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(!slot.panicked.load(std::sync::atomic::Ordering::Acquire), "a detile worker panicked");
+    }
+}
+
+fn detile_pool() -> &'static DetilePool {
+    static POOL: OnceLock<&'static DetilePool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        DetilePool::new(detile_helper_count(cpus))
+    })
+}
+
+/// Runs `refresh_one` across `items`, fanning out to `detile_pool()` when
+/// `items.len() >= min_parallel`, and returning how many items were left
+/// unrefreshed (returned `false` or skipped after `should_stop()` signaled).
+fn refresh_batch_with<T: Sync>(
+    items: &[T],
+    min_parallel: usize,
+    should_stop: &(dyn Fn() -> bool + Sync),
+    refresh_one: &(dyn Fn(&T) -> bool + Sync),
+) -> u64 {
+    if items.len() < min_parallel {
+        let mut left = 0u64;
+        for item in items {
+            if should_stop() || !refresh_one(item) {
+                left += 1;
+            }
+        }
+        return left;
+    }
+    let left = AtomicU64::new(0);
+    detile_pool().run(items.len(), &|i| {
+        if should_stop() || !refresh_one(&items[i]) {
+            left.fetch_add(1, Relaxed);
+        }
+    });
+    left.load(Relaxed)
+}
 
 /// A view to give a host slot once its texture's upload is in the queue:
 /// the title's heap, the slot, the record's handle, and the record's key as
@@ -110,6 +321,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct Batch {
     heap: This,
     list: Option<HostList>,
+    staging: Vec<Arc<Staging>>,
     publish: Vec<Publish>,
     bytes: u64,
     began: std::time::Instant,
@@ -120,6 +332,7 @@ impl Batch {
         Batch {
             heap: std::ptr::from_ref(heap).cast(),
             list: None,
+            staging: Vec::new(),
             publish: Vec::new(),
             bytes: 0,
             began: std::time::Instant::now(),
@@ -127,12 +340,27 @@ impl Batch {
     }
 
     /// The open upload list.
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn list(&mut self) -> Option<&HostList> {
         if self.list.is_none() {
             self.list = crate::list::fresh_list();
             self.began = std::time::Instant::now();
         }
         self.list.as_ref()
+    }
+
+    /// Records a texture upload onto the open upload list while capturing any
+    /// deferred [`Staging`] handles for parallel burst detiling on flush.
+    pub(crate) fn record(&mut self, f: impl FnOnce(&HostList)) -> bool {
+        if self.list.is_none() {
+            self.list = crate::list::fresh_list();
+            self.began = std::time::Instant::now();
+        }
+        let Some(list) = self.list.as_ref() else {
+            return false;
+        };
+        crate::texture::capture_deferred_staging(&mut self.staging, || f(list));
+        true
     }
 
     /// Slot `index` (its record at `handle`, then with `key`) shows its
@@ -145,7 +373,7 @@ impl Batch {
     /// and handed over when it holds enough.
     pub(crate) fn uploaded(&mut self, bytes: u64) {
         self.bytes += bytes;
-        if self.bytes >= LIST_BYTES || self.began.elapsed().as_millis() >= LIST_MS {
+        if should_flush(self.bytes, self.began.elapsed().as_millis()) {
             self.flush();
         }
     }
@@ -155,13 +383,18 @@ impl Batch {
     fn flush(&mut self) {
         self.bytes = 0;
         let publish = std::mem::take(&mut self.publish);
+        let staging = std::mem::take(&mut self.staging);
         let list = self.list.take();
         if list.is_none() && publish.is_empty() {
             return;
         }
         if let Some(list) = &list {
             let started = std::time::Instant::now();
-            let left = list.refresh_textures_ahead();
+            let left = if staging.len() >= PARALLEL_DETILE_MIN {
+                refresh_batch_with(&staging, PARALLEL_DETILE_MIN, &make_way, &|s| s.refresh_ahead())
+            } else {
+                list.refresh_textures_ahead()
+            };
             STATS[1].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
             STATS[5].fetch_add(left, Relaxed);
             list.close();
@@ -195,8 +428,20 @@ impl PendingPublish {
         }
     }
 
-    /// Publishes every slot whose texture upload is included in this batch.
+    /// Publishes every slot whose texture upload is included in this batch and
+    /// drains remade texture views / ready copy-queue flips for the affected
+    /// heaps so newly streamed mip levels are visible on this submission.
     pub(crate) fn publish(mut self) {
+        for (i, held) in self._heaps.iter().enumerate() {
+            let ptr = held.0 as usize;
+            if self._heaps[..i].iter().any(|prev| prev.0 as usize == ptr) {
+                continue;
+            }
+            if let Some(host) = held.heap().host() {
+                host.texture_views_remade();
+                host.texture_slots_flip();
+            }
+        }
         for p in self.publish.drain(..) {
             let Some(host) = crate::descriptor::heap(p.heap as This).host() else {
                 continue;
@@ -347,5 +592,57 @@ mod tests {
         drop(pass);
         handle.join().unwrap();
         assert!(!make_way());
+    }
+
+    #[test]
+    fn flush_thresholds_match_16mib_and_12ms() {
+        assert_eq!(LIST_BYTES, 16 << 20);
+        assert_eq!(LIST_MS, 12);
+        assert!(!should_flush(0, 0));
+        assert!(!should_flush(LIST_BYTES - 1, LIST_MS - 1));
+        assert!(should_flush(LIST_BYTES, 0));
+        assert!(should_flush(0, LIST_MS));
+        assert!(should_flush(LIST_BYTES + 1, LIST_MS + 1));
+    }
+
+    #[test]
+    fn detile_helper_count_stays_bounded() {
+        assert_eq!(detile_helper_count(1), 0);
+        assert_eq!(detile_helper_count(2), 0);
+        assert_eq!(detile_helper_count(4), 1);
+        assert_eq!(detile_helper_count(8), 2);
+        assert_eq!(detile_helper_count(12), 3);
+        assert_eq!(detile_helper_count(32), 3);
+    }
+
+    #[test]
+    fn refresh_batch_with_runs_sequential_and_parallel_and_counts_left() {
+        let seen_small: Vec<AtomicUsize> = (0..7).map(|_| AtomicUsize::new(0)).collect();
+        let left_small = refresh_batch_with(&seen_small, PARALLEL_DETILE_MIN, &|| false, &|slot| {
+            slot.fetch_add(1, Relaxed);
+            true
+        });
+        assert_eq!(left_small, 0);
+        assert!(seen_small.iter().all(|c| c.load(Relaxed) == 1));
+
+        let seen_burst: Vec<(usize, AtomicUsize)> = (0..24).map(|i| (i, AtomicUsize::new(0))).collect();
+        let left_burst = refresh_batch_with(&seen_burst, PARALLEL_DETILE_MIN, &|| false, &|(i, slot)| {
+            slot.fetch_add(1, Relaxed);
+            i % 4 != 0
+        });
+        assert_eq!(left_burst, 6);
+        assert!(seen_burst.iter().all(|(_, c)| c.load(Relaxed) == 1));
+    }
+
+    #[test]
+    fn refresh_batch_with_respects_stop_signal() {
+        let ran = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..16).collect();
+        let left = refresh_batch_with(&items, PARALLEL_DETILE_MIN, &|| true, &|_| {
+            ran.fetch_add(1, Relaxed);
+            true
+        });
+        assert_eq!(ran.load(Relaxed), 0);
+        assert_eq!(left, 16);
     }
 }

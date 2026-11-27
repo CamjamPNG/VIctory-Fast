@@ -740,6 +740,25 @@ thread_local! {
     /// The thread is staging a texture for a copy-only queue (`texture::ahead`),
     /// which cannot dispatch GPU compute detile shaders.
     pub(crate) static COPY_QUEUE_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Active while `heap_worker::Batch::record` collects `Staging` handles
+    /// deferred into its upload list for parallel burst detiling.
+    static AHEAD_COLLECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AHEAD_STAGED: std::cell::RefCell<Vec<Arc<Staging>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` while capturing any [`Staging`] handles passed to
+/// `HostList::defer_texture` on this thread into `out`.
+pub(crate) fn capture_deferred_staging<R>(out: &mut Vec<Arc<Staging>>, f: impl FnOnce() -> R) -> R {
+    struct Guard<'a>(&'a mut Vec<Arc<Staging>>, bool);
+    impl Drop for Guard<'_> {
+        fn drop(&mut self) {
+            AHEAD_COLLECT.set(self.1);
+            AHEAD_STAGED.with(|staged| self.0.extend(staged.borrow_mut().drain(..)));
+        }
+    }
+    let prev = AHEAD_COLLECT.replace(true);
+    let _guard = Guard(out, prev);
+    f()
 }
 
 /// Whether a staging buffer made for one upload of a texture picked by index
@@ -906,6 +925,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // latency when title memory changes (including 3-buffer video rings) and
     // avoids stale-frame races with joined submissions / `VICTORY_THIN`.
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+    if AHEAD_COLLECT.get() {
+        AHEAD_STAGED.with(|staged| staged.borrow_mut().push(staging.clone()));
+    }
     list.defer_texture(PreludeUpload {
         staging,
         copy,

@@ -70,10 +70,6 @@ const LOW: u64 = 1 << 32;
 #[allow(dead_code)]
 const MOST: u64 = 512 << 20;
 
-/// Upper bound on automatic stretch expansion for 64-bit `SEC_RESERVE` section
-/// views so a single small buffer in a multi-GB pool never locks 512 MiB.
-const EXPAND_STRETCH_CAP: u64 = 64 << 20;
-
 /// Cached heap chunk size for 64-bit committed `MEM_PRIVATE` regions.
 const PRIVATE_CHUNK: usize = 16 << 20;
 
@@ -172,6 +168,11 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// `[15]` cached private regions opened, `[16]` their bytes.
 static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
 
+/// Minimum size for 64-bit Pool A section-stretch buffers under `VICTORY_PORT_EXPAND=2`
+/// so we place the few hot 11-26 MiB upload rings (~65-100 MiB total) without pinning
+/// hundreds of MiB for tiny scattered buffers.
+const EXPAND_MIN_BYTES: u64 = 4 << 20;
+
 /// Pure placement policy decision for `[start, start + len)`.
 /// Returns `Some((allow_section, allow_private))` when `port` should attempt
 /// in-place placement, or `None` to leave the caller to its normal path.
@@ -199,21 +200,21 @@ fn placement_policy(
         return None;
     }
     if window {
-        if after_card_fallback {
-            // Shared-memory fallback window (BAR/VRAM declined): zero GPU bandwidth penalty.
+        if after_card_fallback && expand >= 3 {
             Some((true, true))
-        } else if expand >= 2 {
+        } else if expand >= 3 {
             Some((true, true))
         } else {
             None
         }
-    } else if !card_eligible {
-        // Non-card buffer (`< card_limits().0` or VRAM-refused): already in system RAM.
-        Some((true, true))
     } else if expand >= 3 {
         Some((true, true))
-    } else if expand == 2 && len <= max_bytes {
-        // 64-bit section-stretch buffers up to `max_bytes` (e.g. 11-24 MiB CPU-written
+    } else if !card_eligible {
+        // Non-card buffer: only place under expand=1 if section-backed, skip under
+        // expand=2 to avoid pinning dozens of tiny scattered buffers in 64-bit pools.
+        if expand == 1 { Some((true, false)) } else { None }
+    } else if expand == 2 && len >= EXPAND_MIN_BYTES && len <= max_bytes {
+        // 64-bit section-stretch buffers in `[4 MiB..=max_bytes]` (e.g. 11-26 MiB CPU-written
         // upload rings in Pool A), leaving larger GPU-hot UAV heaps in local VRAM.
         Some((true, false))
     } else {
@@ -470,8 +471,9 @@ fn open_section_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Regio
     if expand_mode() == 0 && first < LOW && first + bytes > LOW {
         bytes = LOW.saturating_sub(first);
     }
-    let stretch_cap = if first < LOW { MOST } else { EXPAND_STRETCH_CAP };
-    if bytes > stretch_cap {
+    // For 64-bit sections (`first >= LOW`), map only the exact `[at, end)` buffer
+    // sub-range rather than expanding to the full stretch, keeping `SHR` minimal.
+    if first >= LOW || bytes > MOST {
         offset += at - first;
         (first, bytes) = (at, end - at);
     }
@@ -789,21 +791,23 @@ mod tests {
         assert_eq!(placement_policy(high_addr, 128 << 10, false, false, false, true, 0, cap), None);
         assert_eq!(placement_policy(0, 4 << 20, true, false, false, true, 3, cap), None);
 
-        // Mode 1 (safe): non-card 64-bit buffers and shared-fallback windows allowed;
-        // card-eligible 64-bit buffers and pre-BAR windows stay on VRAM/BAR.
-        assert_eq!(placement_policy(high_addr, 128 << 10, false, false, false, true, 1, cap), Some((true, true)));
+        // Mode 1 (safe): non-card 64-bit section buffers only (no windows, no MEM_PRIVATE).
+        assert_eq!(placement_policy(high_addr, 128 << 10, false, false, false, true, 1, cap), Some((true, false)));
         assert_eq!(placement_policy(high_addr, 12 << 20, false, true, false, true, 1, cap), None);
         assert_eq!(placement_policy(high_addr, 1 << 20, true, false, false, true, 1, cap), None);
-        assert_eq!(placement_policy(high_addr, 1 << 20, true, false, true, true, 1, cap), Some((true, true)));
+        assert_eq!(placement_policy(high_addr, 1 << 20, true, false, true, true, 1, cap), None);
 
-        // Mode 2 (sections): adds 64-bit section-stretch buffers <= cap (e.g. 11-24 MiB Pool A)
-        // and pre-BAR windows, while keeping > cap GPU-hot heaps (e.g. 50-90 MiB) in VRAM.
+        // Mode 2 (sections): places only 64-bit section buffers in [4 MiB..=cap]
+        // (e.g. 11-26 MiB Pool A upload rings), skipping tiny buffers, rotating windows,
+        // and > cap GPU-hot heaps.
+        assert_eq!(placement_policy(high_addr, 128 << 10, false, false, false, true, 2, cap), None);
         assert_eq!(placement_policy(high_addr, 24 << 20, false, true, false, true, 2, cap), Some((true, false)));
         assert_eq!(placement_policy(high_addr, 50 << 20, false, true, false, true, 2, cap), None);
-        assert_eq!(placement_policy(high_addr, 1 << 20, true, false, false, true, 2, cap), Some((true, true)));
+        assert_eq!(placement_policy(high_addr, 1 << 20, true, false, false, true, 2, cap), None);
 
         // Mode 3 (all): places all 64-bit buffers (section + private) regardless of size cap.
         assert_eq!(placement_policy(high_addr, 90 << 20, false, true, false, true, 3, cap), Some((true, true)));
+        assert_eq!(placement_policy(high_addr, 1 << 20, true, false, false, true, 3, cap), Some((true, true)));
     }
 
     /// A `SEC_RESERVE` stretch where only an interior sub-range is committed:

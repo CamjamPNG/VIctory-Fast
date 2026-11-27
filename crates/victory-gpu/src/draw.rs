@@ -1027,6 +1027,42 @@ pub(crate) enum Into<'a> {
     Ahead(&'a mut crate::heap_worker::Batch),
 }
 
+/// Whether a newly created host texture may take its first upload on
+/// `texture::ahead`'s dedicated COPY queue instead of the DIRECT list/batch.
+///
+/// With `VICTORY_HEAP_WORKER=1` (`ahead_worker`), COPY-queue offloading is
+/// race-free only for placed textures (`is_placed`) when `VICTORY_SHOW_AFTER=1`
+/// (`show_after`) is also active:
+/// - non-placed `View::Shader` objects register in `descriptor::WAITING` and
+///   are mirrored immediately by `descriptor::make_waiting()` during
+///   `Host::submit` without waiting for the COPY queue fence;
+/// - without `show_after`, a concurrent table draw calls `HostHeap::mirror`
+///   in `mirror_after()` before `readable()` waits in `ahead::listed()`,
+///   exposing the texture to in-flight DIRECT submissions while the COPY
+///   queue is still writing it.
+#[allow(clippy::too_many_arguments)]
+fn use_ahead_copy_queue(
+    ahead_worker: bool,
+    late: bool,
+    is_placed: bool,
+    shows_other: bool,
+    baking: bool,
+    sync_bake: bool,
+    show_after: bool,
+    slot_made_from: bool,
+    tabled: bool,
+    fresh: bool,
+) -> bool {
+    if tabled || !fresh || baking || sync_bake || shows_other {
+        return false;
+    }
+    if ahead_worker {
+        is_placed && show_after && !slot_made_from
+    } else {
+        late
+    }
+}
+
 pub(crate) static HEAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURE_BYTES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
@@ -3432,11 +3468,19 @@ impl State {
             // from another level) goes on doing so until the upload of what
             // the new one shows has run.
             let sync_bake = sync.is_some();
-            let shows_other = !ahead_worker
+            let check_slot_views = !ahead_worker || (crate::descriptor::host::show_after() && crate::texture::ahead::on());
+            let shows_other_slot = check_slot_views
                 && !baking
                 && !sync_bake
                 && crate::resource::held_only()
                 && heap.handle(index).is_some_and(|handle| host.texture_slot_shows_other(index, handle));
+            let shows_other = !ahead_worker && shows_other_slot;
+            let slot_made_from = check_slot_views
+                && !shows_other_slot
+                && !baking
+                && !sync_bake
+                && crate::descriptor::host::show_after()
+                && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
             // A slot that shows nothing of it yet, or something else, shows it
             // when the upload has run too.
             let late = !ahead_worker
@@ -3444,7 +3488,7 @@ impl State {
                 && !baking
                 && !sync_bake
                 && crate::descriptor::host::show_after()
-                && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
+                && !slot_made_from;
             let (view, bake_key) = if ahead_worker {
                 // On the worker the slot shows the view when the upload is in
                 // the queue (`crate::heap_worker::Batch::publish`).
@@ -3541,7 +3585,20 @@ impl State {
             }
             // The first upload of a texture no list has used: on a queue of
             // its own, and the slot shows it as soon as that has run.
-            let ahead = if late && !tabled && texture.is_some_and(crate::pool::fresh) {
+            let ahead = if check_slot_views
+                && use_ahead_copy_queue(
+                    ahead_worker,
+                    late,
+                    placed.is_some(),
+                    shows_other_slot,
+                    baking,
+                    sync_bake,
+                    crate::descriptor::host::show_after(),
+                    slot_made_from,
+                    tabled,
+                    texture.is_some_and(crate::pool::fresh),
+                )
+            {
                 crate::texture::ahead::take(resource, first, there.filter(|_| partly.is_none()).unwrap_or(u64::MAX))
             } else {
                 None
@@ -3571,11 +3628,10 @@ impl State {
                 match &mut into {
                     Into::List(list) => readable(list, sampled.kind, view),
                     Into::Ahead(batch) => {
-                        let Some(list) = batch.list() else {
+                        if !batch.record(|list| readable(list, sampled.kind, view)) {
                             crate::texture::PICKING.set(None);
                             return false;
-                        };
-                        readable(list, sampled.kind, view);
+                        }
                     }
                 }
                 crate::texture::PICKING.set(None);
@@ -3589,7 +3645,8 @@ impl State {
                 served = false;
                 break;
             }
-            if let Into::Ahead(batch) = &mut into
+            if ahead.is_none()
+                && let Into::Ahead(batch) = &mut into
                 && let (Some(handle), Some((_, key))) = (heap.handle(index), &record)
             {
                 batch.publish(index, handle, *key);
@@ -3675,7 +3732,7 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
-            if let Into::Ahead(batch) = &mut into {
+            if ahead.is_none() && let Into::Ahead(batch) = &mut into {
                 batch.uploaded(bytes);
             }
             since_asked += bytes;
@@ -6646,5 +6703,28 @@ mod record_hash_tests {
         let mut c = a;
         c.TopLeftX = f32::NAN;
         assert!(super::viewports_eq(&[b], &[c]));
+    }
+
+    #[test]
+    fn use_ahead_copy_queue_enforces_worker_safety_invariants() {
+        // Non-worker path: preserves `late && !tabled && fresh`.
+        assert!(super::use_ahead_copy_queue(false, true, false, false, false, false, true, false, false, true));
+        assert!(!super::use_ahead_copy_queue(false, false, true, false, false, false, true, false, false, true));
+        assert!(!super::use_ahead_copy_queue(false, true, true, false, false, false, true, false, true, true));
+        assert!(!super::use_ahead_copy_queue(false, true, true, false, false, false, true, false, false, false));
+
+        // Heap-worker path: requires placed texture + show_after + unmade slot + no other view.
+        assert!(super::use_ahead_copy_queue(true, false, true, false, false, false, true, false, false, true));
+        // Non-placed View::Shader must stay off COPY queue (make_waiting hazard).
+        assert!(!super::use_ahead_copy_queue(true, false, false, false, false, false, true, false, false, true));
+        // Without VICTORY_SHOW_AFTER=1, table draws can mirror before ahead::listed() waits.
+        assert!(!super::use_ahead_copy_queue(true, false, true, false, false, false, false, false, false, true));
+        // Already-made, shows_other, baking, sync_bake, tabled, or non-fresh are excluded.
+        assert!(!super::use_ahead_copy_queue(true, false, true, false, false, false, true, true, false, true));
+        assert!(!super::use_ahead_copy_queue(true, false, true, true, false, false, true, false, false, true));
+        assert!(!super::use_ahead_copy_queue(true, false, true, false, true, false, true, false, false, true));
+        assert!(!super::use_ahead_copy_queue(true, false, true, false, false, true, true, false, false, true));
+        assert!(!super::use_ahead_copy_queue(true, false, true, false, false, false, true, false, true, true));
+        assert!(!super::use_ahead_copy_queue(true, false, true, false, false, false, true, false, false, false));
     }
 }

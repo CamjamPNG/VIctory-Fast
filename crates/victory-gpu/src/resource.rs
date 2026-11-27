@@ -1307,15 +1307,16 @@ fn video_memory_percent() -> u64 {
 }
 
 /// Pure threshold logic for [`over_cap`]: skips top mips so neither side passes
-/// `set` (0: uncapped) or the VRAM-pressure cap (1024 below 92 %, 512 at
-/// 92..97 %, 256 at 97 %+).
+/// `set` (0: uncapped) or the VRAM-pressure cap (2048 below 85 %, 1024 at
+/// 85..92 %, 512 at 92..97 %, 256 at 97 %+).
 #[cfg(any(windows, test))]
 fn over_cap_for(desc: &ResourceDesc, set: Option<u64>, vram_pct: u64) -> u32 {
     if set == Some(0) {
         return 0;
     }
     let max = set.unwrap_or_else(|| match vram_pct {
-        0..92 => 1024,
+        0..85 => 2048,
+        85..92 => 1024,
         92..97 => 512,
         _ => 256,
     });
@@ -1330,8 +1331,8 @@ fn over_cap_for(desc: &ResourceDesc, set: Option<u64>, vram_pct: u64) -> u32 {
 }
 
 /// How many of a streamed placed 2D texture's largest mips to skip so no side
-/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 1024, then 512 from 92 %
-/// of the VRAM budget and 256 from 97 %, after `VIctory-vitesse` 7ada43b6).
+/// passes `VICTORY_TEXTURE_MAX` (0: uncapped; unset: 2048 below 85 %, 1024 at
+/// 85..92 %, 512 from 92 % of the VRAM budget and 256 from 97 %).
 /// Keeps 16 GB cards from filling VRAM and stalling thousands of textures.
 #[cfg(windows)]
 fn over_cap(desc: &ResourceDesc) -> u32 {
@@ -1846,36 +1847,33 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
+/// Pure calculation for [`targets_room_kept`]: reserves up to `override_mb`
+/// (clamped to 8,192 MiB) or the default 2,048 MiB minus live target bytes,
+/// keeping safe burst/growth headroom above steady-state targets (~1,807 MiB)
+/// without permanently locking ~1.26 GiB of phantom VRAM.
+#[cfg(any(windows, test))]
+fn targets_room_kept_for(targets: u64, override_mb: Option<u64>) -> u64 {
+    const DEFAULT_TARGETS_MB: u64 = 2048;
+    let most = override_mb.map_or(DEFAULT_TARGETS_MB << 20, |mb| mb.min(8192) << 20);
+    most.saturating_sub(targets)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
-/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
-///
-/// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
-/// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
-/// on, none of them idle (run 198's census). They are made with no room
-/// test, in the same frame as the card copies of title buffers (762 MB),
-/// after the texture queue has filled the card to its line with textures
-/// written while the world loaded (7.3 GB of them at the first world frame
-/// of run 193, of which 2.3 GB were let go again within 13 seconds). The
-/// card then stood at 99 to 100.5 % of its budget, buffer copies were
-/// turned down for good (31 of 95 made: the frame 355 ms where 95 give
-/// 238), and the queue was refused from the first world frame on. With
-/// their room kept, the queue stops that much earlier while the world
-/// loads and gets it back as the targets are made.
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (default 2,048 MiB; 0:
+/// none) less what such copies hold now.
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static OVERRIDE_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let override_mb = *OVERRIDE_MB.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    targets_room_kept_for(targets, override_mb)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -1897,12 +1895,8 @@ pub(crate) fn room_lately() -> bool {
 }
 
 /// The share of the card's budget, in percent, up to which host copies of
-/// textures picked by index are made ([`room`]): 90 unless
-/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97). At 90 about a
-/// tenth of the budget, 1,020 MB of 10,200, stays unused while thousands of
-/// textures wait (runs 170-174); the card copies of title buffers from
-/// 1 MiB up take 449 MB more of the card than before (941 against 492),
-/// and 94 gives the textures about that much back.
+/// textures picked by index are made ([`room`]): 93 unless
+/// `VICTORY_TEXTURE_ROOM_PERCENT` says another (50 to 97).
 #[cfg(windows)]
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1910,7 +1904,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(93, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -2131,6 +2125,18 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Gives textures that were already evicted and remade (`r.host.gone`) twice
+/// the idle grace under active VRAM trimming (`idle_ms < 60_000`) to curb
+/// eviction/remake thrash while leaving emergency reclamation bounded.
+#[cfg(any(windows, test))]
+fn remade_idle_ms(idle_ms: u64, remade: bool) -> u64 {
+    if remade && idle_ms < 60_000 {
+        idle_ms.saturating_mul(2).min(60_000)
+    } else {
+        idle_ms
+    }
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2196,15 +2202,18 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    // With a limit, the longest idle first.
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // With a limit, evict never-remade textures before already-remade ones,
+    // longest idle first within each group.
+    let mut by_age: Vec<(u8, u64, usize)> = Vec::new();
     if most != u64::MAX {
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+            let remade = r.host.gone.load(Relaxed);
+            let need_ms = remade_idle_ms(idle_ms, remade);
+            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, need_ms, IDLE_FRAMES) {
+                by_age.push((u8::from(remade), used & 0xffff_ffff, at));
             }
         }
         by_age.sort_unstable();
@@ -2226,7 +2235,7 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, _, at)| at)) {
         if bytes >= most {
             break;
         }
@@ -2239,13 +2248,14 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        let need_ms = remade_idle_ms(idle_ms, r.host.gone.load(Relaxed));
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, need_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
             continue;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), need_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -4779,10 +4789,16 @@ float4 lit() : SV_Target { return 1.0; }
         let mut t256 = texture(256, 256, 98, 1);
         t256.mip_levels = 9;
 
-        // Below 92 %: cap at 1024.
-        assert_eq!(over_cap_for(&t4k, None, 0), 2);
+        // Below 85 %: cap at 2048.
+        assert_eq!(over_cap_for(&t4k, None, 0), 1);
+        assert_eq!(over_cap_for(&t4k, None, 84), 1);
+        assert_eq!(over_cap_for(&t2k, None, 80), 0);
+        assert_eq!(over_cap_for(&t1k, None, 84), 0);
+
+        // 85..92 %: cap at 1024.
+        assert_eq!(over_cap_for(&t4k, None, 85), 2);
         assert_eq!(over_cap_for(&t4k, None, 91), 2);
-        assert_eq!(over_cap_for(&t2k, None, 80), 1);
+        assert_eq!(over_cap_for(&t2k, None, 85), 1);
         assert_eq!(over_cap_for(&t1k, None, 91), 0);
 
         // 92..97 %: cap at 512.
@@ -4812,6 +4828,28 @@ float4 lit() : SV_Target { return 1.0; }
     }
 
     #[test]
+    fn targets_room_kept_trims_phantom_and_respects_override() {
+        const MIB: u64 = 1 << 20;
+        // Loading screen (~652 MiB) still reserves burst room for incoming world targets.
+        assert_eq!(targets_room_kept_for(652 * MIB, None), (2048 - 652) * MIB);
+        // Steady-state targets (~1,807 MiB) keep 241 MiB headroom instead of 1,265 MiB phantom.
+        assert_eq!(targets_room_kept_for(1807 * MIB, None), 241 * MIB);
+        assert_eq!(targets_room_kept_for(2200 * MIB, None), 0);
+        // Explicit override (including 0 and upper clamp at 8192 MiB) is preserved.
+        assert_eq!(targets_room_kept_for(1807 * MIB, Some(0)), 0);
+        assert_eq!(targets_room_kept_for(1807 * MIB, Some(3072)), (3072 - 1807) * MIB);
+        assert_eq!(targets_room_kept_for(0, Some(16_384)), 8192 * MIB);
+    }
+
+    #[test]
+    fn remade_idle_ms_protects_remade_textures() {
+        assert_eq!(remade_idle_ms(5_000, false), 5_000);
+        assert_eq!(remade_idle_ms(5_000, true), 10_000);
+        assert_eq!(remade_idle_ms(1_500, true), 3_000);
+        assert_eq!(remade_idle_ms(600_000, true), 600_000);
+    }
+
+    #[test]
     fn budget_capped_keep_evicts_before_vram_pressure() {
         const MIB: u64 = 1 << 20;
         let calm = crate::host::vram_keep(15_000 * MIB, 9_500 * MIB);
@@ -4820,8 +4858,8 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(tighter_keep(calm, under), calm);
         assert_eq!(tighter_keep(calm, over), over);
         assert!(over.0 <= 5_000 && over.1 > 0 && over.1 < u64::MAX);
-        // When both VRAM and budget are over 88%, keep the tighter deadline and larger trim.
-        let vram_over = crate::host::vram_keep(15_000 * MIB, 13_500 * MIB);
+        // When both VRAM and budget are over 91%, keep the tighter deadline and larger trim.
+        let vram_over = crate::host::vram_keep(15_000 * MIB, 13_800 * MIB);
         assert_eq!(tighter_keep(vram_over, over), (over.0.min(vram_over.0), over.1.max(vram_over.1)));
     }
 

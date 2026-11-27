@@ -1052,10 +1052,10 @@ pub struct Dispatch<'a> {
 /// The host's slot table for `views`: one buffer of
 /// [`super::shader::SLOT_STRIDES_COUNT`] dwords of element sizes and as many
 /// again of counts, the same buffer bound at [`super::shader::SLOT_STRIDES`]
-/// and [`super::shader::SLOT_TABLE_STRIDES`]. The host makes every buffer
-/// view raw (`victory-gpu`'s `write_stride`), so the element word is 1 and
-/// the count is bytes; a shader divides the bytes of a structured view by
-/// the stride its used resources name.
+/// and [`super::shader::SLOT_TABLE_STRIDES`]. A word is the view's bytes per
+/// element, and 1 for a raw view (the host counts those in dwords); a count
+/// is the view's elements, or its bytes when it is raw — what
+/// `victory-gpu`'s `write_stride` writes for the view it would make.
 #[cfg(test)]
 pub fn slot_table(views: &[View]) -> Vec<u32> {
     let cap = super::shader::SLOT_STRIDES_COUNT as usize;
@@ -1064,14 +1064,29 @@ pub fn slot_table(views: &[View]) -> Vec<u32> {
         if i >= cap {
             break;
         }
-        let bytes = match *v {
-            View::Buffer { data, .. } => data.len() as u32 * 4,
-            View::RawUav(n) | View::HalfUav(n) | View::HalfUintUav(n) => n * 4,
-            View::TypedUav { data, .. } => data.len() as u32 * 4,
+        let (word, elements, bytes) = match *v {
+            View::Buffer { data, stride } => {
+                let bytes = data.len() as u32 * 4;
+                let (word, elements) = match stride {
+                    Stride::Raw => (1, bytes / 4),
+                    Stride::Typed => (16, bytes / 16),
+                    Stride::Structured(s) => (s, bytes / s),
+                    Stride::Format(_, s) => (s, bytes / s),
+                };
+                (word, elements, bytes)
+            }
+            View::RawUav(n) => (1, n, n * 4),
+            View::HalfUav(n) | View::HalfUintUav(n) => (8, n, n * 8),
+            View::TypedUav { data, elem_bytes, .. } => {
+                let bytes = data.len() as u32 * 4;
+                (elem_bytes, bytes / elem_bytes, bytes)
+            }
             _ => continue,
         };
-        words[i] = 1;
-        words[cap + i] = bytes;
+        // A raw view's count is in dwords of its own: its bytes.
+        let count = if word == 1 { bytes } else { elements };
+        words[i] = word;
+        words[cap + i] = count;
     }
     words
 }

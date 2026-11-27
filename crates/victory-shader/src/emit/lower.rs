@@ -7491,16 +7491,24 @@ impl<'a> Lower<'a> {
             // slot: AMD RDNA 4's driver compiler crashes on `getDimensions`
             // of a buffer (`0xc0000005` in `amdxc64.dll`).
             //
-            // The host counts the bytes of every buffer view it makes (it
-            // makes them all raw), and the console's dword 2 counts records:
-            // the stride `sized_view` let through divides them down, as the
+            // The console's dword 2 counts records. The host's word counts
+            // the elements of a structured view and the bytes of a raw one,
+            // and the table says which by its stride (1: raw): a raw view of
+            // a structured buffer (`buffer_srv`'s window) divides the bytes
+            // down by the stride `sized_view` let through, as the
             // `getDimensions` form below does.
             let stride = used.map_or(0, |u| u.stride);
-            let n = if props.0 & 0xFF == 11 && stride > 1 {
-                let k = self.s.m.i32(stride);
-                self.s.m.bin(c, Bin::UDiv, n, k)
-            } else {
-                n
+            let n = match self.slot_word(&src, true)? {
+                Some(word) if stride > 1 => {
+                    let one = self.s.m.i32(1);
+                    let mask = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
+                    let raw = self.s.m.bin(c, Bin::And, word, mask);
+                    let raw = self.s.m.cmp(c, pred::EQ, raw, one);
+                    let k = self.s.m.i32(stride);
+                    let records = self.s.m.bin(c, Bin::UDiv, n, k);
+                    self.s.m.select(c, raw, records, n)
+                }
+                _ => n,
             };
             let mut words = vec![(2, n)];
             let computed = (0..2u8).any(|k| {

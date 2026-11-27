@@ -14961,9 +14961,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(target, 5_200 << 20);
         // 4,900 MB is 79 % of the 6 GiB the system reports: nothing goes.
         assert_eq!(super::vram_keep(6 * gib, used), (600_000, u64::MAX));
-        // …and 94 % of the target: enough goes to come down to 85 % of it.
+        // …and 94 % of the target: past where the bands start (91 %) but
+        // short of where they tighten (95 %), so the idle grace halves and
+        // enough goes to come down to 88 % of it (upstream's bands).
         let (ms, bytes) = super::vram_keep(target, used);
-        assert_eq!((ms, bytes), (1_500, used - target / 100 * 85));
+        assert_eq!((ms, bytes), (5_000, used - target / 100 * 88));
+        assert_eq!(super::vram_keep(target, 5_100 << 20), (1_500, (5_100 << 20) - target / 100 * 88));
         assert_eq!(super::vram_idle_for(Some([6 * gib, used, 0, 0]), true), 2_500);
         assert_eq!(super::vram_idle_for(Some([target, used, 0, 0]), true), 1_000);
         // 4 GiB: the target is the reported budget less the system's share.

@@ -71,10 +71,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
-    match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
-        _ => SPARE,
-    }
+    // Against the budget this layer holds itself to, not the one the system
+    // reports: up to 4 GiB of empty blocks are kept only while the card is
+    // under 85 % of that budget, so a starved card keeps 128 MiB of them.
+    let Some([reported, used, ..]) = memory.filter(|_| keep) else {
+        return SPARE;
+    };
+    let target = crate::resource::vram_target(reported);
+    if u128::from(used) * 100 < u128::from(target) * 85 { SPARE_KEPT } else { SPARE }
 }
 
 /// Milliseconds until a piece given back is used again. (It was three
@@ -678,9 +682,15 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const GIB: u64 = 1 << 30;
+        // A card with room is measured against what it reports.
+        assert_eq!(spares(Some([16 * GIB, 13 * GIB, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([16 * GIB, 14 * GIB, 0, 0]), true), SPARE);
+        // A starved one against its target: 5,000 MB is 81 % of the 6 GiB
+        // the system reports and 96 % of the 5,200 MB it is held to.
+        assert_eq!(spares(Some([6 * GIB, 5_000 << 20, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([6 * GIB, 4_000 << 20, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([16 * GIB, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
     }
 

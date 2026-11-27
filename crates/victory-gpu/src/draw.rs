@@ -3224,7 +3224,7 @@ impl State {
         } else {
             crate::residency::prefetch_limit(
                 bytes_at_most,
-                crate::residency::pressured(),
+                crate::residency::pressured() || crate::residency::vram_pressured(),
                 crate::residency::critical_commit(),
                 crate::residency::limited_host_ram(),
                 crate::texture::live_staging_bytes(),

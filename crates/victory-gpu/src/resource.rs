@@ -1285,8 +1285,9 @@ pub(crate) fn read_from(layout: &victory_formats::texture::Layout, first: u32) -
     if layout.bytes_from(first) < layout.size { first } else { 0 }
 }
 
-/// The share of the card's local VRAM budget in use, in percent (cached for
-/// a tenth of a second via [`crate::host::now_ms`]).
+/// The share of the budget [`vram_target`] holds this layer to that is in
+/// use, in percent (cached for a tenth of a second via
+/// [`crate::host::now_ms`]).
 #[cfg(windows)]
 fn video_memory_percent() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1298,9 +1299,7 @@ fn video_memory_percent() -> u64 {
     }
     let pct = crate::host::host()
         .and_then(|h| h.video_memory())
-        .and_then(|[budget, used, ..]| {
-            (budget > 0).then(|| ((u128::from(used) * 100) / u128::from(budget)).min(255) as u64)
-        })
+        .and_then(|[budget, used, ..]| (budget > 0).then(|| held_percent_for(used, budget, vram_target_set())))
         .unwrap_or(0);
     LAST.store((tenth << 8) | pct, Relaxed);
     pct
@@ -1776,6 +1775,135 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// The most of the card's local memory this layer will hold on a card that
+/// cannot keep the working set at the budget the system reports, in bytes.
+///
+/// The reported figure is not headroom. Windows keeps a slice of the card's
+/// memory for everything that is not this process before the process sees
+/// it, and past the budget it gives the process the system moves what does
+/// not fit into the PC's memory, over PCIe 3.0 at about a thirteenth of the
+/// card's bandwidth: every frame that crosses that line is a thrash, and
+/// that is what ended runs 20 and 24.
+const VRAM_CEILING: u64 = 5_200 << 20;
+
+/// Reported local budgets below this (6.5 GiB) get the target of
+/// [`vram_target_for`]: a 6 GiB card reports 5.4 to 6.1 GiB and an 8 GiB
+/// card 7.2 to 7.9 GiB, so the line separates them however much of the card
+/// the desktop holds. Every larger card keeps the numbers it had.
+const STARVED_BUDGET: u64 = 6_656 << 20;
+
+/// The least a hand-set target is taken to mean.
+const MIN_TARGET: u64 = 1 << 30;
+
+/// What Windows keeps of a card's memory for everything that is not this
+/// process: an eighth of the reported budget, between 256 MiB and 1 GiB, and
+/// never more than half of it (the floor is for cards, not for arithmetic on
+/// toy budgets).
+fn vram_reservation(reported: u64) -> u64 {
+    (reported / 8).clamp(256 << 20, 1 << 30).min(reported / 2)
+}
+
+/// The budget the pressure rules of this file measure their shares against:
+/// the system's reported local budget `reported` where the card has room,
+/// else what is left of it after [`vram_reservation`], and never more than
+/// [`VRAM_CEILING`]. `set_mb` is `VICTORY_VRAM_TARGET_MB` (0: none), which
+/// replaces the computed figure on any card and is clamped to what the card
+/// can keep, so it cannot oversubscribe a small one by accident.
+#[cfg(any(windows, test))]
+pub(crate) fn vram_target_for(reported: u64, set_mb: Option<u64>) -> u64 {
+    if reported == 0 {
+        return 0;
+    }
+    let usable = reported.saturating_sub(vram_reservation(reported));
+    match set_mb {
+        Some(mb) => (mb << 20).clamp(MIN_TARGET, usable),
+        None if reported < STARVED_BUDGET => usable.min(VRAM_CEILING),
+        None => reported,
+    }
+}
+
+/// `VICTORY_VRAM_TARGET_MB`, read once (0 or unreadable: none).
+#[cfg(windows)]
+fn vram_target_set() -> Option<u64> {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_TARGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|mb| *mb != 0)
+    })
+}
+
+/// [`vram_target_for`] with `VICTORY_VRAM_TARGET_MB` as it was read at the
+/// start: the budget [`room`], [`over_cap`] and [`let_go_idle`] hold
+/// themselves to.
+#[cfg(windows)]
+pub(crate) fn vram_target(reported: u64) -> u64 {
+    vram_target_for(reported, vram_target_set())
+}
+
+/// The share of [`vram_target`] in use, in percent (capped at 255, which is
+/// past every band).
+#[cfg(any(windows, test))]
+fn held_percent_for(used: u64, reported: u64, set_mb: Option<u64>) -> u64 {
+    let target = vram_target_for(reported, set_mb);
+    if target == 0 {
+        return 0;
+    }
+    ((u128::from(used) * 100) / u128::from(target)).min(255) as u64
+}
+
+/// The most of the card's local memory this process has held, in bytes.
+#[cfg(windows)]
+pub(crate) static PEAK_LOCAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Askings of [`room`] answered no since the start: textures this layer
+/// deferred rather than made.
+#[cfg(windows)]
+pub(crate) static ROOM_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The line a measurement run keeps: the budget this layer holds itself to,
+/// where it came from, what the card reports, the peak of its local memory,
+/// and what was deferred or let go to stay under it. Said with the memory
+/// summary ([`crate::host::memory_summary_line`]), and only while a target
+/// is in force, so a card that is not starved logs what it logged before.
+#[cfg(windows)]
+pub(crate) fn log_vram_target() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some([reported, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return;
+    };
+    let target = vram_target(reported);
+    if target == reported {
+        return;
+    }
+    let set = vram_target_set();
+    tracing::info!(
+        "vram target: {} MB of the {} MB the system reports ({}), local in use {} MB, peak {} MB; \
+         texture admissions refused {} times, host copies of textures the title fills let go {} \
+         ({} MB) since the start{}",
+        target >> 20,
+        reported >> 20,
+        match set {
+            Some(mb) => format!(
+                "set by VICTORY_VRAM_TARGET_MB={mb}, ceiling {} MB, clamped to what the card can keep",
+                VRAM_CEILING >> 20
+            ),
+            None => format!("computed: ceiling {} MB less the desktop's share", VRAM_CEILING >> 20),
+        },
+        used >> 20,
+        PEAK_LOCAL.load(Relaxed) >> 20,
+        ROOM_REFUSED.load(Relaxed),
+        KINDS[2].load(Relaxed),
+        KINDS[3].load(Relaxed) >> 20,
+        if crate::residency::vram_pressured() {
+            "; the card is over its target"
+        } else {
+            ""
+        }
+    );
+}
+
 /// Unconditional host-texture floor for a given local VRAM budget (`None` when
 /// the adapter does not report one): up to 2 GiB, capped at a quarter of the
 /// reported budget so 4–6 GiB cards do not bypass the budget check early.
@@ -1812,10 +1940,12 @@ fn tighter_keep(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
-/// memory in use by this process is under nine tenths of the budget the system
-/// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
-/// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
-/// which ended runs 20 and 24.
+/// memory in use by this process is under nine tenths of the budget it holds
+/// itself to ([`vram_target`]; [`room_percent`] says another share;
+/// `VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes as well).
+/// Past the budget the system moves the card's memory into the PC's, which
+/// ended runs 20 and 24: a copy that would cross the line is deferred, its
+/// slot asked for again on a later frame, not made and paged.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1823,27 +1953,38 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
-    if let Some(limit) = texture_budget_bytes() {
-        return filled < limit;
-    }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
-        return true;
-    }
-    match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`), render targets
-        // ([`targets_room_kept`]), and Native DXR AS slabs
-        // (`crate::dxr::dxr_room_kept`) counts as used.
-        Some([budget, used, ..]) => {
+    let reported = memory.map(|[reported, ..]| reported);
+    let target = reported.map(vram_target);
+    // A target is in force when it is below the budget the system reports:
+    // a card this layer holds itself back on.
+    let targeted = matches!((reported, target), (Some(reported), Some(target)) if target != reported);
+    // What the card has room for, by the budget this layer holds itself to.
+    // What is kept for card copies of title buffers not made yet
+    // (`crate::shadow::card_room_kept`), render targets
+    // ([`targets_room_kept`]), and Native DXR AS slabs
+    // (`crate::dxr::dxr_room_kept`) counts as used.
+    let card_room = match (memory, target) {
+        (Some([_, used, ..]), Some(budget)) => {
+            PEAK_LOCAL.fetch_max(used, Relaxed);
             used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept()
                 + crate::dxr::dxr_room_kept()
                 < budget / 100 * room_percent()
         }
-        None => filled < WITHOUT_BUDGET,
+        _ => filled < WITHOUT_BUDGET,
+    };
+    let room = if let Some(limit) = texture_budget_bytes() {
+        // The copies' own limit, and on a card this layer has a target for,
+        // the card's line too.
+        filled < limit && (!targeted || card_room)
+    } else {
+        filled < texture_floor_bytes(target) || card_room
+    };
+    if !room {
+        ROOM_REFUSED.fetch_add(1, Relaxed);
     }
+    room
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2174,10 +2315,17 @@ pub(crate) fn let_go_idle() {
         }
     }
     let memory = crate::host::host().and_then(|h| h.video_memory());
+    // The shares below are of the budget this layer holds itself to, not of
+    // the one the system reports ([`vram_target`]): on a card that cannot
+    // keep the working set the first is lower, so the same bands start
+    // emptying host copies well before the system would begin to page.
+    let held = memory.map(|[reported, used, shared_budget, shared_used]| {
+        [vram_target(reported), used, shared_budget, shared_used]
+    });
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let mut policy = match memory {
+    let mut policy = match held {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2185,7 +2333,7 @@ pub(crate) fn let_go_idle() {
                 + crate::dxr::dxr_room_kept();
             crate::host::vram_keep(budget, used)
         }
-        _ => (crate::host::vram_idle_ms(memory), u64::MAX),
+        _ => (crate::host::vram_idle_ms(held), u64::MAX),
     };
     if let Some(limit) = texture_budget_bytes() {
         let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
@@ -4836,6 +4984,67 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+        // What the floor is on the budget a 6 GiB card is held to.
+        assert_eq!(texture_floor_bytes(Some(vram_target_for(6 * GIB, None))), 1_300 << 20);
+    }
+
+    /// A card below 6.5 GiB reported is held to what is left of it after the
+    /// system's share, and never above the ceiling; 8 GiB and up keep what
+    /// they report.
+    #[test]
+    fn a_starved_card_is_held_to_a_target_from_what_it_can_keep() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(vram_target_for(4 * GIB, None), 3_584 * MIB);
+        assert_eq!(vram_target_for(5_400 * MIB, None), 4_725 * MIB);
+        assert_eq!(vram_target_for(6 * GIB, None), VRAM_CEILING);
+        assert_eq!(vram_target_for(8 * GIB, None), 8 * GIB);
+        assert_eq!(vram_target_for(12 * GIB, None), 12 * GIB);
+        assert_eq!(vram_target_for(16 * GIB, None), 16 * GIB);
+        // Nothing reported: nothing to hold to.
+        assert_eq!(vram_target_for(0, None), 0);
+    }
+
+    /// `VICTORY_VRAM_TARGET_MB` replaces the computed figure anywhere, and
+    /// cannot oversubscribe a card: it is clamped to the reported budget
+    /// less the system's share, and to at least a gigabyte.
+    #[test]
+    fn a_hand_set_target_is_clamped_to_what_the_card_can_keep() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(vram_target_for(6 * GIB, Some(8_000)), 5_376 * MIB);
+        assert_eq!(vram_target_for(6 * GIB, Some(600)), GIB);
+        assert_eq!(vram_target_for(6 * GIB, Some(3_000)), 3_000 * MIB);
+        assert_eq!(vram_target_for(16 * GIB, Some(6_000)), 6_000 * MIB);
+        assert_eq!(vram_target_for(0, Some(3_000)), 0);
+    }
+
+    /// 4,900 MB of a 6 GiB card is under four fifths of what the system
+    /// reports and over 92 % of the target: the bands that skip top mips and
+    /// empty host copies are measured against the target, so they start
+    /// there rather than at the cliff.
+    #[test]
+    fn a_starved_card_crosses_the_bands_before_it_did() {
+        const GIB: u64 = 1 << 30;
+        let target = vram_target_for(6 * GIB, None);
+        // 6 GiB of card: the ceiling is what binds, not the eighth taken off.
+        assert_eq!(target, VRAM_CEILING);
+        let mut t4k = texture(4096, 4096, 98, 1);
+        t4k.mip_levels = 13;
+        // Under the cap of 1024 a side still, by the reported budget…
+        assert_eq!((4_900u64 * 100) / (6 * GIB / (1 << 20)), 79);
+        assert_eq!(over_cap_for(&t4k, None, 4_900u64 * 100 / (6 * GIB / (1 << 20))), 2);
+        // …and past 92 % of the target.
+        assert_eq!(held_percent_for(4_900 << 20, 6 * GIB, None), 94);
+        assert_eq!(over_cap_for(&t4k, None, held_percent_for(4_900 << 20, 6 * GIB, None)), 3);
+        // 4,400 MB is under the first band of the target, as 3,400 MB is of
+        // a 4 GiB card's.
+        assert_eq!(held_percent_for(4_400 << 20, 6 * GIB, None), 84);
+        assert_eq!(held_percent_for(3_400 << 20, 4 * GIB, None), 94);
+        assert_eq!(held_percent_for(3_200 << 20, 4 * GIB, None), 89);
+        // A card held to what it reports keeps the shares it had.
+        assert_eq!(held_percent_for(4_900 << 20, 8 * GIB, None), 59);
+        assert_eq!(held_percent_for(4_900 << 20, 16 * GIB, None), 29);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

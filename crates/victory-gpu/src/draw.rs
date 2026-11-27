@@ -3915,7 +3915,10 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, REFLECTIONS_ALPHA, Role, Views};
+        if role == Role::ReflectAlpha && !crate::ambient::reflect_alpha_on() {
+            return false;
+        }
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3943,56 +3946,12 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
-        if role == Role::ReflectAlpha {
-            if !crate::ambient::reflect_alpha_on() {
-                return false;
-            }
-            let mut ran = false;
-            let mut seen_slots = [0u64; 8];
-            let mut seen_len = 0usize;
-            for u in &t.used {
-                if u.kind != ResourceType::Uav || u.root != RootType::Table {
-                    continue;
-                }
-                let key = (u64::from(u.slot) << 32) | u64::from(u.table_offset_dwords);
-                if seen_slots[..seen_len].contains(&key) {
-                    continue;
-                }
-                if seen_len < seen_slots.len() {
-                    seen_slots[seen_len] = key;
-                    seen_len += 1;
-                }
-                let Some((of, image)) = entry(ResourceType::Uav, (u.slot, u.table_offset_dwords)) else {
-                    continue;
-                };
-                if of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || of.Width < 240 || of.Height < 135 {
-                    continue;
-                }
-                let fmt = of.Format.0;
-                if !matches!(fmt, 42 | 26) {
-                    once!(key, pipeline = p.name, format = fmt, w = of.Width, h = of.Height, "alpha reflection UAV format skipped");
-                    continue;
-                }
-                once!(key, pipeline = p.name, slot = u.slot, off = u.table_offset_dwords, format = fmt, w = of.Width, h = of.Height, "clamping forward/alpha reflection UAV");
-                ran |= crate::ambient::after(
-                    list,
-                    role,
-                    &Views {
-                        image,
-                        depth: image,
-                        size: [of.Width as u32, of.Height],
-                        slices: u32::from(of.DepthOrArraySize),
-                        float_uav: fmt == 26,
-                    },
-                );
-            }
-            return ran;
-        }
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
-            Role::Reflect | Role::ReflectAlpha => REFLECTIONS,
+            Role::Reflect => REFLECTIONS,
+            Role::ReflectAlpha => REFLECTIONS_ALPHA,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
@@ -4000,14 +3959,14 @@ impl State {
             Role::Radiance | Role::Air | Role::Reflect | Role::ReflectAlpha => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
+            once!(?role, pipeline = p.name, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if matches!(role, Role::Resolve | Role::Reflect) { 42 } else { 26 };
+        let format = if matches!(role, Role::Resolve | Role::Reflect | Role::ReflectAlpha) { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
-            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            once!(?role, pipeline = p.name, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
         crate::ambient::after(list, role, &Views {
@@ -4015,7 +3974,6 @@ impl State {
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
-            float_uav: false,
         })
     }
 

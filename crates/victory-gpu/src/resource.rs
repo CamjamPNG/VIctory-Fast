@@ -1346,13 +1346,95 @@ fn over_cap(desc: &ResourceDesc) -> u32 {
     over_cap_for(desc, set, video_memory_percent())
 }
 
-/// The level a host copy begins at for views that start at `first`: one the
-/// host can have as a texture's level 0 ([`read_from`], [`over_cap`];
-/// block-compressed formats in whole blocks).
-#[cfg(windows)]
-fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
+/// The level [`base_level`] starts a host copy at because of the texture
+/// quality tier alone, before a view or [`over_cap`] is considered: 1 for a
+/// texture no shader writes ([`fills`]) whose level 0 alone takes
+/// `threshold` bytes or more, and 0 for every other texture and at tier 0.
+///
+/// A full chain puts three quarters of its bytes in level 0, so storing the
+/// chain from level 1 on costs a quarter and gives up one level over the
+/// whole image - a uniform half resolution, the trade a texture quality
+/// setting makes. No mip bias goes with it: with the chain re-based onto the
+/// title's level 1, the sampler's implicit level 0 (`SampleLevel(0)` too)
+/// already reads that level, and a `MipLODBias` on top would shift every
+/// read a second level down for no further byte saved.
+#[cfg(any(windows, test))]
+fn tier_base_for(desc: &ResourceDesc, tier: u64, threshold: u64) -> u32 {
     const TEXTURE_2D: u32 = 3;
-    let first = first.max(over_cap(desc));
+    if tier == 0
+        || !fills(desc)
+        || desc.dimension != TEXTURE_2D
+        || desc.depth_or_array_size != 1
+        || desc.mip_levels <= 1
+        || desc.sample_count > 1
+    {
+        return 0;
+    }
+    let Some(t) = texture_layout(desc).filter(|t| t.planes.len() == 1) else {
+        return 0;
+    };
+    let layout = &t.planes[0].layout;
+    if layout.desc.swizzle.xor() {
+        return 0;
+    }
+    u32::from(level0_bytes(layout) >= threshold)
+}
+
+/// The bytes of level 0 alone: what a host copy started on level 1 does not
+/// store. 0 for a layout whose levels are not all in one span
+/// ([`victory_formats::texture::Layout::bytes_from`] gives the whole size
+/// for those), which [`tier_base_for`] does not take.
+#[cfg(any(windows, test))]
+fn level0_bytes(layout: &victory_formats::texture::Layout) -> u64 {
+    layout.size.saturating_sub(layout.bytes_from(1))
+}
+
+/// What a texture's level 0 must take for the quality tier to store its
+/// chain from level 1: a megabyte. Below that the level is small enough that
+/// the millimetres it saves do not pay for the detail it costs - a 512x512
+/// BC7 texture's level 0 is 256 KiB - and at or above it a level 0 is worth
+/// a quarter of the working set on a 6 GiB card (`texture_floor_bytes` is
+/// 1,300 MiB there and the recorded host copies are 6.3 and 6.7 GB).
+const TIER_LEVEL0_BYTES: u64 = 1 << 20;
+
+/// `VICTORY_TEXTURE_TIER`, read once: the texture quality tier
+/// ([`tier_base_for`], [`TIER_LEVEL0_BYTES`]). 0, the default and what a
+/// value that does not parse means, keeps every level a view shows, as
+/// before. 1 stores the chain from level 1 on for the textures
+/// [`tier_base_for`] names. 2 and up are tier 1: no other tier is defined
+/// yet, and a value there is clamped rather than invented.
+#[cfg(windows)]
+fn tier() -> u64 {
+    static TIER: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TIER.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_TIER")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |tier| tier.min(1))
+    })
+}
+
+/// [`tier_base_for`] with the switch as it was read at the start.
+#[cfg(windows)]
+fn tier_base(desc: &ResourceDesc) -> u32 {
+    tier_base_for(desc, tier(), TIER_LEVEL0_BYTES)
+}
+
+/// The tier in force and the level-0 size it stores no level at or above
+/// ([`tier`], [`TIER_LEVEL0_BYTES`]), for the per-second lines.
+#[cfg(windows)]
+pub(crate) fn texture_tier() -> (u64, u64) {
+    (tier(), TIER_LEVEL0_BYTES)
+}
+
+/// [`base_level`] with the cap [`over_cap`] and the tier's level already
+/// answered: the level a host copy begins at for views that start at
+/// `first`, as a level whose texels are whole blocks. `cap` and `tier` 0
+/// give the level this layer chose before the tier existed.
+#[cfg(any(windows, test))]
+fn base_level_for(desc: &ResourceDesc, first: u32, cap: u32, tier: u32) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    let first = first.max(cap).max(tier);
     if first == 0
         || !fills(desc)
         || desc.dimension != TEXTURE_2D
@@ -1377,6 +1459,20 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     }
     base
 }
+
+/// The level a host copy begins at for views that start at `first`: one the
+/// host can have as a texture's level 0 ([`read_from`], [`over_cap`],
+/// [`tier_base`]; block-compressed formats in whole blocks).
+#[cfg(windows)]
+fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
+    base_level_for(desc, first, over_cap(desc), tier_base(desc))
+}
+
+/// Since the start: host copies the quality tier started at level 1 rather
+/// than a view or [`over_cap`], and the bytes of level 0 they do not store.
+#[cfg(windows)]
+pub(crate) static TIERED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
@@ -1593,7 +1689,7 @@ fn lazy() -> bool {
 /// memory: one the host neither renders to nor writes (no target, depth or
 /// unordered access flag). Its host copy can be made again from that
 /// memory; any other texture's contents exist on the host alone.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn fills(desc: &ResourceDesc) -> bool {
     const TARGET_DEPTH_UNORDERED: u32 = 0x7;
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
@@ -1683,13 +1779,23 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
+        // pick by index among them, and the level the quality tier keeps
+        // out ([`tier_base`]).
         let mut base = 0;
         if texture.is_none() && shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
             let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
             let first = wanted.min(viewed);
-            base = base_level(&r.desc, if first == u32::MAX { 0 } else { first });
+            let from = if first == u32::MAX { 0 } else { first };
+            base = base_level(&r.desc, from);
+            // (Counted apart from what a view or `over_cap` asks, so the line
+            // reads what the tier itself did.)
+            if base > from.max(over_cap(&r.desc))
+                && let Some(t) = texture_layout(&r.desc)
+            {
+                TIERED[0].fetch_add(1, Relaxed);
+                TIERED[1].fetch_add(t.planes.first().map_or(0, |p| level0_bytes(&p.layout)), Relaxed);
+            }
         }
         let texture = match texture {
             Some(texture) => Ok(texture),
@@ -1881,7 +1987,7 @@ pub(crate) fn log_vram_target() {
     tracing::info!(
         "vram target: {} MB of the {} MB the system reports ({}), local in use {} MB, peak {} MB; \
          texture admissions refused {} times, host copies of textures the title fills let go {} \
-         ({} MB) since the start{}",
+         ({} MB) since the start{}; texture tier {} (level 0 of {} KiB and up not stored)",
         target >> 20,
         reported >> 20,
         match set {
@@ -1900,7 +2006,9 @@ pub(crate) fn log_vram_target() {
             "; the card is over its target"
         } else {
             ""
-        }
+        },
+        tier(),
+        TIER_LEVEL0_BYTES >> 10
     );
 }
 
@@ -5045,6 +5153,187 @@ float4 lit() : SV_Target { return 1.0; }
         // A card held to what it reports keeps the shares it had.
         assert_eq!(held_percent_for(4_900 << 20, 8 * GIB, None), 59);
         assert_eq!(held_percent_for(4_900 << 20, 16 * GIB, None), 29);
+    }
+
+    /// `base_level` before the texture quality tier existed, kept here as the
+    /// answer the tier must not disturb at its default (`cap` is `over_cap`).
+    fn base_level_before_the_tier(desc: &ResourceDesc, first: u32, cap: u32) -> u32 {
+        const TEXTURE_2D: u32 = 3;
+        let first = first.max(cap);
+        if first == 0
+            || !fills(desc)
+            || desc.dimension != TEXTURE_2D
+            || desc.depth_or_array_size != 1
+            || desc.mip_levels <= 1
+            || desc.sample_count > 1
+        {
+            return 0;
+        }
+        let Some(t) = texture_layout(desc).filter(|t| t.planes.len() == 1) else {
+            return 0;
+        };
+        let layout = &t.planes[0].layout;
+        if layout.desc.swizzle.xor() {
+            return 0;
+        }
+        let block = u64::from(layout.desc.block.max(1));
+        let mut base = read_from(layout, first).min(u32::from(desc.mip_levels) - 1);
+        let whole = |side: u64| side != 0 && side.is_multiple_of(block);
+        while base > 0 && !(whole(desc.width >> base) && whole(u64::from(desc.height) >> base)) {
+            base -= 1;
+        }
+        base
+    }
+
+    /// The textures and first levels the two tests below run over: whole
+    /// chains, odd sides, arrays, 3D, multisampled, targets, an XOR mode, and
+    /// the levels the cap and the pressure bands land on.
+    fn base_levels_under_test() -> Vec<(ResourceDesc, Vec<u32>)> {
+        fn push(out: &mut Vec<(ResourceDesc, Vec<u32>)>, desc: ResourceDesc) {
+            let mips = u32::from(desc.mip_levels).max(1);
+            out.push((desc, (0..=mips).chain([u32::MAX - 1]).collect()));
+        }
+        let mut out = vec![];
+        for (width, height, mips) in [
+            (1024u64, 1024u32, 11u16),
+            (2048, 2048, 12),
+            (4096, 4096, 13),
+            (1024, 360, 11),
+            (4096, 350, 12),
+            (250, 175, 8),
+            (256, 256, 9),
+            (64, 64, 1),
+        ] {
+            let mut d = texture(width, height, 98, mips);
+            push(&mut out, d);
+            // Render target, depth, unordered access: the tier refuses these.
+            for flags in [1, 2, 4, 7] {
+                d.flags = flags;
+                push(&mut out, d);
+            }
+            d.flags = 0;
+            // An array, a 3D texture, two samples, an XOR swizzle mode.
+            d.depth_or_array_size = 2;
+            push(&mut out, d);
+            d.depth_or_array_size = 1;
+            d.dimension = 4;
+            push(&mut out, d);
+            d.dimension = 3;
+            d.sample_count = 2;
+            push(&mut out, d);
+            d.sample_count = 1;
+            d.layout = 0x100 | 21;
+            push(&mut out, d);
+            // A format with no console layout.
+            d.layout = 0;
+            d.format = 0;
+            push(&mut out, d);
+        }
+        out
+    }
+
+    /// At its default the tier changes nothing: for every texture and first
+    /// level above, the level a host copy begins at is the one the code chose
+    /// before the tier existed, so the copy has the same levels and the same
+    /// bytes. It also never rises above what a view or the cap asked, which is
+    /// what keeps the tier's counter at zero at the default.
+    #[test]
+    fn the_quality_tier_at_its_default_answers_as_the_code_did() {
+        for (desc, firsts) in base_levels_under_test() {
+            for cap in [0u32, 1, 2, 3, 4] {
+                for &first in &firsts {
+                    let now = base_level_for(&desc, first, cap, 0);
+                    assert_eq!(
+                        now,
+                        base_level_before_the_tier(&desc, first, cap),
+                        "{desc:?} from level {first} under cap {cap}"
+                    );
+                    assert!(
+                        now <= first.max(cap),
+                        "the tier's counter would count {desc:?} from {first} under cap {cap}"
+                    );
+                    assert_eq!(tier_base_for(&desc, 0, TIER_LEVEL0_BYTES), 0);
+                }
+            }
+        }
+    }
+
+    /// Tier 1 takes level 0 of the textures it names - sampled, single-layer,
+    /// single-sample 2D, level 0 of a megabyte or more - and of nothing else.
+    /// A render target, depth texture, unordered access texture, array, 3D
+    /// texture or multisampled one is left whole whatever its size.
+    #[test]
+    fn the_quality_tier_keeps_level_0_out_of_the_textures_it_names() {
+        let mib = TIER_LEVEL0_BYTES;
+        let big = texture(1024, 1024, 98, 11);
+        let small = texture(512, 512, 98, 10);
+        // 1 MiB of level 0 exactly is enough; 256 KiB is not.
+        assert_eq!(level0_bytes(&texture_layout(&big).unwrap().planes[0].layout), mib);
+        assert_eq!(tier_base_for(&big, 1, mib), 1);
+        assert_eq!(tier_base_for(&small, 1, mib), 0);
+        assert_eq!(tier_base_for(&big, 1, mib + 1), 0);
+        // The switch off asks for nothing, whatever the texture.
+        assert_eq!(tier_base_for(&big, 0, mib), 0);
+
+        for (flags, what) in [(1, "render target"), (2, "depth"), (4, "unordered access"), (7, "all three")] {
+            let mut d = big;
+            d.flags = flags;
+            assert_eq!(tier_base_for(&d, 1, mib), 0, "a {what} texture is never cut");
+        }
+        for (arrays, dimension, samples, layout, what) in [
+            (2u16, 3u32, 1u32, 0u32, "an array"),
+            (1, 4, 1, 0, "a 3D texture"),
+            (1, 3, 2, 0, "a multisampled texture"),
+            (1, 3, 1, 0x100 | 21, "an XOR swizzle mode"),
+            (1, 1, 1, 0, "a buffer"),
+        ] {
+            let mut d = big;
+            d.depth_or_array_size = arrays;
+            d.dimension = dimension;
+            d.sample_count = samples;
+            d.layout = layout;
+            assert_eq!(tier_base_for(&d, 1, mib), 0, "{what} is never cut");
+        }
+        let mut one_mip = big;
+        one_mip.mip_levels = 1;
+        assert_eq!(tier_base_for(&one_mip, 1, mib), 0, "one level has no chain to shorten");
+
+        // And the level the host copy begins at follows: a whole chain
+        // becomes the chain from level 1, and a side that is no longer whole
+        // blocks of texels keeps level 0.
+        assert_eq!(base_level_for(&big, 0, 0, 0), 0);
+        assert_eq!(base_level_for(&big, 0, 0, tier_base_for(&big, 1, mib)), 1);
+        let odd = texture(4096, 350, 98, 12);
+        assert_eq!(tier_base_for(&odd, 1, mib), 1);
+        assert_eq!(base_level_for(&odd, 0, 0, 1), 0, "175 rows are not whole 4x4 blocks");
+        // A level the cap or a view already asked for is not asked for twice.
+        assert_eq!(base_level_for(&big, 4, 0, tier_base_for(&big, 1, mib)), 4);
+        assert_eq!(base_level_for(&big, 0, 2, tier_base_for(&big, 1, mib)), 2);
+    }
+
+    /// What a texture stored from level 1 costs, from the layout's own
+    /// accounting: a 1024x1024 and a 2048x2048 BC7 texture (one byte a texel,
+    /// sixteen bytes a 4x4 block) with their whole chains. Three quarters of
+    /// the bytes are level 0, so the chain from level 1 is a quarter of it.
+    #[test]
+    fn a_texture_stored_from_level_1_costs_a_quarter_of_its_bytes() {
+        for (width, mips, whole, from_one) in [
+            (1024u64, 11u16, 1_400_832u64, 352_256u64),
+            (2048, 12, 5_595_136, 1_400_832),
+        ] {
+            let desc = texture(width, width as u32, 98, mips);
+            let t = texture_layout(&desc).unwrap();
+            let layout = &t.planes[0].layout;
+            assert_eq!(layout.size, whole, "{width} whole");
+            assert_eq!(layout.bytes_from(1), from_one, "{width} from level 1");
+            // The level not stored is exactly a level 0: a megabyte of a
+            // 1024 chain, four of a 2048 one.
+            assert_eq!(level0_bytes(layout), width * width, "{width} level 0");
+            assert_eq!(level0_bytes(layout), whole - from_one);
+            // And the chain from level 1 is a quarter of the whole, to
+            // within a page of the layout's padding.
+            assert!(from_one.abs_diff(whole / 4) <= 4_096, "{from_one} against {}", whole / 4);
+        }
     }
 
     /// A placed texture viewed from a later level has a host copy of that

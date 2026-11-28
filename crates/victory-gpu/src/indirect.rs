@@ -4548,7 +4548,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
+        // Two records of 65,535 x 16 groups (2^26 threads each) and one of 32
+        // groups (2,048 threads): the budget exactly. A record that does not
+        // fit takes nothing (the default: `VICTORY_INDIRECT_REST` off), so
+        // what is left after these has to be nothing rather than a remainder.
         let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
             return;
         };
@@ -4560,8 +4563,8 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
+            let records = [[65535u32, 16, 1], [65535, 16, 1], [32, 1, 1]];
+            for (i, words) in records.iter().enumerate() {
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -5030,7 +5033,10 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     }
 
     /// Records past the list's budget come out empty, and one read by many
-    /// executions is charged for each.
+    /// executions is charged for each. A record that does not fit in what is
+    /// left of the budget takes nothing (`VICTORY_INDIRECT_REST` is off by
+    /// default; `warp_a_record_that_does_not_fit_may_take_nothing`), so a
+    /// record of more than the whole budget charges it nothing at all.
     #[test]
     #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn warp_batch_charges_every_execution() {
@@ -5040,7 +5046,8 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
         // 2^26 vertices each, as much as a draw is let run: two fill it.
-        for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
+        let cases = [(1u32, 3u64, 2usize, BUDGET), (2, 1, 1, BUDGET), (1, 1, 1, 1 << 26), (3, 1, 0, 0)];
+        for (times, records, filled, charged) in cases {
             let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
             let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
             let (back, back_ptr, _) = warp.shared_buffer(1024);
@@ -5090,7 +5097,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            assert_eq!(spent, charged, "{times} times {records}: charged");
         }
     }
 

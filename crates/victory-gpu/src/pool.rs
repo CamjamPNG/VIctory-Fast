@@ -657,9 +657,12 @@ mod tests {
         assert_eq!(texture_alignment(true), u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT));
     }
 
-    /// What the pool's letting go of a block relies on: a texture placed in
-    /// a heap holds a reference to it (the heap lives while the texture does,
-    /// whatever the pool drops).
+    /// A texture placed in a heap holds it: the heap's memory lives while
+    /// the texture does, whatever the pool drops. Microsoft's `CreateHeap`
+    /// remarks promise the reference, but it is the host's own and not the
+    /// object's public count (a native runtime takes none the count shows),
+    /// so this test takes the memory back through the texture after letting
+    /// go of its heap rather than counting references.
     #[test]
     #[ignore = "needs a D3D12 adapter; run with --ignored on a machine with a GPU"]
     fn a_placed_texture_holds_its_heap() {
@@ -674,7 +677,6 @@ mod tests {
         // SAFETY: plain creation.
         unsafe { host.device.CreateHeap(&desc, &mut heap) }.unwrap();
         let heap = heap.unwrap();
-        let before = crate::host::references(&heap);
         let texture_desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Width: 256,
@@ -692,17 +694,73 @@ mod tests {
                 &heap,
                 0,
                 &texture_desc,
-                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
                 None,
                 &mut made,
             )
         }
         .unwrap();
         let made = made.unwrap();
-        let held = crate::host::references(&heap);
-        assert!(held > before, "a placed texture holds no reference to its heap");
-        drop(made);
-        assert_eq!(crate::host::references(&heap), before);
+        // Ours alone: from here the texture's own reference is all the heap
+        // has, and the bytes below come back through it.
+        drop(heap);
+        let (pitch, rows) = (1024usize, 256usize);
+        let bytes = (pitch * rows) as u64;
+        let Some((upload, data)) = host.upload_buffer(bytes) else { return };
+        // SAFETY: the mapping holds `bytes`, and no list has read it yet.
+        unsafe { (0..pitch * rows).for_each(|i| data.add(i).write((i % 251) as u8)) };
+        let Some(back) = host.read_back_buffer(bytes) else { return };
+        let Ok(list) = host.new_list() else { return };
+        list.close();
+        list.reset();
+        let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            Offset: 0,
+            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                Width: 256,
+                Height: 256,
+                Depth: 1,
+                RowPitch: pitch as u32,
+            },
+        };
+        // SAFETY: borrowed pointers the copy locations never release.
+        let (from, to, into) = unsafe {
+            (
+                D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&upload),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                },
+                D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&made),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                },
+                D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                },
+            )
+        };
+        // SAFETY: an open list, live resources, the footprint of the upload.
+        unsafe {
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &made,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyTextureRegion(&into, 0, 0, 0, &to, None);
+            list.close();
+            host.execute(&[&list]);
+            let mut at = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut at)).unwrap();
+            let seen = std::slice::from_raw_parts(at.cast::<u8>(), pitch * rows);
+            let wrote = std::slice::from_raw_parts(data, pitch * rows);
+            assert!(seen == wrote, "a placed texture keeps its heap's memory after the heap goes");
+            back.Unmap(0, None);
+        }
     }
 
     #[test]

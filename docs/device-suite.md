@@ -81,10 +81,10 @@ cargo test -p victory-gpu --lib copy_draw_copy_draw -- --ignored --test-threads=
 `check::card` — the nine that want the host's device (`crate::host::host`):
 
 - `gpu_detile::tests::gpu_detile_batched_prelude_layout_and_zero_subresources`
-- `indirect::tests::host_list_budget_starts_empty_at_each_submission` — **red today: CAM-122** (left 1, right 0)
+- `indirect::tests::host_list_budget_starts_empty_at_each_submission`
 - `pipeline::host::tests::a_mesh_pipeline_loads_from_the_library` — also skips without mesh shaders and `dxc.exe`
 - `pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws`
-- `pool::tests::a_placed_texture_holds_its_heap` — **red today: CAM-122** ("a placed texture holds no reference to its heap")
+- `pool::tests::a_placed_texture_holds_its_heap` — the heap's memory, read back after the test lets go of the heap
 - `texture::tests::gpu_detile_end_to_end_and_partial_mip_upload_match_cpu`
 - `texture::ahead::tests::a_placed_texture_is_filled_ahead_of_the_lists`
 - `texture::ahead::tests::drain_waits_until_then_callbacks_have_run`
@@ -92,7 +92,7 @@ cargo test -p victory-gpu --lib copy_draw_copy_draw -- --ignored --test-threads=
 
 `check::warp` — one, on the software adapter:
 
-- `indirect::tests::warp_batch_charges_every_execution` — **red today: CAM-122** (left 0, right 134217728)
+- `indirect::tests::warp_batch_charges_every_execution`
 
 `check::tiles` — one:
 

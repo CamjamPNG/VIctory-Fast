@@ -32,8 +32,10 @@ windows-sys = { workspace = true, features = [
 tempfile.workspace = true
 
 [features]
-# Debugging switches (scheduled stack dumps and the like).
-diagnostics = []
+# Debugging switches (scheduled stack dumps and the like). The counters log
+# through `tracing`, and `victory-core`'s diagnostics is what lets debug-level
+# lines through at all, so a build of this crate alone can see them.
+diagnostics = ["victory-core/diagnostics"]
 
 [lints]
 workspace = true

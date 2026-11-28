@@ -89,6 +89,10 @@ cargo build --release --locked -p victory
 cargo build --profile diag --locked -p victory --features diagnostics
 ```
 
+Which switches only exist in that build, and which work in any, is
+[docs/diagnostics-builds.md](docs/diagnostics-builds.md); `cargo xtask features`
+prints the feature graph.
+
 Configure local paths outside the repository (see `victory.example.toml`):
 
 ```powershell
